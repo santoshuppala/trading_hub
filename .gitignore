@@ -1,0 +1,24 @@
+# --- Security (CRITICAL) ---
+# Never commit your Alpaca or Email credentials
+.env
+.env.local
+
+# --- Python Artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# --- Data & Logs ---
+# Ignore local Parquet or CSV data files you might download
+*.parquet
+*.csv
+*.log
+trade_log.json
+
+# --- Editor / OS ---
+.DS_Store
+.vscode/
+.idea/

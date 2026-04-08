@@ -13,7 +13,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
@@ -323,19 +323,41 @@ class RealTimeMonitor:
         else:
             print(f"ALERT: {message}")
 
-    def place_order(self, ticker, side, qty):
+    # Marketable limit: how far above ask we're willing to pay (0.05%)
+    LIMIT_BUFFER_PCT = 0.0005
+
+    def place_order(self, ticker, side, qty, ref_price=None):
+        """
+        Places a marketable limit order when ref_price is provided (buys),
+        or a plain market order for sells (speed > precision on exits).
+        Marketable limit = limit set slightly above ask so it fills immediately
+        but rejects if price spikes beyond our tolerance before fill.
+        """
         if not self.trading_client:
             self.send_alert(f"Order skipped (no Alpaca client): {side} {qty} {ticker}")
             return None
         try:
-            order_request = MarketOrderRequest(
-                symbol=ticker,
-                qty=qty,
-                side=side,
-                time_in_force=TimeInForce.DAY
-            )
-            order = self.trading_client.submit_order(order_request)
-            self.send_alert(f"Order placed: {side} {qty} {ticker} at market")
+            if side == OrderSide.BUY and ref_price:
+                limit_price = round(ref_price * (1 + self.LIMIT_BUFFER_PCT), 2)
+                order_request = LimitOrderRequest(
+                    symbol=ticker,
+                    qty=qty,
+                    side=side,
+                    limit_price=limit_price,
+                    time_in_force=TimeInForce.DAY,
+                )
+                order = self.trading_client.submit_order(order_request)
+                self.send_alert(f"Order placed: BUY {qty} {ticker} limit ${limit_price:.2f} (ask ~${ref_price:.2f})")
+            else:
+                # Sells use market orders — exit speed is critical
+                order_request = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                )
+                order = self.trading_client.submit_order(order_request)
+                self.send_alert(f"Order placed: SELL {qty} {ticker} at market")
             return order.id
         except Exception as e:
             self.send_alert(f"Order failed: {side} {qty} {ticker} - {e}")
@@ -755,7 +777,7 @@ class RealTimeMonitor:
                     # Effective entry = ask + slippage (what we actually pay)
                     effective_entry = ask_price * (1 + self.SLIPPAGE_PCT)
 
-                    order_id = self.place_order(ticker, OrderSide.BUY, 1)
+                    order_id = self.place_order(ticker, OrderSide.BUY, 1, ref_price=ask_price)
                     if order_id:
                         candle_stop  = reclaim_candle_low - (atr_value * 0.5)
                         pct_stop     = effective_entry * (1 - min_stop_pct)

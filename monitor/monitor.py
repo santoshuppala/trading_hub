@@ -263,7 +263,10 @@ class RealTimeMonitor:
                     qty = max(1, int(self.trade_budget / effective_entry))
                     dollar_value = round(qty * effective_entry, 2)
 
-                    order_id = self._order_manager.place_buy(ticker, qty, ask_price)
+                    order_id = self._order_manager.place_buy(
+                        ticker, qty, ask_price,
+                        refresh_ask=lambda: self._data.check_spread(ticker)[1],
+                    )
                     if order_id:
                         candle_stop = reclaim_candle_low - (atr_value * 0.5)
                         pct_stop = effective_entry * (1 - min_stop_pct)

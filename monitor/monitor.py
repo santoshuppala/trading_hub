@@ -63,6 +63,7 @@ from alpaca.trading.client import TradingClient
 from .alerts import send_alert
 from .data_client import make_data_client
 from .screener import MomentumScreener
+from .state import save_state, load_state
 from .signals import SignalAnalyzer
 from .orders import OrderManager
 
@@ -105,9 +106,6 @@ class RealTimeMonitor:
         self.open_cost = open_cost           # kept for backtest compatibility
         self.close_cost = close_cost
         self.alert_email = alert_email
-        self.positions = {}                  # ticker -> position dict
-        self.trade_log = []                  # completed trades for today's summary
-        self.reclaimed_today = set()         # tickers that already had a reclaim today
         self._bars_cache = {}                # today's bars: {ticker: DataFrame}
         self._rvol_cache = {}                # historical bars for RVOL: {ticker: DataFrame}
         self._last_momentum_refresh = None   # datetime of last screener refresh
@@ -118,6 +116,12 @@ class RealTimeMonitor:
         self.trade_budget = trade_budget         # dollars per trade
         self.last_order_time = {}
         self._last_reset_date = datetime.now(ET).date()
+
+        # Restore intraday state from disk (no-op on first run or new day)
+        saved_positions, saved_reclaimed, saved_trades = load_state()
+        self.positions = saved_positions
+        self.reclaimed_today = saved_reclaimed
+        self.trade_log = saved_trades
 
         # ── Alpaca: order execution only ───────────────────────────────
         api_key    = alpaca_api_key    or os.getenv('APCA_API_KEY_ID', '')
@@ -151,6 +155,9 @@ class RealTimeMonitor:
 
     def _send_alert(self, message):
         send_alert(self.alert_email, message)
+
+    def _save_state(self):
+        save_state(self.positions, self.reclaimed_today, self.trade_log)
 
     def _reset_daily_state(self):
         """Reset per-day tracking at the start of each new trading day."""
@@ -200,6 +207,7 @@ class RealTimeMonitor:
                                 'is_win': pnl >= 0,
                             })
                             del self.positions[ticker]
+                            self._save_state()
                 return
 
             # Only trade 9:45 AM – 3:00 PM ET
@@ -285,6 +293,7 @@ class RealTimeMonitor:
                         }
                         self.reclaimed_today.add(ticker)
                         self.last_order_time[ticker] = time.time()
+                        self._save_state()
                         self._send_alert(
                             f"BUY (VWAP Reclaim): {ticker} {qty} shares @ ${effective_entry:.2f} "
                             f"(${dollar_value:.0f} deployed) | "
@@ -316,6 +325,7 @@ class RealTimeMonitor:
                             'time':        now.strftime('%H:%M:%S'),
                             'is_win':      partial_pnl >= 0,
                         })
+                        self._save_state()
                         self._send_alert(
                             f"SELL partial: {ticker} {partial_qty} shares @ ${current_price:.2f} | "
                             f"PnL: ${partial_pnl:+.2f} | "
@@ -363,6 +373,7 @@ class RealTimeMonitor:
                         })
                         del self.positions[ticker]
                         self.last_order_time[ticker] = time.time()
+                        self._save_state()
 
         except Exception as e:
             log.error(f"Error analyzing {ticker}: {e}")

@@ -75,3 +75,8 @@ PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
 # 'tradier' — Tradier REST API (recommended; commission-free data, no SDK)
 # 'alpaca'  — Alpaca Data API (uses same key/secret as order execution)
 DATA_SOURCE = os.getenv('DATA_SOURCE', 'tradier')
+
+# ── Broker ─────────────────────────────────────────────────────────────────────
+# 'alpaca' — live or paper execution via Alpaca TradingClient
+# 'paper'  — local simulation; fills every order instantly, no API needed
+BROKER = os.getenv('BROKER', 'alpaca')

@@ -1,0 +1,20 @@
+{
+  "date": "2026-04-10",
+  "positions": {},
+  "reclaimed_today": [
+    "ZS"
+  ],
+  "trade_log": [
+    {
+      "ticker": "ZS",
+      "entry_price": 116.9,
+      "entry_time": "11:25:06",
+      "exit_price": 116.64,
+      "qty": 1,
+      "pnl": -0.26,
+      "reason": "sell_vwap",
+      "time": "11:26:39",
+      "is_win": false
+    }
+  ]
+}

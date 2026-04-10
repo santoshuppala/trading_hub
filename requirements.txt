@@ -6,3 +6,4 @@ matplotlib
 streamlit
 alpaca-py
 requests
+confluent-kafka

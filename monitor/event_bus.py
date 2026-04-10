@@ -1184,7 +1184,8 @@ class EventBus:
                         f"[idempotent] Duplicate {event.event_id[:8]} "
                         f"({event.type.name}) dropped."
                     )
-                    return
+                    # Maintain return contract even when we short-circuit.
+                    return BackpressureStatus.SYNC if self._mode == DispatchMode.SYNC else BackpressureStatus.OK
                 self._seen_ids[event.event_id] = None
                 if len(self._seen_ids) > self._idempotency_window:
                     self._seen_ids.popitem(last=False)
@@ -1195,6 +1196,10 @@ class EventBus:
         # Step 4 — F: priority
         if event.priority < 0:
             event.priority = _DEFAULT_PRIORITY.get(event.type, EventPriority.MEDIUM)
+
+        # Step 4.5 — per-bus monotonic sequence
+        with self._bus_seq_lock:
+            event.sequence = next(self._bus_seq_iter)
 
         # Step 5 — stream_seq with LRU cap (seq_lock) + emit_count (count_lock)
         stream_key = (event.type, getattr(event.payload, 'ticker', ''))
@@ -1303,15 +1308,21 @@ class EventBus:
                     filtered.append(event)
             events = filtered
         if not events:
-            return
+            # Entire batch was deduped; no enqueue, but keep return type stable.
+            return BackpressureStatus.SYNC if self._mode == DispatchMode.SYNC else BackpressureStatus.OK
 
         # Step 3 — D + F: timestamp + priority (no lock; time_source is thread-safe)
         now_dt = self._time_source.now()
         for event in events:
             event.timestamp = now_dt
             if event.priority < 0:
-                event.priority = _DEFAULT_PRIORITY.get(event.type, EventPriority.MEDIUM)
+                event.priority = _DEFAULT_PRIORITY.get(event.type, EventPriority.MEDIUM)                
 
+		        # Step 3.5 — per-bus monotonic sequence (one lock for the whole batch)
+        with self._bus_seq_lock:
+            for event in events:
+                event.sequence = next(self._bus_seq_iter)
+                
         # Step 4 — stream_seqs (one seq_lock acquisition)
         with self._seq_lock:
             for event in events:
@@ -1546,6 +1557,10 @@ class EventBus:
                 tripped = True
 
         if tripped:
+        	# Increment handler-level trip_count for metrics, in addition to per-ticker cb_state.
+            if state:
+                with state._lock:
+                    state.trip_count += 1
             with self._count_lock:
                 self._circuit_breaks += 1
             log.error(

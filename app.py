@@ -11,7 +11,7 @@ from strategies import get_strategy_class
 from main import run_backtest, run_compounding_backtest
 from config import (
     TICKERS, STRATEGY, STRATEGY_PARAMS,
-    MAX_POSITIONS, ORDER_COOLDOWN,
+    MAX_POSITIONS, ORDER_COOLDOWN, TRADE_BUDGET,
     ALERT_EMAIL, PAPER_TRADING, DATA_SOURCE,
 )
 
@@ -94,13 +94,15 @@ with tab_monitor:
         api_secret = st.text_input("Alpaca Secret Key", type="password")
 
     # ── Settings ──────────────────────────────────────────────────────────────
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         paper      = st.checkbox("Paper Trading", value=PAPER_TRADING)
     with col2:
         max_pos    = st.number_input("Max Positions", min_value=1, max_value=20, value=MAX_POSITIONS)
     with col3:
         cooldown   = st.number_input("Order Cooldown (s)", min_value=60, max_value=3600, value=ORDER_COOLDOWN, step=30)
+    with col4:
+        budget     = st.number_input("Trade Budget ($)", min_value=100, max_value=100000, value=TRADE_BUDGET, step=100)
 
     alert_email = st.text_input("Alert Email (optional)", value=ALERT_EMAIL)
 
@@ -144,6 +146,7 @@ with tab_monitor:
                     paper=paper,
                     max_positions=max_pos,
                     order_cooldown=cooldown,
+                    trade_budget=budget,
                     data_source=data_source,
                 )
                 try:

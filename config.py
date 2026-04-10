@@ -60,6 +60,7 @@ STRATEGY_PARAMS = {
 # ── Risk / order settings ──────────────────────────────────────────────────────
 MAX_POSITIONS  = 5
 ORDER_COOLDOWN = 300   # seconds between orders on same ticker
+TRADE_BUDGET   = int(os.getenv('TRADE_BUDGET', 1000))  # dollars allocated per trade
 OPEN_COST      = 0.0   # commission-free (Alpaca); slippage handled in OrderManager
 CLOSE_COST     = 0.0
 

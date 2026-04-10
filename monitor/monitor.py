@@ -95,6 +95,7 @@ class RealTimeMonitor:
         order_cooldown=300,
         per_ticker_params=None,
         data_source='tradier',
+        trade_budget=1000,
     ):
         self.base_tickers = list(tickers)    # fixed watchlist
         self.tickers = list(tickers)         # active list (base + dynamic momentum)
@@ -114,6 +115,7 @@ class RealTimeMonitor:
         self.thread = None
         self.max_positions = max_positions
         self.order_cooldown = order_cooldown
+        self.trade_budget = trade_budget         # dollars per trade
         self.last_order_time = {}
         self._last_reset_date = datetime.now(ET).date()
 
@@ -178,7 +180,7 @@ class RealTimeMonitor:
                 if not data.empty:
                     current_price = float(data['close'].iloc[-1])
                     pos = self.positions[ticker]
-                    qty = pos['quantity'] + pos.get('partial_qty', 0)
+                    qty = pos['quantity']
                     if qty > 0:
                         order_id = self._order_manager.place_sell(ticker, qty)
                         if order_id:
@@ -257,7 +259,11 @@ class RealTimeMonitor:
                     # Effective entry = ask + slippage
                     effective_entry = ask_price * (1 + self._order_manager.SLIPPAGE_PCT)
 
-                    order_id = self._order_manager.place_buy(ticker, 1, ask_price)
+                    # Position size: allocate trade_budget dollars
+                    qty = max(1, int(self.trade_budget / effective_entry))
+                    dollar_value = round(qty * effective_entry, 2)
+
+                    order_id = self._order_manager.place_buy(ticker, qty, ask_price)
                     if order_id:
                         candle_stop = reclaim_candle_low - (atr_value * 0.5)
                         pct_stop = effective_entry * (1 - min_stop_pct)
@@ -267,8 +273,7 @@ class RealTimeMonitor:
                         self.positions[ticker] = {
                             'entry_price': effective_entry,
                             'entry_time': now.strftime('%H:%M:%S'),
-                            'quantity': 1,
-                            'partial_qty': 0,
+                            'quantity': qty,
                             'partial_done': False,
                             'order_id': order_id,
                             'stop_price': stop_price,
@@ -278,64 +283,80 @@ class RealTimeMonitor:
                         self.reclaimed_today.add(ticker)
                         self.last_order_time[ticker] = time.time()
                         self._send_alert(
-                            f"BUY (VWAP Reclaim): {ticker} @ ${effective_entry:.2f} (ask ${ask_price:.2f} + slip) | "
+                            f"BUY (VWAP Reclaim): {ticker} {qty} shares @ ${effective_entry:.2f} "
+                            f"(${dollar_value:.0f} deployed) | "
                             f"Spread: {spread_pct:.3%} | VWAP: ${current_vwap:.2f} | "
                             f"Stop: ${stop_price:.2f} | Target: ${target_price:.2f} | "
                             f"Partial: ${half_target:.2f} | RSI: {rsi_value:.1f} | RVOL: {rvol:.1f}x"
                         )
             else:
                 pos = self.positions[ticker]
-                partial_done = pos['partial_done']
                 qty = pos['quantity']
 
-                # Partial exit — sell 50% at 1x ATR, move stop to breakeven
-                if not partial_done and current_price >= pos['half_target'] and qty >= 2:
+                # ── Exit 1: sell 50% at 1x ATR, move stop to breakeven ────────
+                if not pos['partial_done'] and current_price >= pos['half_target'] and qty >= 2:
                     partial_qty = qty // 2
                     order_id = self._order_manager.place_sell(ticker, partial_qty)
                     if order_id:
+                        partial_pnl = round((current_price - pos['entry_price']) * partial_qty, 2)
                         pos['quantity'] -= partial_qty
                         pos['partial_done'] = True
-                        pos['stop_price'] = pos['entry_price']  # move stop to breakeven
+                        pos['stop_price'] = pos['entry_price']  # breakeven stop
+                        self.trade_log.append({
+                            'ticker':      ticker,
+                            'entry_price': pos['entry_price'],
+                            'entry_time':  pos.get('entry_time', ''),
+                            'exit_price':  current_price,
+                            'qty':         partial_qty,
+                            'pnl':         partial_pnl,
+                            'reason':      'partial exit (1x ATR)',
+                            'time':        now.strftime('%H:%M:%S'),
+                            'is_win':      partial_pnl >= 0,
+                        })
                         self._send_alert(
-                            f"PARTIAL SELL: {ticker} {partial_qty} shares @ ${current_price:.2f} | "
-                            f"Stop moved to breakeven ${pos['entry_price']:.2f}"
+                            f"SELL partial: {ticker} {partial_qty} shares @ ${current_price:.2f} | "
+                            f"PnL: ${partial_pnl:+.2f} | "
+                            f"Stop moved to breakeven ${pos['entry_price']:.2f} | "
+                            f"Holding {pos['quantity']} shares"
                         )
-                        return
+                    return
 
                 # Trailing stop update
                 trail_stop = current_price - (atr_value * 1.0)
                 if trail_stop > pos['stop_price']:
                     pos['stop_price'] = trail_stop
 
-                hit_stop = current_price <= pos['stop_price']
+                hit_stop   = current_price <= pos['stop_price']
                 hit_target = current_price >= pos['target_price']
-                rsi_exit = rsi_value > rsi_overbought
-                vwap_exit = result['_vwap_breakdown']
+                rsi_exit   = rsi_value > rsi_overbought
+                vwap_exit  = result['_vwap_breakdown']
 
+                # ── Exit 2: sell remaining shares ─────────────────────────────
                 if hit_stop or hit_target or rsi_exit or vwap_exit:
                     remaining_qty = pos['quantity']
                     order_id = self._order_manager.place_sell(ticker, remaining_qty)
                     if order_id:
-                        pnl = (current_price - pos['entry_price']) * remaining_qty
+                        pnl = round((current_price - pos['entry_price']) * remaining_qty, 2)
                         reason = (
                             'target reached' if hit_target else
-                            'trailing stop' if hit_stop else
-                            'RSI overbought' if rsi_exit else
+                            'trailing stop'  if hit_stop  else
+                            'RSI overbought' if rsi_exit  else
                             'VWAP breakdown'
                         )
                         self._send_alert(
-                            f"SELL ({reason}): {ticker} @ ${current_price:.2f} | PnL: ${pnl:.2f}"
+                            f"SELL final ({reason}): {ticker} {remaining_qty} shares @ "
+                            f"${current_price:.2f} | PnL: ${pnl:+.2f}"
                         )
                         self.trade_log.append({
-                            'ticker': ticker,
+                            'ticker':      ticker,
                             'entry_price': pos['entry_price'],
-                            'entry_time': pos.get('entry_time', ''),
-                            'exit_price': current_price,
-                            'qty': remaining_qty,
-                            'pnl': round(pnl, 2),
-                            'reason': reason,
-                            'time': now.strftime('%H:%M:%S'),
-                            'is_win': pnl >= 0,
+                            'entry_time':  pos.get('entry_time', ''),
+                            'exit_price':  current_price,
+                            'qty':         remaining_qty,
+                            'pnl':         pnl,
+                            'reason':      reason,
+                            'time':        now.strftime('%H:%M:%S'),
+                            'is_win':      pnl >= 0,
                         })
                         del self.positions[ticker]
                         self.last_order_time[ticker] = time.time()

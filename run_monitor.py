@@ -26,7 +26,7 @@ from monitor import RealTimeMonitor
 from config import (
     TICKERS, STRATEGY, STRATEGY_PARAMS,
     OPEN_COST, CLOSE_COST, MAX_POSITIONS, ORDER_COOLDOWN,
-    ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING,
+    ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, TRADIER_TOKEN, PAPER_TRADING,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -57,6 +57,7 @@ def main():
         alert_email=ALERT_EMAIL,
         alpaca_api_key=ALPACA_API_KEY,
         alpaca_secret_key=ALPACA_SECRET,
+        tradier_token=TRADIER_TOKEN,
         paper=PAPER_TRADING,
         max_positions=MAX_POSITIONS,
         order_cooldown=ORDER_COOLDOWN,

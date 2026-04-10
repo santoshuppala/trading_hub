@@ -65,6 +65,7 @@ CLOSE_COST     = 0.0
 
 # ── Credentials (read from environment / .env) ─────────────────────────────────
 ALERT_EMAIL    = os.getenv('ALERT_EMAIL_TO', 'usantoshayyappa@yahoo.com')
-ALPACA_API_KEY = os.getenv('APCA_API_KEY_ID')
-ALPACA_SECRET  = os.getenv('APCA_API_SECRET_KEY')
+ALPACA_API_KEY = os.getenv('APCA_API_KEY_ID')       # order execution only
+ALPACA_SECRET  = os.getenv('APCA_API_SECRET_KEY')   # order execution only
+TRADIER_TOKEN  = os.getenv('TRADIER_TOKEN')          # market data source
 PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'

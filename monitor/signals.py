@@ -16,35 +16,58 @@ FORCE_CLOSE_HOUR = 15
 
 def get_rvol(hist_df, current_volume_sum, current_bar_index):
     """
-    Relative Volume: compare cumulative volume up to this bar vs the same
-    bar index averaged over the last 5 trading days.
+    Relative Volume ratio (current vs historical average at this time of day).
+
+    Supports two hist_df formats:
+      - Minute bars (multiple rows per date): precise bar-aligned comparison.
+      - Daily bars (one row per date, from Tradier): time-fraction approximation
+        using the fraction of the trading day elapsed so far.
 
     Returns RVOL ratio (2.0 = twice the usual volume at this time of day).
     Falls back to 1.0 if historical data is unavailable.
-
-    Parameters
-    ----------
-    hist_df : pd.DataFrame
-        Historical minute bars (multi-day) with a tz-aware DatetimeIndex.
-    current_volume_sum : float
-        Cumulative volume for today up to the current bar.
-    current_bar_index : int
-        Number of bars elapsed today (used to slice past day volumes).
     """
     try:
         if hist_df is None or hist_df.empty:
             return 1.0
         today = datetime.now(ET).date()
-        past_days = sorted({idx.date() for idx in hist_df.index if idx.date() < today})[-5:]
-        avg_cum_vol = []
-        for d in past_days:
-            day_vol = hist_df.loc[hist_df.index.date == d, 'volume']
-            if len(day_vol) >= current_bar_index:
-                avg_cum_vol.append(day_vol.iloc[:current_bar_index].sum())
-        if not avg_cum_vol:
+        past_dates = sorted({idx.date() for idx in hist_df.index if idx.date() < today})[-5:]
+        if not past_dates:
             return 1.0
-        avg = sum(avg_cum_vol) / len(avg_cum_vol)
-        return current_volume_sum / avg if avg > 0 else 1.0
+
+        # Detect whether this is minute-level or daily data
+        sample_date = past_dates[0]
+        bars_on_sample = int((hist_df.index.date == sample_date).sum())
+        is_minute_data = bars_on_sample > 1
+
+        if is_minute_data:
+            # Precise: compare cumulative volume at the same bar index
+            avg_cum_vol = []
+            for d in past_dates:
+                day_vol = hist_df.loc[hist_df.index.date == d, 'volume']
+                if len(day_vol) >= current_bar_index:
+                    avg_cum_vol.append(day_vol.iloc[:current_bar_index].sum())
+            if not avg_cum_vol:
+                return 1.0
+            avg = sum(avg_cum_vol) / len(avg_cum_vol)
+            return current_volume_sum / avg if avg > 0 else 1.0
+        else:
+            # Daily bars: estimate expected volume using time-fraction of trading day
+            daily_vols = [
+                float(hist_df.loc[hist_df.index.date == d, 'volume'].iloc[0])
+                for d in past_dates
+                if (hist_df.index.date == d).any()
+            ]
+            if not daily_vols:
+                return 1.0
+            avg_daily_vol = sum(daily_vols) / len(daily_vols)
+            now = datetime.now(ET)
+            market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+            market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+            elapsed = max(0.0, (now - market_open).total_seconds())
+            total   = (market_close - market_open).total_seconds()
+            time_frac = min(elapsed / total, 1.0) if total > 0 else 0.5
+            expected = avg_daily_vol * time_frac
+            return current_volume_sum / expected if expected > 0 else 1.0
     except Exception:
         return 1.0
 

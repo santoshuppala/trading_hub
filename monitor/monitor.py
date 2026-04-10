@@ -59,10 +59,9 @@ def _remove_lock():
         pass
 
 from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
 
 from .alerts import send_alert
-from .data_client import AlpacaDataClient
+from .data_client import TradierDataClient
 from .screener import MomentumScreener
 from .signals import SignalAnalyzer
 from .orders import OrderManager
@@ -90,6 +89,7 @@ class RealTimeMonitor:
         alert_email=None,
         alpaca_api_key=None,
         alpaca_secret_key=None,
+        tradier_token=None,
         paper=True,
         max_positions=5,
         order_cooldown=300,
@@ -116,25 +116,28 @@ class RealTimeMonitor:
         self.last_order_time = {}
         self._last_reset_date = datetime.now(ET).date()
 
-        # Use environment variables as fallback if keys not provided
-        api_key = alpaca_api_key or os.getenv('APCA_API_KEY_ID', '')
+        # ── Alpaca: order execution only ───────────────────────────────
+        api_key    = alpaca_api_key    or os.getenv('APCA_API_KEY_ID', '')
         api_secret = alpaca_secret_key or os.getenv('APCA_API_SECRET_KEY', '')
-
-        self._api_key = api_key
-        self._api_secret = api_secret
 
         if api_key and api_secret:
             trading_client = TradingClient(api_key, api_secret, paper=paper)
-            alpaca_data_client = AlpacaDataClient(api_key, api_secret)
-            log.info("Alpaca trading + data clients initialized.")
+            log.info(f"Alpaca trading client initialized (paper={paper}).")
         else:
             trading_client = None
-            alpaca_data_client = AlpacaDataClient.__new__(AlpacaDataClient)
-            alpaca_data_client._client = StockHistoricalDataClient()
-            log.warning("Warning: Alpaca keys not provided. Orders and data will be skipped.")
+            log.warning("Alpaca keys not provided — orders will be skipped.")
 
-        self._alpaca_data = alpaca_data_client
-        self._screener = MomentumScreener(api_key, api_secret, alpaca_data_client)
+        # ── Tradier: market data source ────────────────────────────────
+        token = tradier_token or os.getenv('TRADIER_TOKEN', '')
+        if token:
+            data_client = TradierDataClient(token)
+            log.info("Tradier data client initialized.")
+        else:
+            data_client = TradierDataClient('')
+            log.warning("Tradier token not provided — market data will be unavailable.")
+
+        self._data = data_client
+        self._screener = MomentumScreener(data_client)
         self._signal_analyzer = SignalAnalyzer(strategy_params, self.per_ticker_params)
         self._order_manager = OrderManager(trading_client, alert_email)
 
@@ -167,7 +170,7 @@ class RealTimeMonitor:
             # Force-close all positions by 3:00 PM ET
             force_close = hour == 15 and minute >= 0
             if force_close and ticker in self.positions:
-                data = self._alpaca_data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
+                data = self._data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
                 today = now.date()
                 data = data[data.index.date == today] if not data.empty else data
                 if not data.empty:
@@ -200,7 +203,7 @@ class RealTimeMonitor:
             if not market_open:
                 return
 
-            data = self._alpaca_data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
+            data = self._data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
             if data.empty:
                 return
             today = now.date()
@@ -237,11 +240,11 @@ class RealTimeMonitor:
 
                 rvol_confirmed = rvol >= 2.0
                 rsi_bullish = 50 <= rsi_value <= 70
-                spy_bullish = self._alpaca_data.get_spy_vwap_bias(self._bars_cache)
+                spy_bullish = self._data.get_spy_vwap_bias(self._bars_cache)
 
                 if vwap_reclaim and opened_above_vwap and rsi_bullish and rvol_confirmed and spy_bullish:
                     # Level 1 quote: check bid/ask spread before entering
-                    spread_pct, ask_price = self._alpaca_data.check_spread(ticker)
+                    spread_pct, ask_price = self._data.check_spread(ticker)
                     if spread_pct is None:
                         ask_price = current_price
                         spread_pct = 0.0
@@ -354,7 +357,7 @@ class RealTimeMonitor:
                 f"[{datetime.now(ET).strftime('%H:%M:%S')}] "
                 f"Fetching bars for {len(self.tickers)} tickers..."
             )
-            self._bars_cache, self._rvol_cache = self._alpaca_data.fetch_batch_bars(self.tickers)
+            self._bars_cache, self._rvol_cache = self._data.fetch_batch_bars(self.tickers)
 
             # Analyze all tickers in parallel using cached data
             with ThreadPoolExecutor(max_workers=min(len(self.tickers), 50)) as ex:

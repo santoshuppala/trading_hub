@@ -125,6 +125,7 @@ with tab_monitor:
                     alert_email=alert_email or None,
                     alpaca_api_key=api_key,
                     alpaca_secret_key=api_secret,
+                    tradier_token=os.getenv('TRADIER_TOKEN', ''),
                     paper=paper,
                     max_positions=max_pos,
                     order_cooldown=cooldown,

@@ -59,10 +59,9 @@ def _remove_lock():
         pass
 
 from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
 
 from .alerts import send_alert
-from .data_client import AlpacaDataClient
+from .data_client import make_data_client
 from .screener import MomentumScreener
 from .signals import SignalAnalyzer
 from .orders import OrderManager
@@ -90,10 +89,13 @@ class RealTimeMonitor:
         alert_email=None,
         alpaca_api_key=None,
         alpaca_secret_key=None,
+        tradier_token=None,
         paper=True,
         max_positions=5,
         order_cooldown=300,
         per_ticker_params=None,
+        data_source='tradier',
+        trade_budget=1000,
     ):
         self.base_tickers = list(tickers)    # fixed watchlist
         self.tickers = list(tickers)         # active list (base + dynamic momentum)
@@ -113,28 +115,33 @@ class RealTimeMonitor:
         self.thread = None
         self.max_positions = max_positions
         self.order_cooldown = order_cooldown
+        self.trade_budget = trade_budget         # dollars per trade
         self.last_order_time = {}
         self._last_reset_date = datetime.now(ET).date()
 
-        # Use environment variables as fallback if keys not provided
-        api_key = alpaca_api_key or os.getenv('APCA_API_KEY_ID', '')
+        # ── Alpaca: order execution only ───────────────────────────────
+        api_key    = alpaca_api_key    or os.getenv('APCA_API_KEY_ID', '')
         api_secret = alpaca_secret_key or os.getenv('APCA_API_SECRET_KEY', '')
-
-        self._api_key = api_key
-        self._api_secret = api_secret
 
         if api_key and api_secret:
             trading_client = TradingClient(api_key, api_secret, paper=paper)
-            alpaca_data_client = AlpacaDataClient(api_key, api_secret)
-            log.info("Alpaca trading + data clients initialized.")
+            log.info(f"Alpaca trading client initialized (paper={paper}).")
         else:
             trading_client = None
-            alpaca_data_client = AlpacaDataClient.__new__(AlpacaDataClient)
-            alpaca_data_client._client = StockHistoricalDataClient()
-            log.warning("Warning: Alpaca keys not provided. Orders and data will be skipped.")
+            log.warning("Alpaca keys not provided — orders will be skipped.")
 
-        self._alpaca_data = alpaca_data_client
-        self._screener = MomentumScreener(api_key, api_secret, alpaca_data_client)
+        # ── Market data client (provider selected by data_source) ─────
+        token = tradier_token or os.getenv('TRADIER_TOKEN', '')
+        data_client = make_data_client(
+            data_source,
+            tradier_token=token,
+            alpaca_api_key=api_key,
+            alpaca_secret=api_secret,
+        )
+        log.info(f"Data client initialized: {data_source}.")
+
+        self._data = data_client
+        self._screener = MomentumScreener(data_client)
         self._signal_analyzer = SignalAnalyzer(strategy_params, self.per_ticker_params)
         self._order_manager = OrderManager(trading_client, alert_email)
 
@@ -167,13 +174,13 @@ class RealTimeMonitor:
             # Force-close all positions by 3:00 PM ET
             force_close = hour == 15 and minute >= 0
             if force_close and ticker in self.positions:
-                data = self._alpaca_data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
+                data = self._data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
                 today = now.date()
                 data = data[data.index.date == today] if not data.empty else data
                 if not data.empty:
                     current_price = float(data['close'].iloc[-1])
                     pos = self.positions[ticker]
-                    qty = pos['quantity'] + pos.get('partial_qty', 0)
+                    qty = pos['quantity']
                     if qty > 0:
                         order_id = self._order_manager.place_sell(ticker, qty)
                         if order_id:
@@ -200,7 +207,7 @@ class RealTimeMonitor:
             if not market_open:
                 return
 
-            data = self._alpaca_data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
+            data = self._data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
             if data.empty:
                 return
             today = now.date()
@@ -237,11 +244,11 @@ class RealTimeMonitor:
 
                 rvol_confirmed = rvol >= 2.0
                 rsi_bullish = 50 <= rsi_value <= 70
-                spy_bullish = self._alpaca_data.get_spy_vwap_bias(self._bars_cache)
+                spy_bullish = self._data.get_spy_vwap_bias(self._bars_cache)
 
                 if vwap_reclaim and opened_above_vwap and rsi_bullish and rvol_confirmed and spy_bullish:
                     # Level 1 quote: check bid/ask spread before entering
-                    spread_pct, ask_price = self._alpaca_data.check_spread(ticker)
+                    spread_pct, ask_price = self._data.check_spread(ticker)
                     if spread_pct is None:
                         ask_price = current_price
                         spread_pct = 0.0
@@ -252,7 +259,14 @@ class RealTimeMonitor:
                     # Effective entry = ask + slippage
                     effective_entry = ask_price * (1 + self._order_manager.SLIPPAGE_PCT)
 
-                    order_id = self._order_manager.place_buy(ticker, 1, ask_price)
+                    # Position size: allocate trade_budget dollars
+                    qty = max(1, int(self.trade_budget / effective_entry))
+                    dollar_value = round(qty * effective_entry, 2)
+
+                    order_id = self._order_manager.place_buy(
+                        ticker, qty, ask_price,
+                        refresh_ask=lambda: self._data.check_spread(ticker)[1],
+                    )
                     if order_id:
                         candle_stop = reclaim_candle_low - (atr_value * 0.5)
                         pct_stop = effective_entry * (1 - min_stop_pct)
@@ -262,8 +276,7 @@ class RealTimeMonitor:
                         self.positions[ticker] = {
                             'entry_price': effective_entry,
                             'entry_time': now.strftime('%H:%M:%S'),
-                            'quantity': 1,
-                            'partial_qty': 0,
+                            'quantity': qty,
                             'partial_done': False,
                             'order_id': order_id,
                             'stop_price': stop_price,
@@ -273,64 +286,80 @@ class RealTimeMonitor:
                         self.reclaimed_today.add(ticker)
                         self.last_order_time[ticker] = time.time()
                         self._send_alert(
-                            f"BUY (VWAP Reclaim): {ticker} @ ${effective_entry:.2f} (ask ${ask_price:.2f} + slip) | "
+                            f"BUY (VWAP Reclaim): {ticker} {qty} shares @ ${effective_entry:.2f} "
+                            f"(${dollar_value:.0f} deployed) | "
                             f"Spread: {spread_pct:.3%} | VWAP: ${current_vwap:.2f} | "
                             f"Stop: ${stop_price:.2f} | Target: ${target_price:.2f} | "
                             f"Partial: ${half_target:.2f} | RSI: {rsi_value:.1f} | RVOL: {rvol:.1f}x"
                         )
             else:
                 pos = self.positions[ticker]
-                partial_done = pos['partial_done']
                 qty = pos['quantity']
 
-                # Partial exit — sell 50% at 1x ATR, move stop to breakeven
-                if not partial_done and current_price >= pos['half_target'] and qty >= 2:
+                # ── Exit 1: sell 50% at 1x ATR, move stop to breakeven ────────
+                if not pos['partial_done'] and current_price >= pos['half_target'] and qty >= 2:
                     partial_qty = qty // 2
                     order_id = self._order_manager.place_sell(ticker, partial_qty)
                     if order_id:
+                        partial_pnl = round((current_price - pos['entry_price']) * partial_qty, 2)
                         pos['quantity'] -= partial_qty
                         pos['partial_done'] = True
-                        pos['stop_price'] = pos['entry_price']  # move stop to breakeven
+                        pos['stop_price'] = pos['entry_price']  # breakeven stop
+                        self.trade_log.append({
+                            'ticker':      ticker,
+                            'entry_price': pos['entry_price'],
+                            'entry_time':  pos.get('entry_time', ''),
+                            'exit_price':  current_price,
+                            'qty':         partial_qty,
+                            'pnl':         partial_pnl,
+                            'reason':      'partial exit (1x ATR)',
+                            'time':        now.strftime('%H:%M:%S'),
+                            'is_win':      partial_pnl >= 0,
+                        })
                         self._send_alert(
-                            f"PARTIAL SELL: {ticker} {partial_qty} shares @ ${current_price:.2f} | "
-                            f"Stop moved to breakeven ${pos['entry_price']:.2f}"
+                            f"SELL partial: {ticker} {partial_qty} shares @ ${current_price:.2f} | "
+                            f"PnL: ${partial_pnl:+.2f} | "
+                            f"Stop moved to breakeven ${pos['entry_price']:.2f} | "
+                            f"Holding {pos['quantity']} shares"
                         )
-                        return
+                    return
 
                 # Trailing stop update
                 trail_stop = current_price - (atr_value * 1.0)
                 if trail_stop > pos['stop_price']:
                     pos['stop_price'] = trail_stop
 
-                hit_stop = current_price <= pos['stop_price']
+                hit_stop   = current_price <= pos['stop_price']
                 hit_target = current_price >= pos['target_price']
-                rsi_exit = rsi_value > rsi_overbought
-                vwap_exit = result['_vwap_breakdown']
+                rsi_exit   = rsi_value > rsi_overbought
+                vwap_exit  = result['_vwap_breakdown']
 
+                # ── Exit 2: sell remaining shares ─────────────────────────────
                 if hit_stop or hit_target or rsi_exit or vwap_exit:
                     remaining_qty = pos['quantity']
                     order_id = self._order_manager.place_sell(ticker, remaining_qty)
                     if order_id:
-                        pnl = (current_price - pos['entry_price']) * remaining_qty
+                        pnl = round((current_price - pos['entry_price']) * remaining_qty, 2)
                         reason = (
                             'target reached' if hit_target else
-                            'trailing stop' if hit_stop else
-                            'RSI overbought' if rsi_exit else
+                            'trailing stop'  if hit_stop  else
+                            'RSI overbought' if rsi_exit  else
                             'VWAP breakdown'
                         )
                         self._send_alert(
-                            f"SELL ({reason}): {ticker} @ ${current_price:.2f} | PnL: ${pnl:.2f}"
+                            f"SELL final ({reason}): {ticker} {remaining_qty} shares @ "
+                            f"${current_price:.2f} | PnL: ${pnl:+.2f}"
                         )
                         self.trade_log.append({
-                            'ticker': ticker,
+                            'ticker':      ticker,
                             'entry_price': pos['entry_price'],
-                            'entry_time': pos.get('entry_time', ''),
-                            'exit_price': current_price,
-                            'qty': remaining_qty,
-                            'pnl': round(pnl, 2),
-                            'reason': reason,
-                            'time': now.strftime('%H:%M:%S'),
-                            'is_win': pnl >= 0,
+                            'entry_time':  pos.get('entry_time', ''),
+                            'exit_price':  current_price,
+                            'qty':         remaining_qty,
+                            'pnl':         pnl,
+                            'reason':      reason,
+                            'time':        now.strftime('%H:%M:%S'),
+                            'is_win':      pnl >= 0,
                         })
                         del self.positions[ticker]
                         self.last_order_time[ticker] = time.time()
@@ -354,7 +383,7 @@ class RealTimeMonitor:
                 f"[{datetime.now(ET).strftime('%H:%M:%S')}] "
                 f"Fetching bars for {len(self.tickers)} tickers..."
             )
-            self._bars_cache, self._rvol_cache = self._alpaca_data.fetch_batch_bars(self.tickers)
+            self._bars_cache, self._rvol_cache = self._data.fetch_batch_bars(self.tickers)
 
             # Analyze all tickers in parallel using cached data
             with ThreadPoolExecutor(max_workers=min(len(self.tickers), 50)) as ex:

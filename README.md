@@ -1,8 +1,65 @@
 # Trading Hub
 
-A real-time stock trading system with backtesting, live monitoring, and automated scheduling. Uses Alpaca for order execution and market data, and implements a VWAP Reclaim strategy with institutional-grade filters.
+A real-time algorithmic trading system built on an event-driven architecture. Supports live execution via Alpaca, intraday bar data from Tradier or Alpaca, durable event logging via Redpanda, and a VWAP Reclaim momentum strategy with institutional-grade pre-trade risk filters.
 
 > **Disclaimer:** This is for educational purposes only. Trading involves significant risk. Always start with paper trading. Consult a financial advisor before trading with real money.
+
+---
+
+## Architecture
+
+The system is organized as a 9-layer event pipeline. Each layer subscribes to one or more `EventType`s on the shared `EventBus` and emits downstream events.
+
+```
+monitor.run() → emit_batch(BAR[])
+    └─ StrategyEngine   BAR  → SIGNAL (buy / sell_* / partial_sell / hold)
+    └─ RiskEngine        SIGNAL → ORDER_REQ | RISK_BLOCK
+    └─ Broker            ORDER_REQ → FILL | ORDER_FAIL
+    └─ ExecutionFeedback FILL(buy) → patches stop/target on position record
+    └─ PositionManager   FILL → POSITION (opened / partial_exit / closed)
+    └─ StateEngine       POSITION → read-only UI snapshot
+    └─ HeartbeatEmitter  tick() → HEARTBEAT every 60 s
+    └─ EventLogger       * → structured log line for every event
+    └─ DurableEventLog   ORDER_REQ/FILL → Redpanda (ACKed before handlers run)
+```
+
+### Monitor layers
+
+| Layer | File | Responsibility |
+|-------|------|----------------|
+| T1 EventBus | `event_bus.py` | Pub/sub backbone; priority queues; backpressure; idempotency; SLA tracking |
+| T1.5 Event Schema | `events.py` | Typed, validated dataclasses for every event payload |
+| T2 DurableEventLog | `event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
+| T3 RiskEngine | `risk_engine.py` | 6 pre-trade checks; position limits; spread filter; cooldown |
+| T4 StrategyEngine | `strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
+| T5 PositionManager | `position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json` |
+| T6 StateEngine | `state_engine.py` | Maintains read-only portfolio snapshot for UI and heartbeat |
+| T7 ExecutionFeedback | `execution_feedback.py` | Patches stop/target prices after a buy fill |
+| T8 Observability | `observability.py` | EventLogger, HeartbeatEmitter, EODSummary |
+| T9 Monitor | `monitor.py` | Thin orchestrator; data-fetch loop; Alpaca reconciliation on startup |
+
+### Event Bus (v4)
+
+Key capabilities built into `event_bus.py`:
+
+- **Priority queues** — `_BoundedPriorityQueue` (heapq); DROP_OLDEST evicts lowest-urgency items, preserving FILL/ORDER_REQ over BAR
+- **Partitioned workers** — `_PartitionedAsyncDispatcher`; N workers per EventType; `hash(ticker) % n_workers` routing (Kafka partition model) preserves per-ticker ordering while parallelizing across tickers
+- **Stable partitioning** — `hashlib.md5` instead of Python's `hash()`, which is process-randomized (PEP 456)
+- **Split locks** — `_sub_lock`, `_seq_lock`, `_count_lock`, `_idem_lock`; per-handler `_HandlerState._lock` — no global contention
+- **`emit_batch()`** — O(4) lock acquisitions for N events vs O(4N) for N×`emit()`; used in the BAR fan-out for 100+ tickers
+- **Systemic backpressure** — `_BackpressureMonitor`; 60%/80%/95% thresholds; adaptive micro-sleep; returns `BackpressureStatus` enum to callers
+- **LRU stream_seqs** — `OrderedDict` capped at `max_streams=1000`; O(1) eviction
+- **Durable write-then-deliver** — `add_before_emit_hook()` + `emit(durable=True)`; Redpanda ACKs before any in-process handler runs
+- **SLA tracking** — `event.deadline` field; `_deliver()` counts breaches in `BusMetrics.sla_breaches`
+- **Prometheus exporter** — optional `PrometheusExporter` class; delta-based counters + gauges
+
+Default async config:
+
+| EventType | Queue size | Overflow | Workers |
+|-----------|-----------|----------|---------|
+| BAR | 200 | DROP_OLDEST | 4 |
+| ORDER_REQ, FILL | 100 | BLOCK | 1 (strict ordering) |
+| HEARTBEAT | 10 | DROP_OLDEST | 1 |
 
 ---
 
@@ -10,25 +67,34 @@ A real-time stock trading system with backtesting, live monitoring, and automate
 
 ```
 trading_hub/
-├── monitor/                  # Real-time monitor modules
-│   ├── alerts.py             # Email alert logic (Yahoo SMTP)
-│   ├── data_client.py        # Alpaca data fetching (bars, quotes, SPY bias)
-│   ├── screener.py           # Momentum screener + Relative Strength filter
-│   ├── signals.py            # VWAP Reclaim signal analysis (entry/exit)
-│   ├── orders.py             # Order placement (marketable limit / market)
-│   └── monitor.py            # RealTimeMonitor orchestrator + lock file guard
-├── strategies/               # Backtrader strategy classes (for backtesting)
-│   ├── base.py               # BaseTradeStrategy
-│   ├── ema_rsi.py            # EMA + RSI Crossover
-│   ├── trend_atr.py          # Trend Following ATR
-│   ├── momentum_breakout.py  # Momentum Breakout
-│   └── mean_reversion.py     # Mean Reversion (Bollinger + RSI)
-├── app.py                    # Unified Streamlit UI (live monitor + backtest)
-├── main.py                   # Backtesting engine
-├── run_monitor.py            # Headless daily launcher (no UI required)
-├── start_monitor.sh          # Shell launcher for cron scheduling
-├── config.py                 # Shared configuration (tickers, strategy, credentials)
-├── logs/                     # Daily log files (monitor_YYYY-MM-DD.log)
+├── monitor/
+│   ├── event_bus.py          # T1  — EventBus v4 (priority queues, partitioned workers, backpressure)
+│   ├── events.py             # T1.5 — Typed payload dataclasses with validation
+│   ├── event_log.py          # T2  — Redpanda durable event log
+│   ├── risk_engine.py        # T3  — Pre-trade risk checks (6 filters)
+│   ├── strategy_engine.py    # T4  — VWAP Reclaim signal generation
+│   ├── position_manager.py   # T5  — Position lifecycle + bot_state.json persistence
+│   ├── state_engine.py       # T6  — Read-only portfolio snapshot (seeded on restart)
+│   ├── execution_feedback.py # T7  — Stop/target patch after buy fill
+│   ├── observability.py      # T8  — EventLogger, HeartbeatEmitter, EODSummary
+│   ├── monitor.py            # T9  — Orchestrator; run loop; Alpaca reconciliation
+│   ├── brokers.py            # AlpacaBroker (limit+retry buy, market sell) + PaperBroker
+│   ├── data_client.py        # Factory: TradierDataClient | AlpacaDataClient
+│   ├── tradier_client.py     # Tradier REST API: bars, quotes
+│   ├── alpaca_data_client.py # Alpaca data API: bars, quotes, screener
+│   ├── screener.py           # MomentumScreener — refreshes watchlist every 30 min
+│   ├── signals.py            # VWAP Reclaim signal math (used by StrategyEngine)
+│   ├── state.py              # load_state() / save_state() — atomic bot_state.json I/O
+│   ├── alerts.py             # Email alerts via Yahoo SMTP
+│   └── orders.py             # (legacy) direct order helpers
+├── app.py                    # Streamlit UI — live monitor + backtest tabs
+├── config.py                 # Shared settings: tickers, strategy params, credentials
+├── main.py                   # Backtrader backtesting engine
+├── run_monitor.py            # Headless launcher (no UI)
+├── vwap_utils.py             # VWAP computation utilities
+├── start_monitor.sh          # Shell launcher for cron
+├── bot_state.json            # Intraday state — positions, reclaimed tickers, trade log
+├── logs/                     # Daily log files: monitor_YYYY-MM-DD.log
 ├── .env                      # API keys and SMTP credentials (never commit)
 └── requirements.txt
 ```
@@ -43,107 +109,150 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Python 3.10+ required (uses `match` statement).
+
 ---
 
 ## Configuration
 
-Create a `.env` file in the project root. No quotes around values, no spaces around `=`:
+### `.env` file
+
+Create `.env` in the project root. No quotes, no spaces around `=`:
 
 ```
+# Alpaca (order execution + optional data)
 APCA_API_KEY_ID=PKxxxxxxxxxxxxxxxx
 APCA_API_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-PAPER_TRADING=true
 
+# Tradier (bar data — recommended for 1-min bars)
+TRADIER_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
+
+# Broker: 'alpaca' (live/paper) | 'paper' (local simulation, no API needed)
+BROKER=alpaca
+
+# Data source: 'tradier' | 'alpaca'
+DATA_SOURCE=tradier
+
+# Email alerts (Yahoo Mail app password — 16 chars, no spaces)
 ALERT_EMAIL_USER=you@yahoo.com
 ALERT_EMAIL_PASS=your16charapppassword
 ALERT_EMAIL_FROM=you@yahoo.com
 ALERT_EMAIL_TO=you@yahoo.com
+
+# Redpanda / Kafka (optional — for durable event log)
+REDPANDA_BROKERS=127.0.0.1:9092
 ```
 
-Get Alpaca API keys at [alpaca.markets](https://alpaca.markets). Use paper trading keys for safe testing.
+### `config.py`
 
-All shared settings (tickers, strategy params, max positions, etc.) live in `config.py`. Both the UI and headless launcher read from there — change it once and it applies everywhere.
+All tunable strategy values live in `config.py` — tickers, per-ticker params, max positions, trade budget, order cooldown, etc. Both the UI and headless launcher read from it.
 
 ---
 
 ## Running
 
-### UI (live monitor + backtest in one place)
+### Streamlit UI
 
 ```bash
 streamlit run app.py
 ```
 
-Opens a browser with two tabs:
-- **Live Monitor** — start/stop the monitor, view open positions, today's trades, live log with auto-refresh
-- **Backtest** — run single-ticker or year-by-year compounding backtests
+Opens two tabs:
+- **Live Monitor** — start/stop the monitor, open positions, today's trades, live log with auto-refresh
+- **Backtest** — single-ticker or year-by-year compounding backtests
 
-All UI activity is logged to `logs/monitor_YYYY-MM-DD.log` — same file and format as the headless run.
-
-### Headless (command line / cron)
-
-```bash
-bash start_monitor.sh
-```
-
-Or directly:
+### Headless
 
 ```bash
 source venv/bin/activate
 python run_monitor.py
+# or
+bash start_monitor.sh
 ```
 
-Runs without any browser. Logs to `logs/monitor_YYYY-MM-DD.log`. Stops automatically at 3:15 PM ET with a full EOD summary.
+Logs to `logs/monitor_YYYY-MM-DD.log`. Stops automatically at 3:15 PM ET with an EOD summary.
 
-### Scheduled Daily (cron)
-
-Runs automatically at 6:00 AM PST (9:00 AM ET) on weekdays:
+### Cron (auto-start daily)
 
 ```
 0 6 * * 1-5 /path/to/trading_hub/start_monitor.sh >> /path/to/logs/cron.log 2>&1
 ```
 
-### Single instance enforcement
+Runs at 6:00 AM PST (9:00 AM ET) on weekdays.
 
-Only one monitor can run at a time. If you try to start a second instance (from either the UI or command line), it will refuse and print the PID of the running process. The lock file is at `.monitor.lock` in the project root and is cleaned up automatically on stop.
+### Single-instance enforcement
+
+Only one monitor can run at a time. A second start attempt (from UI or CLI) is refused with the PID of the running process. The lock file is `.monitor.lock` in the project root; cleaned up automatically on stop.
 
 ---
 
-## Live Trading Strategy: VWAP Reclaim
+## Trading Strategy: VWAP Reclaim
 
-All 9 conditions must be true simultaneously for a buy order to be placed:
+### Entry — all 9 conditions must hold simultaneously
 
 | # | Filter | Detail |
-|---|---|---|
-| 1 | **2-bar VWAP reclaim** | Was above VWAP → dipped below → reclaimed for 2 consecutive bars |
+|---|--------|--------|
+| 1 | **2-bar VWAP reclaim** | Was above VWAP → dipped below → closed above VWAP for 2 consecutive bars |
 | 2 | **Opened above VWAP** | Day bias is bullish |
 | 3 | **RSI 50–70** | Momentum without being overbought |
 | 4 | **RVOL ≥ 2×** | Twice the usual volume at this time of day |
 | 5 | **SPY above VWAP** | Market tailwind |
-| 6 | **Bid/ask spread ≤ 0.2%** | Spread not wider than profit margin |
-| 7 | **Not already traded today** | No double-dip on same ticker |
+| 6 | **Bid/ask spread ≤ 0.2%** | Spread not wider than target profit margin |
+| 7 | **Not already traded today** | No re-entry on same ticker intraday |
 | 8 | **Trading hours 9:45–3:00 PM ET** | Avoid noisy open and illiquid close |
-| 9 | **Max 5 concurrent positions** | Risk management |
+| 9 | **Max positions not exceeded** | Configurable; default 5 |
 
-**Exit conditions:** trailing stop (1×ATR), target (2×ATR), RSI overbought, VWAP breakdown, or EOD force-close at 3:00 PM ET.
+### Exit conditions (first triggered wins)
 
-**Order types:** Buys use marketable limit orders (ask + 0.05% buffer) — fills immediately like a market order but rejects if price spikes before fill. Sells use market orders for guaranteed exit speed.
+| Condition | Description |
+|-----------|-------------|
+| **Trailing stop** | Price drops 1×ATR below entry |
+| **Full target** | Price reaches 2×ATR above entry |
+| **Partial exit** | Sell half at 1×ATR profit; trail remainder |
+| **RSI overbought** | RSI crosses above 75 |
+| **VWAP breakdown** | Price closes below VWAP |
+| **EOD force-close** | All positions closed at 3:00 PM ET |
 
-**Friction model:** Alpaca is commission-free. A 0.01% slippage buffer is applied to the entry price. Entries are skipped if the bid/ask spread exceeds 0.2%.
+### Order execution
+
+- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask up to 3 times before abandoning
+- **Sells**: market order for guaranteed exit speed
+- **Slippage model**: 0.01% applied to entry price for accounting; Alpaca is commission-free
 
 ---
 
 ## Stock Scanning
 
-**Base watchlist:** 164 pre-selected liquid stocks across mega-cap tech, semiconductors, software, fintech, financials, energy, healthcare, consumer, and sector ETFs — defined in `config.py`.
+**Base watchlist**: ~165 liquid stocks across mega-cap tech, semiconductors, software, fintech, financials, energy, healthcare, consumer, and sector ETFs — defined in `config.py`.
 
-**Dynamic momentum tickers:** Refreshed every 30 minutes during market hours via the Alpaca screener API:
+**Dynamic momentum additions**: refreshed every 30 minutes by `MomentumScreener`:
 - Top 50 most active stocks by volume
 - Top 20 gainers
 
 Filtered by **Relative Strength**: only stocks outperforming SPY over the last 5 trading days are added.
 
-**Data fetching:** All tickers fetched in a single Alpaca batch API call (`feed='iex'`), then analyzed across 50 parallel threads — one full scan cycle per minute.
+**Data fetching**: all tickers fetched in a single batch API call per cycle; fan-out via `emit_batch()` (O(4) lock acquisitions regardless of ticker count).
+
+---
+
+## State Persistence
+
+`bot_state.json` is written atomically (tmp → replace) after every position change:
+
+```json
+{
+  "date": "2026-04-10",
+  "positions": {
+    "AAPL": {"entry_price": 175.0, "qty": 5, "stop": 172.0, "target": 178.5, ...}
+  },
+  "reclaimed_today": ["ZS"],
+  "trade_log": [
+    {"ticker": "ZS", "entry_price": 116.9, "exit_price": 116.64, "qty": 1, "pnl": -0.26, ...}
+  ]
+}
+```
+
+On restart, `load_state()` validates the date and restores positions and trade history. Then `RealTimeMonitor.__init__` runs **Alpaca reconciliation**: any position that Alpaca holds but `bot_state.json` doesn't know about is imported automatically, preventing orphaned positions from being ignored.
 
 ---
 
@@ -151,48 +260,50 @@ Filtered by **Relative Strength**: only stocks outperforming SPY over the last 5
 
 Both run modes write to `logs/monitor_YYYY-MM-DD.log`:
 
-| Event | Logged |
-|---|---|
-| Monitor start/stop | Strategy, ticker count, paper mode, PID |
-| Heartbeat (every 60s) | Ticker count, open positions, trade count, running PnL |
-| Every completed trade | Entry/exit price, time, quantity, PnL, exit reason |
-| Batch fetch errors | Data API errors with details |
-| Email alerts | Sent/failed status |
-
-The UI log viewer reads this file live with optional 5-second auto-refresh.
+| Event | Level | What's logged |
+|-------|-------|---------------|
+| Monitor start/stop | INFO | Strategy, tickers, broker, data source, PID |
+| Heartbeat (60 s) | INFO | Tickers, open positions, trades, win rate, running PnL |
+| SIGNAL | INFO | Ticker, action, price, RSI, RVOL |
+| ORDER_REQ | INFO | Side, qty, ticker, price, reason |
+| FILL | INFO | Side, qty, ticker, fill price, order ID |
+| ORDER_FAIL | WARNING | Side, qty, ticker, reason |
+| POSITION | INFO | Ticker, action, PnL (on close) |
+| RISK_BLOCK | INFO | Ticker, signal blocked, reason |
+| Alpaca reconciliation | WARNING | Any orphaned positions imported on startup |
 
 ---
 
 ## EOD Summary
 
-When the monitor stops (3:15 PM ET or manual stop), a detailed summary is logged:
+Logged (and optionally emailed) when the monitor stops:
 
 - Total trades, wins/losses, win rate
-- Average win / average loss
-- Profit factor
-- Best and worst trade
-- Exit reason breakdown
-- Per-ticker breakdown
-- Full trade-by-trade log with entry time, exit time, prices, PnL
+- Per-trade breakdown: entry/exit price, time, quantity, PnL, exit reason
+- Total PnL
 
 ---
 
-## Backtesting Strategies
+## Backtesting
+
+Powered by Backtrader. Strategies in `strategies/`:
 
 | Strategy | Description |
-|---|---|
+|----------|-------------|
 | EMA + RSI Crossover | Fast/slow EMA crossover with RSI filter |
 | Trend Following ATR | EMA crossover with ATR-based trailing stop |
 | Momentum Breakout | N-bar high breakout with ATR stop |
 | Mean Reversion | Bollinger Band lower touch + RSI oversold |
 
-Supports single-ticker backtests and year-by-year compounding (reinvest returns each year).
+Supports single-ticker backtests and year-by-year compounding (reinvest returns each year). Run via the Streamlit UI or directly via `main.py`.
 
 ---
 
 ## Requirements
 
-- Python 3.9+
-- Alpaca account (free paper trading available at [alpaca.markets](https://alpaca.markets))
-- Yahoo Mail app password for email alerts (16-character, no spaces)
+- Python 3.10+
+- Alpaca account — free paper trading at [alpaca.markets](https://alpaca.markets)
+- Tradier account — free developer sandbox at [tradier.com](https://tradier.com) (recommended for bar data)
+- Yahoo Mail app password for email alerts (optional)
+- Redpanda or Kafka broker for durable event log (optional — bot runs without it)
 - macOS/Linux for cron scheduling

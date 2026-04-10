@@ -62,6 +62,22 @@ class StateEngine:
 
         bus.subscribe(EventType.POSITION, self._on_position)
 
+    def seed(self, positions: dict, trade_log: list) -> None:
+        """
+        Pre-populate snapshot from restored on-disk state.
+
+        Call once after __init__ when restarting mid-session so that
+        HeartbeatEmitter / UI see the correct positions and trade history
+        before any new POSITION events arrive.
+        """
+        with self._lock:
+            self._positions = {k: copy.deepcopy(v) for k, v in positions.items()}
+            self._trade_log = copy.deepcopy(trade_log)
+        log.info(
+            f"[StateEngine] Seeded: {len(self._positions)} open positions, "
+            f"{len(self._trade_log)} completed trades"
+        )
+
     # ── Event handler ────────────────────────────────────────────────────────
 
     def _on_position(self, event: Event) -> None:

@@ -183,6 +183,12 @@ class RealTimeMonitor:
             trading_client = None
             log.warning("Alpaca keys not provided — order execution unavailable.")
 
+        # ── Alpaca position reconciliation ────────────────────────────────
+        # Query broker for actual open positions and import any that local
+        # state lost track of (e.g. positions opened in a previous session
+        # that didn't survive a restart cleanly).
+        self._sync_broker_positions(trading_client)
+
         # ── Event Bus ─────────────────────────────────────────────────────
         self._bus = EventBus()
 
@@ -239,6 +245,9 @@ class RealTimeMonitor:
         )
 
         self._state_engine = StateEngine(self._bus)
+        # Seed snapshot from restored on-disk state so HeartbeatEmitter and
+        # the UI show correct data before any new POSITION events arrive.
+        self._state_engine.seed(self.positions, self.trade_log)
 
         self._heartbeat = HeartbeatEmitter(
             bus=self._bus,
@@ -267,6 +276,70 @@ class RealTimeMonitor:
             f"max_pos={max_positions} cooldown={order_cooldown}s "
             f"redpanda={rp_brokers}"
         )
+
+    # ── Startup reconciliation ───────────────────────────────────────────────
+
+    def _sync_broker_positions(self, trading_client) -> None:
+        """
+        Import any Alpaca open positions that local state lost track of.
+
+        Called once during __init__ — before engines are wired — so that
+        RiskEngine, PositionManager, and StateEngine all start with a
+        complete and accurate view of open positions.
+
+        For each Alpaca position NOT in self.positions we:
+          • Add a minimal position record to self.positions.
+          • Add the ticker to self._reclaimed_today so RiskEngine treats it
+            as an existing position and won't open a duplicate.
+          • Log a WARNING so the discrepancy is visible in the log.
+        """
+        if not trading_client:
+            return
+        try:
+            alpaca_positions = trading_client.get_all_positions()
+        except Exception as e:
+            log.warning(f"[reconcile] Could not fetch Alpaca positions: {e}")
+            return
+
+        reconciled = 0
+        for ap in alpaca_positions:
+            ticker = str(ap.symbol)
+            if ticker in self.positions:
+                continue  # already tracked locally — trust local record
+
+            try:
+                avg_entry = float(ap.avg_entry_price or 0)
+                qty       = int(float(ap.qty or 0))
+            except (TypeError, ValueError):
+                log.warning(f"[reconcile] Bad position data from Alpaca for {ticker}; skipping")
+                continue
+
+            if qty <= 0 or avg_entry <= 0:
+                continue
+
+            self.positions[ticker] = {
+                'entry_price': avg_entry,
+                'qty':         qty,
+                'stop':        round(avg_entry * 0.97, 4),
+                'target':      round(avg_entry * 1.05, 4),
+                'entry_time':  'alpaca_restored',
+                'reason':      'alpaca_reconciliation',
+            }
+            self._reclaimed_today.add(ticker)
+            log.warning(
+                f"[reconcile] Imported orphaned Alpaca position: "
+                f"{qty} {ticker} @ ${avg_entry:.2f} "
+                f"(was absent from bot_state.json)"
+            )
+            reconciled += 1
+
+        if reconciled:
+            log.warning(
+                f"[reconcile] Imported {reconciled} orphaned position(s) from Alpaca. "
+                f"Verify stop/target prices — defaults are ±3%/±5% from avg entry."
+            )
+        else:
+            log.info("[reconcile] Local positions are in sync with Alpaca.")
 
     # ── Run loop ─────────────────────────────────────────────────────────────
 

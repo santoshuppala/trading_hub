@@ -26,7 +26,8 @@ from monitor import RealTimeMonitor
 from config import (
     TICKERS, STRATEGY, STRATEGY_PARAMS,
     OPEN_COST, CLOSE_COST, MAX_POSITIONS, ORDER_COOLDOWN,
-    ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, TRADIER_TOKEN, PAPER_TRADING,
+    ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, TRADIER_TOKEN,
+    PAPER_TRADING, DATA_SOURCE,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -46,7 +47,7 @@ log = logging.getLogger(__name__)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"Starting monitor | Strategy: {STRATEGY} | Tickers: {len(TICKERS)} | Paper: {PAPER_TRADING}")
+    log.info(f"Starting monitor | Strategy: {STRATEGY} | Tickers: {len(TICKERS)} | Paper: {PAPER_TRADING} | Data: {DATA_SOURCE}")
 
     monitor = RealTimeMonitor(
         tickers=TICKERS,
@@ -61,6 +62,7 @@ def main():
         paper=PAPER_TRADING,
         max_positions=MAX_POSITIONS,
         order_cooldown=ORDER_COOLDOWN,
+        data_source=DATA_SOURCE,
     )
 
     monitor.start()

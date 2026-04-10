@@ -61,7 +61,7 @@ def _remove_lock():
 from alpaca.trading.client import TradingClient
 
 from .alerts import send_alert
-from .data_client import TradierDataClient
+from .data_client import make_data_client
 from .screener import MomentumScreener
 from .signals import SignalAnalyzer
 from .orders import OrderManager
@@ -94,6 +94,7 @@ class RealTimeMonitor:
         max_positions=5,
         order_cooldown=300,
         per_ticker_params=None,
+        data_source='tradier',
     ):
         self.base_tickers = list(tickers)    # fixed watchlist
         self.tickers = list(tickers)         # active list (base + dynamic momentum)
@@ -127,14 +128,15 @@ class RealTimeMonitor:
             trading_client = None
             log.warning("Alpaca keys not provided — orders will be skipped.")
 
-        # ── Tradier: market data source ────────────────────────────────
+        # ── Market data client (provider selected by data_source) ─────
         token = tradier_token or os.getenv('TRADIER_TOKEN', '')
-        if token:
-            data_client = TradierDataClient(token)
-            log.info("Tradier data client initialized.")
-        else:
-            data_client = TradierDataClient('')
-            log.warning("Tradier token not provided — market data will be unavailable.")
+        data_client = make_data_client(
+            data_source,
+            tradier_token=token,
+            alpaca_api_key=api_key,
+            alpaca_secret=api_secret,
+        )
+        log.info(f"Data client initialized: {data_source}.")
 
         self._data = data_client
         self._screener = MomentumScreener(data_client)

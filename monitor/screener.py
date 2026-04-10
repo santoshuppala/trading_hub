@@ -94,12 +94,12 @@ class MomentumScreener:
 
     def _fetch_momentum_candidates(self, base_tickers):
         """
-        Use Tradier batch quotes to find top movers in the screen universe.
+        Use batch quotes to find top movers in the screen universe.
         Returns a set of symbols.
         """
         universe = list(set(self._SCREEN_UNIVERSE) | set(base_tickers))
         try:
-            quotes = self._data_client._fetch_quotes(universe)
+            quotes = self._data_client.get_quotes(universe)
             if not quotes:
                 return set()
 
@@ -145,7 +145,7 @@ class MomentumScreener:
         bars = {}
 
         def _fetch(sym):
-            return sym, self._data_client._fetch_daily_history(sym, start, end)
+            return sym, self._data_client.get_daily_history(sym, start, end)
 
         with ThreadPoolExecutor(max_workers=10) as ex:
             futures = {ex.submit(_fetch, s): s for s in symbols}

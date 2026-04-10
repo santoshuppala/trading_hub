@@ -65,7 +65,12 @@ CLOSE_COST     = 0.0
 
 # ── Credentials (read from environment / .env) ─────────────────────────────────
 ALERT_EMAIL    = os.getenv('ALERT_EMAIL_TO', 'usantoshayyappa@yahoo.com')
-ALPACA_API_KEY = os.getenv('APCA_API_KEY_ID')       # order execution only
-ALPACA_SECRET  = os.getenv('APCA_API_SECRET_KEY')   # order execution only
-TRADIER_TOKEN  = os.getenv('TRADIER_TOKEN')          # market data source
+ALPACA_API_KEY = os.getenv('APCA_API_KEY_ID')       # order execution (always Alpaca)
+ALPACA_SECRET  = os.getenv('APCA_API_SECRET_KEY')   # order execution (always Alpaca)
+TRADIER_TOKEN  = os.getenv('TRADIER_TOKEN')          # market data — required when DATA_SOURCE=tradier
 PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
+
+# ── Data source ────────────────────────────────────────────────────────────────
+# 'tradier' — Tradier REST API (recommended; commission-free data, no SDK)
+# 'alpaca'  — Alpaca Data API (uses same key/secret as order execution)
+DATA_SOURCE = os.getenv('DATA_SOURCE', 'tradier')

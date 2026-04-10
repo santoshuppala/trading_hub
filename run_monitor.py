@@ -8,69 +8,18 @@ import sys
 import time
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo('America/New_York')
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
-from realtime_main import RealTimeMonitor
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-TICKERS = [
-    # Mega-cap tech
-    'AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','AVGO','ASML','ORCL',
-    # Semiconductors
-    'AMD','MU','QCOM','AMAT','LRCX','TXN','ADI','MRVL','KLAC','NXPI','ON','SWKS',
-    # Software / cloud
-    'ADBE','CRM','INTU','SNPS','CDNS','NOW','WDAY','DDOG','SNOW','NET','ZS','OKTA',
-    'TEAM','MDB','GTLB','PATH','HUBS','ZM','DOCU',
-    # Internet / e-commerce
-    'NFLX','UBER','LYFT','ABNB','DASH','SHOP','ETSY','EBAY','PINS','SNAP',
-    # Hardware / devices
-    'CSCO','IBM','HPQ','DELL','NTAP','STX','WDC',
-    # Fintech / payments
-    'V','MA','PYPL','SQ','AFRM','SOFI','UPST','NU',
-    # Crypto-adjacent
-    'COIN','HOOD','MSTR','RIOT','CLSK','MARA','HUT',
-    # High-growth / speculative
-    'PLTR','RBLX','ROKU','TWLO','BILL','SMAR',
-    # Financials
-    'JPM','BAC','WFC','GS','MS','C','AXP','SCHW','BLK','KKR','APO','BX','ICE','CME',
-    # Energy
-    'XOM','CVX','COP','EOG','SLB','HAL','OXY','MPC','PSX','VLO',
-    # Healthcare / biotech
-    'UNH','LLY','JNJ','ABBV','MRK','PFE','AMGN','GILD','REGN','VRTX',
-    'DXCM','ISRG','IDXX','MTD','VEEV','INCY',
-    # Consumer discretionary
-    'AMZN','TSLA','HD','MCD','SBUX','NKE','TGT','LOW','BKNG','CMG','YUM',
-    # Consumer staples
-    'WMT','COST','PG','KO','PEP','MDLZ','CL',
-    # Industrials
-    'CAT','DE','HON','GE','RTX','LMT','NOC','BA','UPS','FDX',
-    # ETFs (market + sector)
-    'SPY','QQQ','IWM','DIA',
-    'XLK','XLF','XLE','XLV','XLY','XLI','XLC','XLRE','XLB','XLU',
-    'ARKK','SOXS','SOXL','TQQQ','SQQQ',
-]
-
-STRATEGY      = 'confirmed_crossover'
-OPEN_COST     = 0.0    # Alpaca is commission-free; slippage modelled in RealTimeMonitor
-CLOSE_COST    = 0.0
-MAX_POSITIONS = 5
-ORDER_COOLDOWN = 300  # seconds between orders on same ticker
-
-STRATEGY_PARAMS = {
-    'rsi_period':      14,
-    'atr_period':      14,
-    'atr_multiplier':  2.0,
-    'volume_factor':   1.5,
-    'min_stop_pct':    0.05,
-    'rsi_overbought':  70,
-}
-
-# Set these via environment variables or fill in directly
-ALERT_EMAIL     = os.getenv('ALERT_EMAIL_TO', 'usantoshayyappa@yahoo.com')
-ALPACA_API_KEY  = os.getenv('APCA_API_KEY_ID')
-ALPACA_SECRET   = os.getenv('APCA_API_SECRET_KEY')
-PAPER_TRADING   = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
+from monitor import RealTimeMonitor
+from config import (
+    TICKERS, STRATEGY, STRATEGY_PARAMS,
+    OPEN_COST, CLOSE_COST, MAX_POSITIONS, ORDER_COOLDOWN,
+    ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
@@ -110,19 +59,27 @@ def main():
 
     try:
         while True:
-            now = datetime.now()
+            now = datetime.now(ET)
             # Stop at 3:15 PM ET (after 3 PM force-close has fired)
             if now.hour == 15 and now.minute >= 15:
                 log.info("3:15 PM ET reached — stopping monitor.")
                 break
-            # Print daily summary every hour
-            if now.minute == 0:
-                trades = monitor.trade_log
-                if trades:
-                    wins  = sum(1 for t in trades if t['is_win'])
-                    total_pnl = sum(t['pnl'] for t in trades)
-                    log.info(f"Hourly summary: {len(trades)} trades | {wins} wins | PnL: ${total_pnl:+.2f}")
-            time.sleep(30)
+            # Heartbeat every minute — confirms process is alive
+            trades     = monitor.trade_log
+            positions  = monitor.positions
+            tickers    = monitor.tickers
+            wins       = sum(1 for t in trades if t['is_win'])
+            total_pnl  = sum(t['pnl'] for t in trades)
+            log.info(
+                f"[heartbeat] scanning {len(tickers)} tickers | "
+                f"open positions: {len(positions)} {list(positions.keys()) or 'none'} | "
+                f"trades today: {len(trades)} ({wins} wins) | "
+                f"PnL: ${total_pnl:+.2f}"
+            )
+            # Hourly summary
+            if now.minute == 0 and trades:
+                log.info(f"Hourly summary: {len(trades)} trades | {wins} wins | PnL: ${total_pnl:+.2f}")
+            time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
     finally:
@@ -132,7 +89,7 @@ def main():
         bar = "=" * W
 
         log.info(bar)
-        log.info(f"  EOD SUMMARY — {datetime.now().strftime('%A, %Y-%m-%d')}")
+        log.info(f"  EOD SUMMARY — {datetime.now(ET).strftime('%A, %Y-%m-%d')}")
         log.info(bar)
 
         if not trades:

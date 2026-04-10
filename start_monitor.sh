@@ -7,15 +7,23 @@ export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 cd /Users/santosh/Documents/santosh/trading_hub/trading_hub
 
-# Load .env — parse line by line, skip blank lines and comments
+# Load .env — parse line by line, strip quotes and inline comments
 if [ -f .env ]; then
     while IFS= read -r line || [ -n "$line" ]; do
-        # Strip inline comments, trim whitespace
+        # Strip inline comments
         line="${line%%#*}"
+        # Trim leading/trailing whitespace
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
-        # Export non-empty KEY=VALUE lines
-        [ -n "$line" ] && [ "${line#*=}" != "$line" ] && export "$line"
+        # Skip empty lines and lines without =
+        [ -z "$line" ] && continue
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        # Strip surrounding single or double quotes from value
+        val="${val%\"}" ; val="${val#\"}"
+        val="${val%\'}" ; val="${val#\'}"
+        export "$key=$val"
     done < .env
 fi
 

@@ -289,6 +289,13 @@ class ConfirmedCrossoverStrategy(BaseTradeStrategy):
 
 
 def get_strategy_class(name):
+    # Import from strategies package to avoid duplication
+    from strategies import get_strategy_class as _pkg_get
+    from strategies import VWAPReclaimStrategy  # noqa: F401
+    cls = _pkg_get(name)
+    if cls is not None:
+        return cls
+    # Fallback to locally-defined strategies (confirmed_crossover etc.)
     strategies = {
         'ema_rsi': EMARSICrossoverStrategy,
         'trend_atr': TrendFollowingATRStrategy,

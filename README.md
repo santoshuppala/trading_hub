@@ -1,91 +1,198 @@
-# Trading Bot Backtesting
+# Trading Hub
 
-This is a backtesting trading bot for stocks using a strategy based on EMA crossover and RSI indicators. The bot aims to achieve consistent returns, but please note that past performance does not guarantee future results. Trading involves risk, and this is for educational purposes only.
+A real-time stock trading system with backtesting, live monitoring, and automated scheduling. Uses Alpaca for order execution and market data, and implements a VWAP Reclaim strategy with institutional-grade filters.
 
-## Strategy Description
+> **Disclaimer:** This is for educational purposes only. Trading involves significant risk. Always start with paper trading. Consult a financial advisor before trading with real money.
 
-The strategy uses:
-- Fast EMA (9-period)
-- Slow EMA (21-period)
-- RSI (14-period)
+---
 
-Buy signal: When fast EMA crosses above slow EMA and RSI < 70
-Sell signal: When fast EMA crosses below slow EMA or RSI > 70
+## Project Structure
 
-## Initial Investment
+```
+trading_hub/
+├── monitor/                  # Real-time monitor modules
+│   ├── alerts.py             # Email alert logic (Yahoo SMTP)
+│   ├── data_client.py        # Alpaca data fetching (bars, quotes, SPY bias)
+│   ├── screener.py           # Momentum screener + Relative Strength filter
+│   ├── signals.py            # VWAP Reclaim signal analysis (entry/exit)
+│   ├── orders.py             # Order placement (marketable limit / market)
+│   └── monitor.py            # RealTimeMonitor orchestrator + lock file guard
+├── strategies/               # Backtrader strategy classes (for backtesting)
+│   ├── base.py               # BaseTradeStrategy
+│   ├── ema_rsi.py            # EMA + RSI Crossover
+│   ├── trend_atr.py          # Trend Following ATR
+│   ├── momentum_breakout.py  # Momentum Breakout
+│   └── mean_reversion.py     # Mean Reversion (Bollinger + RSI)
+├── app.py                    # Unified Streamlit UI (live monitor + backtest)
+├── main.py                   # Backtesting engine
+├── run_monitor.py            # Headless daily launcher (no UI required)
+├── start_monitor.sh          # Shell launcher for cron scheduling
+├── config.py                 # Shared configuration (tickers, strategy, credentials)
+├── logs/                     # Daily log files (monitor_YYYY-MM-DD.log)
+├── .env                      # API keys and SMTP credentials (never commit)
+└── requirements.txt
+```
 
-$1000
-
-## Backtesting Period
-
-From 2020-01-01 to present, using AAPL stock data.
-
-## Disclaimer
-
-This bot is a simulation and does not execute real trades. No strategy can guarantee 3% monthly returns, as markets are unpredictable. Use at your own risk. Consult a financial advisor before investing real money.
-
-## Requirements
-
-- Python 3.x
-- Dependencies listed in requirements.txt
+---
 
 ## Installation
 
-1. Install Python dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-## Running the Backtest
-
-### Command Line
-Run the main script:
-```
-python main.py
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### GUI (Web-based)
-Run the GUI app:
+---
+
+## Configuration
+
+Create a `.env` file in the project root. No quotes around values, no spaces around `=`:
+
 ```
-streamlit run gui.py
-```
+APCA_API_KEY_ID=PKxxxxxxxxxxxxxxxx
+APCA_API_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+PAPER_TRADING=true
 
-This opens a web browser with a GUI to enter a ticker symbol, set open/close cost percentages, and run the backtest. The app now also includes:
-- selectable strategy modes: EMA + RSI Crossover, Trend Following ATR, Momentum Breakout, and Mean Reversion
-- custom strategy parameter inputs for each mode
-- an optimization mode to sweep valid parameter combinations
-- yearly returns, trade summary, and exact trade timestamps for intraday data
-
-The script will output the backtesting results, including total return, average monthly return, annual return, max drawdown, and Sharpe ratio.
-
-## Real-Time Trading
-
-Run the real-time GUI:
-```
-streamlit run realtime_gui.py
+ALERT_EMAIL_USER=you@yahoo.com
+ALERT_EMAIL_PASS=your16charapppassword
+ALERT_EMAIL_FROM=you@yahoo.com
+ALERT_EMAIL_TO=you@yahoo.com
 ```
 
-The GUI includes a real-time monitoring section to analyze stocks every second and generate alerts.
+Get Alpaca API keys at [alpaca.markets](https://alpaca.markets). Use paper trading keys for safe testing.
 
-### Setup
-- Select a strategy and set parameters.
-- Enter a comma-separated list of tickers to monitor.
-- Optionally provide an email address for alerts (requires SMTP configuration in code).
-- Enter your Alpaca API key and secret key (get from [alpaca.markets](https://alpaca.markets)).
-- Choose paper trading for safe testing.
-- Click "Start Real-Time Monitor" to begin.
+All shared settings (tickers, strategy params, max positions, etc.) live in `config.py`. Both the UI and headless launcher read from there — change it once and it applies everywhere.
 
-### Features
-- Analyzes each stock in the watchlist every second using 1-minute data.
-- Generates BUY alerts when strategy conditions are met.
-- Tracks positions and generates SELL alerts when exit conditions are met.
-- Displays current positions in the GUI.
-- Executes real trades via Alpaca API if keys are provided.
+---
 
-### Important Notes
-- Real-time trading involves significant risk and requires a brokerage account with API access for actual order execution.
-- This implementation uses Yahoo Finance for data, which has rate limits and may not be suitable for high-frequency trading.
-- For production use, integrate with a professional trading API (e.g., Alpaca, Interactive Brokers).
-- Alerts are currently printed to console or sent via email; customize as needed.
-- This is for educational purposes only; consult a financial advisor before trading with real money.
-- Start with paper trading to test without risking real money.
+## Running
+
+### UI (live monitor + backtest in one place)
+
+```bash
+streamlit run app.py
+```
+
+Opens a browser with two tabs:
+- **Live Monitor** — start/stop the monitor, view open positions, today's trades, live log with auto-refresh
+- **Backtest** — run single-ticker or year-by-year compounding backtests
+
+All UI activity is logged to `logs/monitor_YYYY-MM-DD.log` — same file and format as the headless run.
+
+### Headless (command line / cron)
+
+```bash
+bash start_monitor.sh
+```
+
+Or directly:
+
+```bash
+source venv/bin/activate
+python run_monitor.py
+```
+
+Runs without any browser. Logs to `logs/monitor_YYYY-MM-DD.log`. Stops automatically at 3:15 PM ET with a full EOD summary.
+
+### Scheduled Daily (cron)
+
+Runs automatically at 6:00 AM PST (9:00 AM ET) on weekdays:
+
+```
+0 6 * * 1-5 /path/to/trading_hub/start_monitor.sh >> /path/to/logs/cron.log 2>&1
+```
+
+### Single instance enforcement
+
+Only one monitor can run at a time. If you try to start a second instance (from either the UI or command line), it will refuse and print the PID of the running process. The lock file is at `.monitor.lock` in the project root and is cleaned up automatically on stop.
+
+---
+
+## Live Trading Strategy: VWAP Reclaim
+
+All 9 conditions must be true simultaneously for a buy order to be placed:
+
+| # | Filter | Detail |
+|---|---|---|
+| 1 | **2-bar VWAP reclaim** | Was above VWAP → dipped below → reclaimed for 2 consecutive bars |
+| 2 | **Opened above VWAP** | Day bias is bullish |
+| 3 | **RSI 50–70** | Momentum without being overbought |
+| 4 | **RVOL ≥ 2×** | Twice the usual volume at this time of day |
+| 5 | **SPY above VWAP** | Market tailwind |
+| 6 | **Bid/ask spread ≤ 0.2%** | Spread not wider than profit margin |
+| 7 | **Not already traded today** | No double-dip on same ticker |
+| 8 | **Trading hours 9:45–3:00 PM ET** | Avoid noisy open and illiquid close |
+| 9 | **Max 5 concurrent positions** | Risk management |
+
+**Exit conditions:** trailing stop (1×ATR), target (2×ATR), RSI overbought, VWAP breakdown, or EOD force-close at 3:00 PM ET.
+
+**Order types:** Buys use marketable limit orders (ask + 0.05% buffer) — fills immediately like a market order but rejects if price spikes before fill. Sells use market orders for guaranteed exit speed.
+
+**Friction model:** Alpaca is commission-free. A 0.01% slippage buffer is applied to the entry price. Entries are skipped if the bid/ask spread exceeds 0.2%.
+
+---
+
+## Stock Scanning
+
+**Base watchlist:** 164 pre-selected liquid stocks across mega-cap tech, semiconductors, software, fintech, financials, energy, healthcare, consumer, and sector ETFs — defined in `config.py`.
+
+**Dynamic momentum tickers:** Refreshed every 30 minutes during market hours via the Alpaca screener API:
+- Top 50 most active stocks by volume
+- Top 20 gainers
+
+Filtered by **Relative Strength**: only stocks outperforming SPY over the last 5 trading days are added.
+
+**Data fetching:** All tickers fetched in a single Alpaca batch API call (`feed='iex'`), then analyzed across 50 parallel threads — one full scan cycle per minute.
+
+---
+
+## Logging
+
+Both run modes write to `logs/monitor_YYYY-MM-DD.log`:
+
+| Event | Logged |
+|---|---|
+| Monitor start/stop | Strategy, ticker count, paper mode, PID |
+| Heartbeat (every 60s) | Ticker count, open positions, trade count, running PnL |
+| Every completed trade | Entry/exit price, time, quantity, PnL, exit reason |
+| Batch fetch errors | Data API errors with details |
+| Email alerts | Sent/failed status |
+
+The UI log viewer reads this file live with optional 5-second auto-refresh.
+
+---
+
+## EOD Summary
+
+When the monitor stops (3:15 PM ET or manual stop), a detailed summary is logged:
+
+- Total trades, wins/losses, win rate
+- Average win / average loss
+- Profit factor
+- Best and worst trade
+- Exit reason breakdown
+- Per-ticker breakdown
+- Full trade-by-trade log with entry time, exit time, prices, PnL
+
+---
+
+## Backtesting Strategies
+
+| Strategy | Description |
+|---|---|
+| EMA + RSI Crossover | Fast/slow EMA crossover with RSI filter |
+| Trend Following ATR | EMA crossover with ATR-based trailing stop |
+| Momentum Breakout | N-bar high breakout with ATR stop |
+| Mean Reversion | Bollinger Band lower touch + RSI oversold |
+
+Supports single-ticker backtests and year-by-year compounding (reinvest returns each year).
+
+---
+
+## Requirements
+
+- Python 3.9+
+- Alpaca account (free paper trading available at [alpaca.markets](https://alpaca.markets))
+- Yahoo Mail app password for email alerts (16-character, no spaces)
+- macOS/Linux for cron scheduling

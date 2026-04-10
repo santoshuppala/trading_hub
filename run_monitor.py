@@ -4,6 +4,7 @@ Scheduled daily at 6:00 AM PST (9:00 AM ET, 30 min before open).
 Stops automatically at 3:15 PM ET after all positions are force-closed.
 """
 import os
+import signal
 import sys
 import time
 import logging
@@ -11,6 +12,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo('America/New_York')
+
+# SIGTERM handler: convert to KeyboardInterrupt so the finally block runs
+# and atexit callbacks fire (which removes the lock file).
+def _handle_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))

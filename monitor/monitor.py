@@ -389,6 +389,7 @@ class RealTimeMonitor:
 
         if not self.running:
             _write_lock()
+            atexit.register(_remove_lock)   # cleans up on any normal exit or SIGTERM
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
             log.info(f"Real-time monitoring started (PID {os.getpid()}).")

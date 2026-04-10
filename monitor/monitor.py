@@ -1,21 +1,56 @@
+"""
+T9 — Monitor Orchestrator
+==========================
+Thin wiring layer that creates the EventBus, instantiates all engines,
+and runs the main data-fetch loop.
+
+Architecture
+------------
+  Data fetch loop (this file)
+    └─ emits BAR events ──────────────────────────────────────┐
+                                                              ▼
+  StrategyEngine  ← BAR → SIGNAL(buy / sell_* / partial_sell)
+  RiskEngine      ← SIGNAL → ORDER_REQ | RISK_BLOCK
+  Broker          ← ORDER_REQ → FILL | ORDER_FAIL
+  ExecutionFeedback ← SIGNAL(buy) + FILL → patches positions
+  PositionManager ← FILL → POSITION (opens / closes / partial)
+  StateEngine     ← POSITION → clean snapshot for UI
+  EventLogger     ← * → structured log lines
+  HeartbeatEmitter ← tick() → HEARTBEAT every 60 s
+
+Public interface (backward-compatible)
+---------------------------------------
+  Attributes: tickers, positions, trade_log, running
+  Methods   : start(), stop()
+
+Configuration
+-------------
+  All tunable values come from config.py / environment variables.
+  DATA_SOURCE : 'tradier' | 'alpaca'
+  BROKER      : 'alpaca'  | 'paper'
+  TRADE_BUDGET: dollars allocated per trade (default 1000)
+"""
+from __future__ import annotations
+
 import atexit
 import logging
 import os
 import subprocess
-import sys
 import time
 import threading
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
+ET        = ZoneInfo('America/New_York')
 LOCK_FILE = os.path.join(os.path.dirname(__file__), '..', '.monitor.lock')
 
 
-def _pid_is_monitor(pid):
-    """Return True if the given PID is actually a Python process (not a reused PID)."""
+# ── Process-level singleton lock ─────────────────────────────────────────────
+
+def _pid_is_monitor(pid: int) -> bool:
     try:
         result = subprocess.run(
             ['ps', '-p', str(pid), '-o', 'comm='],
@@ -23,17 +58,15 @@ def _pid_is_monitor(pid):
         )
         return 'python' in result.stdout.lower()
     except Exception:
-        return True  # can't verify — assume it's valid
+        return True
 
 
 def _is_running_elsewhere():
-    """Return (True, pid) if another monitor process holds the lock, else (False, None)."""
     try:
         with open(LOCK_FILE) as f:
             pid = int(f.read().strip())
-        os.kill(pid, 0)   # raises OSError if PID is gone
+        os.kill(pid, 0)
         if not _pid_is_monitor(pid):
-            # PID was reused by a non-Python process — stale lock
             log.warning(f"Stale lock (PID {pid} is not a Python process). Removing.")
             os.remove(LOCK_FILE)
             return False, None
@@ -41,7 +74,6 @@ def _is_running_elsewhere():
     except (FileNotFoundError, ValueError):
         return False, None
     except OSError:
-        # PID is gone — stale lock
         log.warning("Stale lock file found (process no longer running). Removing.")
         os.remove(LOCK_FILE)
         return False, None
@@ -58,26 +90,33 @@ def _remove_lock():
     except FileNotFoundError:
         pass
 
+
+# ── Orchestrator ─────────────────────────────────────────────────────────────
+
 from alpaca.trading.client import TradingClient
 
-from .alerts import send_alert
+from .brokers import make_broker
 from .data_client import make_data_client
+from .event_bus import BarPayload, Event, EventBus, EventType, DispatchMode
+from .event_log import DurableEventLog
+from .execution_feedback import ExecutionFeedback
+from .observability import EODSummary, EventLogger, HeartbeatEmitter
+from .position_manager import PositionManager
+from .risk_engine import RiskEngine
 from .screener import MomentumScreener
-from .state import save_state, load_state
-from .signals import SignalAnalyzer
-from .orders import OrderManager
-
-ET = ZoneInfo('America/New_York')
+from .state import load_state
+from .state_engine import StateEngine
+from .strategy_engine import StrategyEngine
 
 
 class RealTimeMonitor:
     """
-    Orchestrates real-time monitoring, signal analysis, and order execution
-    using the VWAP reclaim strategy.
+    Orchestrates all trading engines via the EventBus.
 
-    Public interface (backward-compatible with realtime_main.RealTimeMonitor):
-      Attributes: tickers, positions, trade_log, running
-      Methods:    start(), stop()
+    __init__  : wires up every engine; restores intraday state from disk.
+    start()   : spawns the run loop in a daemon thread.
+    stop()    : signals the loop to stop; waits for thread.
+    run()     : the main loop — fetches bars, emits BAR events, ticks heartbeat.
     """
 
     def __init__(
@@ -97,347 +136,242 @@ class RealTimeMonitor:
         per_ticker_params=None,
         data_source='tradier',
         trade_budget=1000,
+        redpanda_brokers=None,
     ):
-        self.base_tickers = list(tickers)    # fixed watchlist
-        self.tickers = list(tickers)         # active list (base + dynamic momentum)
-        self.strategy_name = strategy_name
-        self.strategy_params = strategy_params
-        self.per_ticker_params = per_ticker_params or {}
-        self.open_cost = open_cost           # kept for backtest compatibility
-        self.close_cost = close_cost
-        self.alert_email = alert_email
-        self._bars_cache = {}                # today's bars: {ticker: DataFrame}
-        self._rvol_cache = {}                # historical bars for RVOL: {ticker: DataFrame}
-        self._last_momentum_refresh = None   # datetime of last screener refresh
+        # ── Watchlist ──────────────────────────────────────────────────────
+        self.base_tickers = list(tickers)
+        self.tickers      = list(tickers)
+
+        # ── Shared mutable state ───────────────────────────────────────────
+        saved_pos, saved_reclaimed, saved_trades = load_state()
+        self.positions       = saved_pos
+        self.trade_log       = saved_trades
+        self._reclaimed_today   = saved_reclaimed
+        self._last_order_time   = {}
+        self._last_reset_date   = datetime.now(ET).date()
+        self._last_momentum_refresh = None
+
+        # ── Caches (for the data fetch layer) ─────────────────────────────
+        self._bars_cache = {}
+        self._rvol_cache = {}
+
+        # ── Control ───────────────────────────────────────────────────────
         self.running = False
-        self.thread = None
-        self.max_positions = max_positions
-        self.order_cooldown = order_cooldown
-        self.trade_budget = trade_budget         # dollars per trade
-        self.last_order_time = {}
-        self._last_reset_date = datetime.now(ET).date()
+        self.thread  = None
 
-        # Restore intraday state from disk (no-op on first run or new day)
-        saved_positions, saved_reclaimed, saved_trades = load_state()
-        self.positions = saved_positions
-        self.reclaimed_today = saved_reclaimed
-        self.trade_log = saved_trades
-
-        # ── Alpaca: order execution only ───────────────────────────────
+        # ── Credentials ───────────────────────────────────────────────────
         api_key    = alpaca_api_key    or os.getenv('APCA_API_KEY_ID', '')
         api_secret = alpaca_secret_key or os.getenv('APCA_API_SECRET_KEY', '')
+        token      = tradier_token     or os.getenv('TRADIER_TOKEN', '')
 
-        if api_key and api_secret:
-            trading_client = TradingClient(api_key, api_secret, paper=paper)
-            log.info(f"Alpaca trading client initialized (paper={paper}).")
-        else:
-            trading_client = None
-            log.warning("Alpaca keys not provided — orders will be skipped.")
-
-        # ── Market data client (provider selected by data_source) ─────
-        token = tradier_token or os.getenv('TRADIER_TOKEN', '')
+        # ── Data client ───────────────────────────────────────────────────
         data_client = make_data_client(
             data_source,
             tradier_token=token,
             alpaca_api_key=api_key,
             alpaca_secret=api_secret,
         )
-        log.info(f"Data client initialized: {data_source}.")
-
-        self._data = data_client
+        self._data     = data_client
         self._screener = MomentumScreener(data_client)
-        self._signal_analyzer = SignalAnalyzer(strategy_params, self.per_ticker_params)
-        self._order_manager = OrderManager(trading_client, alert_email)
+        log.info(f"Data client: {data_source}")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        # ── Alpaca trading client (order execution) ────────────────────────
+        if api_key and api_secret:
+            trading_client = TradingClient(api_key, api_secret, paper=paper)
+            log.info(f"Alpaca trading client initialised (paper={paper}).")
+        else:
+            trading_client = None
+            log.warning("Alpaca keys not provided — order execution unavailable.")
 
-    def _send_alert(self, message):
-        send_alert(self.alert_email, message)
+        # ── Event Bus ─────────────────────────────────────────────────────
+        self._bus = EventBus()
 
-    def _save_state(self):
-        save_state(self.positions, self.reclaimed_today, self.trade_log)
+        # ── Engines (subscription order = handler priority) ────────────────
+        #   1. EventLogger   — passive; subscribes last so it sees everything
+        #   2. StrategyEngine — converts BAR → SIGNAL
+        #   3. RiskEngine     — converts SIGNAL → ORDER_REQ | RISK_BLOCK
+        #   4. Broker         — converts ORDER_REQ → FILL | ORDER_FAIL
+        #   5. ExecutionFeedback — patches positions after buy fill
+        #   6. PositionManager — opens/closes positions on FILL
+        #   7. StateEngine    — maintains read-only snapshot from POSITION
+        #   8. HeartbeatEmitter — periodic HEARTBEAT (called from run loop)
 
-    def _reset_daily_state(self):
-        """Reset per-day tracking at the start of each new trading day."""
-        today = datetime.now(ET).date()
-        if today != self._last_reset_date:
-            self.reclaimed_today.clear()
-            self._last_reset_date = today
+        self._strategy = StrategyEngine(
+            bus=self._bus,
+            positions=self.positions,
+            strategy_params=strategy_params,
+            per_ticker_params=per_ticker_params or {},
+            data_client=data_client,
+        )
 
-    # ------------------------------------------------------------------
-    # Core loop methods
-    # ------------------------------------------------------------------
+        self._risk = RiskEngine(
+            bus=self._bus,
+            positions=self.positions,
+            reclaimed_today=self._reclaimed_today,
+            last_order_time=self._last_order_time,
+            data_client=data_client,
+            max_positions=max_positions,
+            order_cooldown=order_cooldown,
+            trade_budget=trade_budget,
+            alert_email=alert_email,
+        )
 
-    def analyze_ticker(self, ticker):
-        """Analyze a single ticker and place orders if conditions are met."""
-        try:
-            self._reset_daily_state()
+        broker_source = os.getenv('BROKER', 'alpaca')
+        self._broker = make_broker(
+            source=broker_source,
+            bus=self._bus,
+            trading_client=trading_client,
+            alert_email=alert_email,
+        )
 
-            now = datetime.now(ET)
-            hour, minute = now.hour, now.minute
+        self._exec_feedback = ExecutionFeedback(
+            bus=self._bus,
+            positions=self.positions,
+        )
 
-            # Force-close all positions by 3:00 PM ET
-            force_close = hour == 15 and minute >= 0
-            if force_close and ticker in self.positions:
-                data = self._data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
-                today = now.date()
-                data = data[data.index.date == today] if not data.empty else data
-                if not data.empty:
-                    current_price = float(data['close'].iloc[-1])
-                    pos = self.positions[ticker]
-                    qty = pos['quantity']
-                    if qty > 0:
-                        order_id = self._order_manager.place_sell(ticker, qty)
-                        if order_id:
-                            pnl = (current_price - pos['entry_price']) * qty
-                            self._send_alert(
-                                f"SELL (EOD close): {ticker} @ ${current_price:.2f} | PnL: ${pnl:.2f}"
-                            )
-                            self.trade_log.append({
-                                'ticker': ticker,
-                                'entry_price': pos['entry_price'],
-                                'entry_time': pos.get('entry_time', ''),
-                                'exit_price': current_price,
-                                'qty': qty,
-                                'pnl': round(pnl, 2),
-                                'reason': 'EOD force close',
-                                'time': now.strftime('%H:%M:%S'),
-                                'is_win': pnl >= 0,
-                            })
-                            del self.positions[ticker]
-                            self._save_state()
-                return
+        self._pos_manager = PositionManager(
+            bus=self._bus,
+            positions=self.positions,
+            reclaimed_today=self._reclaimed_today,
+            last_order_time=self._last_order_time,
+            trade_log=self.trade_log,
+            alert_email=alert_email,
+        )
 
-            # Only trade 9:45 AM – 3:00 PM ET
-            market_open = (hour == 9 and minute >= 45) or (10 <= hour <= 14)
-            if not market_open:
-                return
+        self._state_engine = StateEngine(self._bus)
 
-            data = self._data.get_bars(ticker, self._bars_cache, self._rvol_cache, calendar_days=2)
-            if data.empty:
-                return
-            today = now.date()
-            data = data[data.index.date == today]
-            if len(data) < 30:
-                return
+        self._heartbeat = HeartbeatEmitter(
+            bus=self._bus,
+            state_engine=self._state_engine,
+            n_tickers=len(self.tickers),
+            interval_sec=60.0,
+        )
 
-            result = self._signal_analyzer.analyze(ticker, data, self._rvol_cache)
-            if result is None:
-                return
+        # EventLogger last — it observes but never emits
+        EventLogger(self._bus)
 
-            current_price = result['current_price']
-            atr_value = result['atr_value']
-            rsi_value = result['rsi_value']
-            rvol = result['rvol']
-            current_vwap = result['vwap']
-            reclaim_candle_low = result['reclaim_candle_low']
-            vwap_reclaim = result['_vwap_reclaim']
-            opened_above_vwap = result['_opened_above_vwap']
-            rsi_overbought = result['_rsi_overbought']
-            atr_mult = result['_atr_mult']
-            min_stop_pct = result['_min_stop_pct']
+        # DurableEventLog — Redpanda producer; subscribes after EventLogger
+        # so it is the very last observer.  Disabled if no broker configured.
+        rp_brokers = (
+            redpanda_brokers
+            or os.getenv('REDPANDA_BROKERS', '127.0.0.1:9092')
+        )
+        self._durable_log = DurableEventLog(self._bus, brokers=rp_brokers)
+        # Issue 7: register synchronous produce+flush hook so ORDER_REQ / FILL
+        # events are Redpanda-acked before any in-process handler runs.
+        self._durable_log.register_durable_hook(self._bus)
 
-            if ticker not in self.positions:
-                # Position sizing / cooldown guards
-                if len(self.positions) >= self.max_positions:
-                    return
-                if time.time() - self.last_order_time.get(ticker, 0) < self.order_cooldown:
-                    return
+        log.info(
+            f"RealTimeMonitor ready | broker={broker_source} "
+            f"data={data_source} budget=${trade_budget} "
+            f"max_pos={max_positions} cooldown={order_cooldown}s "
+            f"redpanda={rp_brokers}"
+        )
 
-                # Skip if this ticker already had a reclaim today
-                if ticker in self.reclaimed_today:
-                    return
-
-                rvol_confirmed = rvol >= 2.0
-                rsi_bullish = 50 <= rsi_value <= 70
-                spy_bullish = self._data.get_spy_vwap_bias(self._bars_cache)
-
-                if vwap_reclaim and opened_above_vwap and rsi_bullish and rvol_confirmed and spy_bullish:
-                    # Level 1 quote: check bid/ask spread before entering
-                    spread_pct, ask_price = self._data.check_spread(ticker)
-                    if spread_pct is None:
-                        ask_price = current_price
-                        spread_pct = 0.0
-                    if spread_pct > self._order_manager.MAX_SPREAD_PCT:
-                        log.warning(f"Skipping {ticker}: spread too wide ({spread_pct:.3%})")
-                        return
-
-                    # Effective entry = ask + slippage
-                    effective_entry = ask_price * (1 + self._order_manager.SLIPPAGE_PCT)
-
-                    # Position size: allocate trade_budget dollars
-                    qty = max(1, int(self.trade_budget / effective_entry))
-                    dollar_value = round(qty * effective_entry, 2)
-
-                    order_id = self._order_manager.place_buy(
-                        ticker, qty, ask_price,
-                        refresh_ask=lambda: self._data.check_spread(ticker)[1],
-                    )
-                    if order_id:
-                        candle_stop = reclaim_candle_low - (atr_value * 0.5)
-                        pct_stop = effective_entry * (1 - min_stop_pct)
-                        stop_price = min(candle_stop, pct_stop)
-                        target_price = effective_entry + (atr_value * atr_mult)
-                        half_target = effective_entry + (atr_value * 1.0)
-                        self.positions[ticker] = {
-                            'entry_price': effective_entry,
-                            'entry_time': now.strftime('%H:%M:%S'),
-                            'quantity': qty,
-                            'partial_done': False,
-                            'order_id': order_id,
-                            'stop_price': stop_price,
-                            'target_price': target_price,
-                            'half_target': half_target,
-                        }
-                        self.reclaimed_today.add(ticker)
-                        self.last_order_time[ticker] = time.time()
-                        self._save_state()
-                        self._send_alert(
-                            f"BUY (VWAP Reclaim): {ticker} {qty} shares @ ${effective_entry:.2f} "
-                            f"(${dollar_value:.0f} deployed) | "
-                            f"Spread: {spread_pct:.3%} | VWAP: ${current_vwap:.2f} | "
-                            f"Stop: ${stop_price:.2f} | Target: ${target_price:.2f} | "
-                            f"Partial: ${half_target:.2f} | RSI: {rsi_value:.1f} | RVOL: {rvol:.1f}x"
-                        )
-            else:
-                pos = self.positions[ticker]
-                qty = pos['quantity']
-
-                # ── Exit 1: sell 50% at 1x ATR, move stop to breakeven ────────
-                if not pos['partial_done'] and current_price >= pos['half_target'] and qty >= 2:
-                    partial_qty = qty // 2
-                    order_id = self._order_manager.place_sell(ticker, partial_qty)
-                    if order_id:
-                        partial_pnl = round((current_price - pos['entry_price']) * partial_qty, 2)
-                        pos['quantity'] -= partial_qty
-                        pos['partial_done'] = True
-                        pos['stop_price'] = pos['entry_price']  # breakeven stop
-                        self.trade_log.append({
-                            'ticker':      ticker,
-                            'entry_price': pos['entry_price'],
-                            'entry_time':  pos.get('entry_time', ''),
-                            'exit_price':  current_price,
-                            'qty':         partial_qty,
-                            'pnl':         partial_pnl,
-                            'reason':      'partial exit (1x ATR)',
-                            'time':        now.strftime('%H:%M:%S'),
-                            'is_win':      partial_pnl >= 0,
-                        })
-                        self._save_state()
-                        self._send_alert(
-                            f"SELL partial: {ticker} {partial_qty} shares @ ${current_price:.2f} | "
-                            f"PnL: ${partial_pnl:+.2f} | "
-                            f"Stop moved to breakeven ${pos['entry_price']:.2f} | "
-                            f"Holding {pos['quantity']} shares"
-                        )
-                    return
-
-                # Trailing stop update
-                trail_stop = current_price - (atr_value * 1.0)
-                if trail_stop > pos['stop_price']:
-                    pos['stop_price'] = trail_stop
-
-                hit_stop   = current_price <= pos['stop_price']
-                hit_target = current_price >= pos['target_price']
-                rsi_exit   = rsi_value > rsi_overbought
-                vwap_exit  = result['_vwap_breakdown']
-
-                # ── Exit 2: sell remaining shares ─────────────────────────────
-                if hit_stop or hit_target or rsi_exit or vwap_exit:
-                    remaining_qty = pos['quantity']
-                    order_id = self._order_manager.place_sell(ticker, remaining_qty)
-                    if order_id:
-                        pnl = round((current_price - pos['entry_price']) * remaining_qty, 2)
-                        reason = (
-                            'target reached' if hit_target else
-                            'trailing stop'  if hit_stop  else
-                            'RSI overbought' if rsi_exit  else
-                            'VWAP breakdown'
-                        )
-                        self._send_alert(
-                            f"SELL final ({reason}): {ticker} {remaining_qty} shares @ "
-                            f"${current_price:.2f} | PnL: ${pnl:+.2f}"
-                        )
-                        self.trade_log.append({
-                            'ticker':      ticker,
-                            'entry_price': pos['entry_price'],
-                            'entry_time':  pos.get('entry_time', ''),
-                            'exit_price':  current_price,
-                            'qty':         remaining_qty,
-                            'pnl':         pnl,
-                            'reason':      reason,
-                            'time':        now.strftime('%H:%M:%S'),
-                            'is_win':      pnl >= 0,
-                        })
-                        del self.positions[ticker]
-                        self.last_order_time[ticker] = time.time()
-                        self._save_state()
-
-        except Exception as e:
-            log.error(f"Error analyzing {ticker}: {e}")
+    # ── Run loop ─────────────────────────────────────────────────────────────
 
     def run(self):
-        """Main monitoring loop. Called in a background thread by start()."""
+        """Main monitoring loop. Runs in the background thread started by start()."""
         self.running = True
         while self.running:
-            # Refresh momentum stocks from Alpaca screener (every 30 min)
+            self._reset_daily_state()
+
+            # Refresh momentum screener every 30 minutes
             self.tickers, self._last_momentum_refresh = self._screener.refresh(
                 self.base_tickers,
                 self.tickers,
                 self._last_momentum_refresh,
             )
+            self._heartbeat.set_n_tickers(len(self.tickers))
 
-            # Single batch API call — fetches all tickers at once
+            # Single batch API call
             log.info(
                 f"[{datetime.now(ET).strftime('%H:%M:%S')}] "
-                f"Fetching bars for {len(self.tickers)} tickers..."
+                f"Fetching bars for {len(self.tickers)} tickers …"
             )
             self._bars_cache, self._rvol_cache = self._data.fetch_batch_bars(self.tickers)
 
-            # Analyze all tickers in parallel using cached data
-            with ThreadPoolExecutor(max_workers=min(len(self.tickers), 50)) as ex:
-                futures = {ex.submit(self.analyze_ticker, t): t for t in self.tickers}
-                for f in as_completed(futures):
-                    try:
-                        f.result()
-                    except Exception as e:
-                        log.error(f"Error in thread for {futures[f]}: {e}")
+            # Emit BAR events for all tickers.
+            # emit_batch() acquires each lock once for the whole batch (issue 4),
+            # vs emit() which would acquire locks N times.
+            now   = datetime.now(ET)
+            today = now.date()
+            bar_events = []
+            for ticker in self.tickers:
+                ev = self._build_bar_event(ticker, today)
+                if ev is not None:
+                    bar_events.append(ev)
+            if bar_events:
+                try:
+                    self._bus.emit_batch(bar_events)
+                except Exception as e:
+                    log.error(f"emit_batch(BAR) failed: {e}")
 
+            # Tick heartbeat (emits at most once per 60 s)
+            self._heartbeat.tick()
+
+            # Sleep until next cycle
             now = datetime.now(ET)
             market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
             if now < market_open_time:
-                # Sleep until 30 seconds before open instead of spinning every minute
                 wait = max(10, (market_open_time - now).total_seconds() - 30)
                 log.info(f"Pre-market: sleeping {wait / 60:.1f} min until near open.")
                 time.sleep(wait)
             else:
-                time.sleep(60)  # During market: re-fetch every minute
+                time.sleep(60)
+
+    def _build_bar_event(self, ticker: str, today) -> Optional[Event]:
+        """Slice today's bars from the cache and return a BAR Event (or None)."""
+        full_df = self._bars_cache.get(ticker)
+        rvol_df = self._rvol_cache.get(ticker)
+        if full_df is None or full_df.empty:
+            return None
+        try:
+            today_df = full_df[full_df.index.date == today]
+        except Exception:
+            today_df = full_df
+        if today_df.empty:
+            return None
+        return Event(
+            type=EventType.BAR,
+            payload=BarPayload(
+                ticker=ticker,
+                df=today_df,
+                rvol_df=rvol_df,
+            ),
+        )
+
+    def _reset_daily_state(self):
+        today = datetime.now(ET).date()
+        if today != self._last_reset_date:
+            self._reclaimed_today.clear()
+            self._last_reset_date = today
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
-        """Start the monitoring loop in a background thread."""
         already_running, pid = _is_running_elsewhere()
         if already_running:
             msg = (
-                f"ERROR: Monitor is already running (PID {pid}).\n"
-                f"Stop it first before starting a new instance.\n"
-                f"Lock file: {os.path.abspath(LOCK_FILE)}"
+                f"ERROR: Monitor already running (PID {pid}).\n"
+                f"Stop it first.  Lock: {os.path.abspath(LOCK_FILE)}"
             )
             log.error(msg)
             raise RuntimeError(msg)
 
         if not self.running:
             _write_lock()
-            atexit.register(_remove_lock)   # cleans up on any normal exit or SIGTERM
+            atexit.register(_remove_lock)
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
             log.info(f"Real-time monitoring started (PID {os.getpid()}).")
 
     def stop(self):
-        """Stop the monitoring loop and wait for the thread to finish."""
         self.running = False
         if self.thread:
             self.thread.join(timeout=10)
+        EODSummary.send(self.trade_log, alert_email=None)
+        self._durable_log.close()   # flush remaining Redpanda messages
+        self._bus.shutdown()        # drain async dispatchers (no-op in sync mode)
         _remove_lock()
         log.info("Real-time monitoring stopped.")

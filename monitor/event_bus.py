@@ -133,13 +133,9 @@ class SimulatedTimeSource(TimeSource):
 
     def set_time(self, dt: datetime) -> None:
         with self._lock:
-            elapsed = (dt - self._t).total_seconds()
+            elapsed    = (dt - self._t).total_seconds()
+            self._t    = dt
             self._mono += max(0.0, elapsed)
-            # Clamp wall-clock so it never goes backwards (matching monotonic guard).
-            # Prevents subtle bugs in backtesting where event.timestamp comparison
-            # would see out-of-order values.
-            if elapsed > 0:
-                self._t = dt
 
 
 _WALL_CLOCK = WallClockTimeSource()
@@ -151,7 +147,6 @@ SLOW_THRESHOLD_SEC        = 0.10
 CIRCUIT_BREAKER_THRESHOLD = 5
 CIRCUIT_BREAKER_COOLDOWN  = 60.0
 LATENCY_WINDOW            = 100
-MAX_CB_STATES             = 2_000   # LRU cap on per-(handler, ticker) CB states
 
 
 # ── Dispatch modes & backpressure ─────────────────────────────────────────────
@@ -307,10 +302,6 @@ _DEFAULT_PRIORITY.update({
     EventType.HEARTBEAT:  EventPriority.LOWEST,
 })
 
-# EventTypes where any retry would cause duplicate side-effects (orders, fills, position mutations).
-# _deliver() enforces max_attempts=1 for these regardless of the handler's RetryPolicy.
-_NO_RETRY_TYPES = frozenset({EventType.ORDER_REQ, EventType.FILL, EventType.POSITION})
-
 
 # ── Issue 1 — Bounded priority queue ─────────────────────────────────────────
 
@@ -462,11 +453,16 @@ class _PartitionedAsyncDispatcher:
         policy:     BackpressurePolicy,
         bus:        'EventBus',
         n_workers:  int = 2,
+        coalesce:   bool = False,
     ) -> None:
         self._event_type = event_type
         self._policy     = policy
         self._bus        = bus
         self._n          = max(1, n_workers)
+        self._coalesce   = coalesce
+        # Coalescing state: ticker → current version number
+        self._cv:      Dict[str, int] = {}
+        self._cv_lock: threading.Lock = threading.Lock()
 
         # Per-partition priority queues (maxsize split evenly)
         per_q = max(1, maxsize // self._n)
@@ -493,7 +489,17 @@ class _PartitionedAsyncDispatcher:
 
     # ── Routing ───────────────────────────────────────────────────────────────
 
+    def _stable_hash(s: str) -> int:
+        return zlib.crc32(s.encode('utf-8'))
     def _partition(self, event: 'Event') -> int:
+        """
+        Partition by (EventType, ticker) to preserve:
+          • per-EventType isolation
+          • per-ticker ordering
+          • deterministic replay
+          • correct coalescing semantics
+          • no hotspotting for no-ticker events
+        """
         ticker = getattr(event.payload, 'ticker', None)
         # Namespace by EventType + ticker
         if ticker:
@@ -511,19 +517,18 @@ class _PartitionedAsyncDispatcher:
         priority  = event.priority   # lower int = higher urgency
         policy    = self._policy
 
-        # Per-handler coalescing: update each handler's latest-seen stream_seq for
-        # this ticker so that _deliver() can skip stale events for handlers that
-        # subscribed with coalesce=True (without dropping for ALL handlers).
-        ticker_c = getattr(event.payload, 'ticker', '') or ''
-        if ticker_c and event.stream_seq is not None:
-            for h_key, h_state in snapshot:
-                if h_state is not None and h_state._coalesce_seqs is not None:
-                    with h_state._lock:
-                        current = h_state._coalesce_seqs.get(ticker_c, 0)
-                        if event.stream_seq > current:
-                            h_state._coalesce_seqs[ticker_c] = event.stream_seq
-
-        item = (event, snapshot)
+        if self._coalesce:
+            ticker = getattr(event.payload, 'ticker', None)
+            if ticker:
+                with self._cv_lock:
+                    self._cv[ticker] = self._cv.get(ticker, 0) + 1
+                    version = self._cv[ticker]
+                coalesce_key = (ticker, version)
+            else:
+                coalesce_key = None
+        else:
+            coalesce_key = None
+        item = (event, snapshot, coalesce_key)
 
         if policy == BackpressurePolicy.BLOCK:
             q.put(priority, item)
@@ -563,11 +568,6 @@ class _PartitionedAsyncDispatcher:
                             f"p={partition}: evicted low-urgency event "
                             f"(dropped={self._dropped})"
                         )
-                    else:
-                        # evict returned None — another thread consumed between our
-                        # put_nowait and evict.  Yield to let workers drain, then
-                        # retry.  Prevents livelock under high contention.
-                        time.sleep(0.0001)
 
     # ── Worker ────────────────────────────────────────────────────────────────
 
@@ -581,7 +581,13 @@ class _PartitionedAsyncDispatcher:
                 continue
             if item is _STOP:
                 break
-            event, snapshot = item
+            event, snapshot, coalesce_key = item
+            # Coalescing: skip stale events (a newer event for this ticker arrived)
+            if coalesce_key is not None:
+                ticker, version = coalesce_key
+                with self._cv_lock:
+                    if self._cv.get(ticker) != version:
+                        continue  # stale; a newer event for this ticker already arrived
             now = self._bus._time_source.monotonic()
             for key, state in snapshot:
                 self._bus._deliver(event, key, state, now)
@@ -652,14 +658,6 @@ class _BackpressureMonitor:
         total_depth    = sum(d.queue_depth    for d in self._dispatchers.values())
         total_capacity = sum(d.total_capacity for d in self._dispatchers.values())
         return (total_depth / total_capacity) if total_capacity else 0.0
-
-    def pressure_by_type(self) -> Dict[str, float]:
-        """Per-EventType pressure ratios (queue_depth / total_capacity)."""
-        result: Dict[str, float] = {}
-        for et, d in self._dispatchers.items():
-            cap = d.total_capacity
-            result[et.name] = (d.queue_depth / cap) if cap else 0.0
-        return result
 
     def check(self) -> float:
         """Sample pressure and apply throttle. Returns current ratio."""
@@ -787,7 +785,7 @@ class _HandlerState:
     __slots__ = (
         'consecutive_failures', 'disabled_until', 'latencies',
         'error_count', 'call_count', 'trip_count', '_lock', 'retry_policy',
-        '_call_lock', '_coalesce_seqs',
+        '_call_lock',
     )
 
     def __init__(self):
@@ -802,9 +800,6 @@ class _HandlerState:
         # Set to a threading.Lock() when subscribe(thread_safe=False) — serialises
         # concurrent worker calls so non-thread-safe handlers are never re-entered.
         self._call_lock: Optional[threading.Lock] = None
-        # Set to {} when subscribe(coalesce=True) — maps ticker → latest stream_seq
-        # enqueued for this handler.  _deliver() skips events with a stale stream_seq.
-        self._coalesce_seqs: Optional[Dict[str, int]] = None
 
     def circuit_state(self, now: float) -> str:
         """Call while holding self._lock."""
@@ -875,8 +870,7 @@ class BusMetrics:
     # E — idempotency
     duplicate_events_dropped: int
     # Issue 5 — systemic backpressure
-    system_pressure:          float          # 0.0–1.0+; ratio of total depth / total capacity
-    pressure_by_type:         Dict[str, float]  # per-EventType pressure ratios
+    system_pressure:          float   # 0.0–1.0+; ratio of total depth / total capacity
     # Issue 6 — memory stats
     stream_count:             int     # active entries in stream_seqs LRU
     seen_ids_count:           int     # entries currently in idempotency window
@@ -1023,8 +1017,7 @@ class EventBus:
         self._sla_breaches:   int = 0   # events delivered past deadline (issue 10)
 
         # DLQ and retry tracking (protected by _count_lock)
-        # Per-handler deques so high-volume BAR failures don't evict ORDER_REQ entries.
-        self._dead_letters:       Dict[str, deque]                              = defaultdict(lambda: deque(maxlen=500))
+        self._dead_letters:       deque                                          = deque(maxlen=1_000)
         self._dlq_handler:        Optional[Callable[['DLQEntry'], None]]        = dlq_handler
         self._dlq_count:          int                                            = 0
         self._retried_deliveries: int                                            = 0
@@ -1032,8 +1025,7 @@ class EventBus:
         # Per-(handler, ticker) circuit breaker states (lazy-created in _deliver)
         # Isolated from global _handler_states so one bad ticker cannot trip the
         # circuit for all other tickers handled by the same function.
-        # OrderedDict enables O(1) LRU eviction when len > MAX_CB_STATES.
-        self._cb_states: OrderedDict = OrderedDict()
+        self._cb_states: Dict[Tuple[_HandlerKey, str], _HandlerState] = {}
         self._cb_lock   = threading.Lock()
 
         # Issue 6: LRU-capped stream_seqs (protected by _seq_lock)
@@ -1048,13 +1040,6 @@ class EventBus:
         # Async mode
         if mode == DispatchMode.ASYNC:
             merged = {**_DEFAULT_ASYNC_CONFIG, **(async_config or {})}
-            missing = [et.name for et in EventType if et not in merged]
-            if missing:
-                raise ValueError(
-                    f"EventBus ASYNC mode requires config for every EventType. "
-                    f"Missing: {missing}. Add entries to _DEFAULT_ASYNC_CONFIG or "
-                    f"pass async_config override."
-                )
             self._dispatchers: Dict[EventType, _PartitionedAsyncDispatcher] = {
                 et: _PartitionedAsyncDispatcher(
                     event_type=et,
@@ -1062,6 +1047,7 @@ class EventBus:
                     policy=merged[et]['policy'],
                     bus=self,
                     n_workers=merged[et].get('n_workers', 2),
+                    coalesce=merged[et].get('coalesce', False),
                 )
                 for et in EventType
             }
@@ -1087,7 +1073,6 @@ class EventBus:
         priority:     int = 0,
         retry_policy: Optional[RetryPolicy] = None,
         thread_safe:  bool = True,
-        coalesce:     bool = False,
     ) -> None:
         """
         Register handler for event_type.
@@ -1108,12 +1093,6 @@ class EventBus:
             across tickers; use only when the handler cannot be made thread-safe.
             Note: handlers with n_workers=1 dispatchers (ORDER_REQ, FILL) are
             inherently serialised and do not need thread_safe=False.
-        coalesce : bool, default False
-            If True, _deliver() skips this handler when a newer event for the same
-            ticker has already been enqueued (per-handler coalescing).  Only affects
-            ASYNC mode; has no effect in SYNC mode.  Safe for high-frequency handlers
-            (e.g. EventLogger on BAR) that only need the latest value per ticker.
-            Do NOT set for StrategyEngine or any handler that needs the full sequence.
         """
         key = _HandlerKey(handler)
         with self._sub_lock:
@@ -1131,11 +1110,6 @@ class EventBus:
                 log.debug(
                     f"[subscribe] {key.__qualname__} registered as non-thread-safe; "
                     f"a serialisation lock will be held per call."
-                )
-            if coalesce and state._coalesce_seqs is None:
-                state._coalesce_seqs = {}
-                log.debug(
-                    f"[subscribe] {key.__qualname__} registered with per-handler coalescing."
                 )
         log.debug(f"Subscribed {key.__qualname__} → {event_type.name} priority={priority}")
 
@@ -1211,14 +1185,6 @@ class EventBus:
             SYNC in synchronous mode.  In ASYNC mode reflects queue pressure
             at the time of this emit so callers can shed load proactively.
         """
-        # Step 0 — TTL pre-check: drop expired events before touching any shared
-        # state (avoids phantom stream_seq gaps from events that will never deliver)
-        if event.expiry_ts is not None and self._time_source.monotonic() > event.expiry_ts:
-            log.debug(
-                f"[ttl-expired] {event.type.name} dropped at emit() — already expired"
-            )
-            return BackpressureStatus.SYNC if self._mode == DispatchMode.SYNC else BackpressureStatus.OK
-
         # Step 1 — payload type check (no lock; _PAYLOAD_TYPES is read-only)
         expected = _PAYLOAD_TYPES.get(event.type)
         if expected is not None and not isinstance(event.payload, expected):
@@ -1337,17 +1303,6 @@ class EventBus:
         if not events:
             return BackpressureStatus.OK
 
-        # Step 0 — TTL pre-filter: remove expired events before touching any shared
-        # state.  Avoids phantom stream_seq gaps from events that would be skipped
-        # anyway in _deliver().  Uses a single monotonic() sample for the whole batch.
-        _now_mono = self._time_source.monotonic()
-        events = [
-            e for e in events
-            if e.expiry_ts is None or _now_mono <= e.expiry_ts
-        ]
-        if not events:
-            return BackpressureStatus.SYNC if self._mode == DispatchMode.SYNC else BackpressureStatus.OK
-
         # Step 1 — payload type check (no lock)
         for event in events:
             expected = _PAYLOAD_TYPES.get(event.type)
@@ -1379,9 +1334,9 @@ class EventBus:
         for event in events:
             event.timestamp = now_dt
             if event.priority < 0:
-                event.priority = _DEFAULT_PRIORITY.get(event.type, EventPriority.MEDIUM)
+                event.priority = _DEFAULT_PRIORITY.get(event.type, EventPriority.MEDIUM)                
 
-        # Step 3.5 — per-bus monotonic sequence (one lock for the whole batch)
+		        # Step 3.5 — per-bus monotonic sequence (one lock for the whole batch)
         with self._bus_seq_lock:
             for event in events:
                 event.sequence = next(self._bus_seq_iter)
@@ -1455,19 +1410,11 @@ class EventBus:
         return status
 
     def _get_cb_state(self, key: _HandlerKey, ticker: str) -> _HandlerState:
-        """
-        Return the per-(handler, ticker) circuit-breaker state, creating lazily.
-        LRU-capped at MAX_CB_STATES to prevent unbounded memory growth when many
-        ticker/handler combinations are active.
-        """
+        """Return the per-(handler, ticker) circuit-breaker state, creating lazily."""
         cb_key = (key, ticker)
         with self._cb_lock:
-            if cb_key in self._cb_states:
-                self._cb_states.move_to_end(cb_key)   # mark as recently used
-                return self._cb_states[cb_key]
-            if len(self._cb_states) >= MAX_CB_STATES:
-                self._cb_states.popitem(last=False)    # evict LRU entry
-            self._cb_states[cb_key] = _HandlerState()
+            if cb_key not in self._cb_states:
+                self._cb_states[cb_key] = _HandlerState()
             return self._cb_states[cb_key]
 
     def _deliver(
@@ -1515,21 +1462,6 @@ class EventBus:
             with self._count_lock:
                 self._sla_breaches += 1
 
-        # ── Per-handler coalescing check ─────────────────────────────────────────
-        if state is not None and state._coalesce_seqs is not None:
-            ticker_c = getattr(event.payload, 'ticker', '') or ''
-            if ticker_c and event.stream_seq is not None:
-                with state._lock:
-                    max_enqueued = state._coalesce_seqs.get(ticker_c, 0)
-                if event.stream_seq < max_enqueued:
-                    event.coalesced = True
-                    log.debug(
-                        f"[coalesce] Skipping stale {event.type.name} "
-                        f"sseq={event.stream_seq} for {ticker_c} "
-                        f"(handler={key.__qualname__}, latest={max_enqueued})"
-                    )
-                    return
-
         # ── Per-(handler, ticker) circuit breaker ────────────────────────────────
         ticker   = getattr(event.payload, 'ticker', '') or ''
         cb_state = self._get_cb_state(key, ticker)
@@ -1552,10 +1484,6 @@ class EventBus:
         # ── Retry loop with backoff ───────────────────────────────────────────────
         rp           = state.retry_policy if state else None
         max_attempts = 1 + (rp.max_retries if rp else 0)
-        # Safety: never retry ORDER_REQ / FILL / POSITION — duplicate side-effects
-        # (e.g. submitting an order twice) are worse than a missed retry.
-        if event.type in _NO_RETRY_TYPES:
-            max_attempts = 1
         last_exc: Optional[Exception] = None
         success      = False
         t0           = self._time_source.monotonic()
@@ -1584,21 +1512,7 @@ class EventBus:
                 success    = True
                 elapsed_ms = (self._time_source.monotonic() - t0) * 1000
                 break
-            except BaseException as exc:
-                # Catch BaseException (not just Exception) so that KeyboardInterrupt
-                # and SystemExit don't silently kill worker threads without
-                # circuit-breaker accounting or DLQ entry.
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    log.critical(
-                        f"[handler-base-exception] {key.__qualname__}[{ticker}] "
-                        f"raised {type(exc).__name__} on {event.type.name} "
-                        f"seq={event.sequence} — re-raising after accounting"
-                    )
-                    # Count as a failure for circuit-breaker / DLQ, then re-raise
-                    # so the worker thread terminates cleanly instead of vanishing.
-                    last_exc = exc
-                    # Fall through to permanent-failure path below.
-                    break
+            except Exception as exc:
                 last_exc   = exc
                 elapsed_ms = (self._time_source.monotonic() - t0) * 1000
                 if attempt < max_attempts - 1:
@@ -1661,7 +1575,7 @@ class EventBus:
                 tripped = True
 
         if tripped:
-            # Increment handler-level trip_count for metrics, in addition to per-ticker cb_state.
+        	# Increment handler-level trip_count for metrics, in addition to per-ticker cb_state.
             if state:
                 with state._lock:
                     state.trip_count += 1
@@ -1673,7 +1587,7 @@ class EventBus:
                 f"{CIRCUIT_BREAKER_THRESHOLD} consecutive failures"
             )
 
-        # Dead-letter queue (per-handler, so BAR failures don't evict ORDER_REQ entries)
+        # Dead-letter queue
         entry = DLQEntry(
             event        = event,
             handler_name = key.__qualname__,
@@ -1682,7 +1596,7 @@ class EventBus:
             failed_at    = now,
         )
         with self._count_lock:
-            self._dead_letters[key.__qualname__].append(entry)
+            self._dead_letters.append(entry)
             self._dlq_count += 1
         if self._dlq_handler:
             try:
@@ -1757,8 +1671,7 @@ class EventBus:
             queue_depths   = {}
             dropped_counts = {}
 
-        system_pressure  = self._bp_monitor.pressure()          if self._bp_monitor else 0.0
-        pressure_by_type = self._bp_monitor.pressure_by_type()  if self._bp_monitor else {}
+        system_pressure = self._bp_monitor.pressure() if self._bp_monitor else 0.0
 
         return BusMetrics(
             emit_counts              = emit_counts,
@@ -1777,32 +1690,12 @@ class EventBus:
             handler_execution_order  = exec_order,
             duplicate_events_dropped = dup_dropped,
             system_pressure          = system_pressure,
-            pressure_by_type         = pressure_by_type,
             stream_count             = stream_count,
             seen_ids_count           = seen_ids_count,
             sla_breaches             = sla_breaches,
             dlq_count                = dlq_count,
             retried_deliveries       = retried_deliveries,
         )
-
-    def dead_letters(
-        self, handler_name: Optional[str] = None
-    ) -> List['DLQEntry']:
-        """
-        Return dead-letter queue entries.
-
-        handler_name : str or None
-            If provided, return only entries for that handler (use handler's
-            __qualname__).  If None, return all entries across all handlers,
-            oldest-first.
-        """
-        with self._count_lock:
-            if handler_name is not None:
-                return list(self._dead_letters.get(handler_name, []))
-            all_entries = []
-            for q in self._dead_letters.values():
-                all_entries.extend(q)
-            return sorted(all_entries, key=lambda e: e.failed_at)
 
     def subscribers(self, event_type: EventType) -> List[Handler]:
         """Return underlying handler functions in execution order (C)."""

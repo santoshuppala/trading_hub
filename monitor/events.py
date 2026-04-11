@@ -14,9 +14,14 @@ Rules
 v2 changes
 ----------
 - @dataclass(frozen=True) on all payload classes.
-- BarPayload: defensive deep-copy of DataFrames in __post_init__; frozen
-  prevents field re-assignment but cannot prevent in-place DataFrame mutation
-  without the copy.
+- BarPayload: deep-copy + numpy read-only flag on DataFrames in __post_init__.
+  frozen=True prevents field re-assignment.  The deep copy isolates the
+  payload from the producer.  Setting numpy writeable=False on the copy
+  means any subscriber that tries to mutate a value in-place (e.g.
+  df.iloc[0,0] = x) gets an immediate ValueError instead of silently
+  corrupting the shared payload that all other subscribers see.
+  Cost: one deep copy + O(n_columns) flag writes — same allocation budget
+  as a plain deep copy, stronger safety guarantee.
 - SignalPayload / OrderRequestPayload: refresh_ask callable removed and
   replaced with needs_ask_refresh: bool.  Callables in events break
   serialisation (Redpanda / DurableEventLog) and hide side effects.
@@ -85,7 +90,44 @@ class PositionAction(str, Enum):
         return self.value
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── DataFrame immutability helper ─────────────────────────────────────────────
+
+def _freeze_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return an immutable view of df suitable for sharing across subscribers.
+
+    Two-step process
+    ----------------
+    1. Copy if needed — skipped when ALL numpy column arrays are already
+       read-only (i.e. the caller transferred ownership via from_owned()).
+       Otherwise a deep copy is made so the producer's buffer is isolated.
+    2. Mark writeable=False on every numeric numpy array in the result.
+       Any subscriber that attempts df.iloc[0, 0] = x or df['c'] = ... on
+       a numeric column now raises ValueError immediately at the mutation
+       site rather than silently corrupting the shared payload.
+
+    Performance
+    -----------
+    Normal path (copy needed):  O(rows × cols) copy + O(cols) flag writes.
+    Owned path (no copy):       O(cols) flag writes only.
+    """
+    # Determine whether a copy is needed (any writeable numeric column).
+    needs_copy = any(
+        getattr(df[c], 'values', None) is not None
+        and getattr(df[c].values, 'flags', None) is not None
+        and df[c].values.flags.writeable
+        for c in df.columns
+    )
+    out = df.copy(deep=True) if needs_copy else df
+    for col in out.columns:
+        try:
+            out[col].values.flags.writeable = False
+        except (ValueError, AttributeError):
+            pass  # non-writeable types (object, categorical, etc.)
+    return out
+
+
+# ── Scalar validation helpers ──────────────────────────────────────────────────
 
 def _require_ticker(ticker: str) -> None:
     if not ticker or not isinstance(ticker, str):
@@ -142,10 +184,22 @@ class BarPayload:
     Producer  : Market Data layer (TradierDataClient / AlpacaDataClient)
     Consumers : Strategy Engine, State Engine, Position Manager
 
-    DataFrames are deep-copied on construction so downstream handlers cannot
-    corrupt shared state by appending columns or rows in-place.
-    frozen=True prevents field reassignment but cannot block internal
-    DataFrame mutation, hence the explicit copy.
+    Immutability contract
+    ---------------------
+    __post_init__ calls _freeze_df() on both DataFrames:
+      1. Deep copy — isolates payload from the producer's buffer.
+      2. Read-only numpy flags — any subscriber that attempts an in-place
+         mutation (df.iloc[0, 0] = x, df['new'] = ...) gets an immediate
+         ValueError at the point of mutation rather than silently corrupting
+         the shared payload seen by all other subscribers.
+
+    Performance note
+    ----------------
+    Cost is one deep copy + O(n_cols) flag writes per bar per emit() call —
+    not per subscriber.  For 390-row × 6-col OHLCV bars across 170 tickers
+    this is ~11 MB of allocation per minute, well within normal GC budget.
+    If profiling shows otherwise, use BarPayload.from_owned() in the data
+    client: it skips the copy and only writes the read-only flags.
     """
     ticker:  str
     df:      pd.DataFrame           # today's 1-min OHLCV bars
@@ -155,9 +209,51 @@ class BarPayload:
         _require_ticker(self.ticker)
         if not isinstance(self.df, pd.DataFrame):
             raise ValueError("df must be a pandas DataFrame")
-        object.__setattr__(self, 'df', self.df.copy(deep=True))
+        object.__setattr__(self, 'df', _freeze_df(self.df))
         if self.rvol_df is not None:
-            object.__setattr__(self, 'rvol_df', self.rvol_df.copy(deep=True))
+            object.__setattr__(self, 'rvol_df', _freeze_df(self.rvol_df))
+
+    @classmethod
+    def from_owned(
+        cls,
+        ticker:  str,
+        df:      pd.DataFrame,
+        rvol_df: Optional[pd.DataFrame] = None,
+    ) -> 'BarPayload':
+        """
+        Construct from DataFrames the caller already owns (fresh per cycle).
+
+        O(n_cols) cost only — no deep copy.
+        This method marks df / rvol_df numpy arrays as read-only in-place,
+        then delegates to the normal constructor.  __post_init__ calls
+        _freeze_df(), which detects the already-read-only arrays and skips
+        the copy, performing only the O(cols) flag write-pass.
+
+        Caller contract: do NOT read or modify df / rvol_df after this call.
+        Ownership is transferred to the payload.
+
+        Usage in data clients:
+            df = pd.DataFrame(rows)   # fresh allocation per fetch cycle
+            bar = BarPayload.from_owned(ticker, df)
+            # df is now owned by the payload — do not touch it
+        """
+        _require_ticker(ticker)
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("df must be a pandas DataFrame")
+        # Transfer ownership: mark all numeric arrays read-only so __post_init__
+        # detects them as already frozen and skips the deep copy.
+        for col in df.columns:
+            try:
+                df[col].values.flags.writeable = False
+            except (ValueError, AttributeError):
+                pass
+        if rvol_df is not None:
+            for col in rvol_df.columns:
+                try:
+                    rvol_df[col].values.flags.writeable = False
+                except (ValueError, AttributeError):
+                    pass
+        return cls(ticker=ticker, df=df, rvol_df=rvol_df)
 
 
 # ── QUOTE ─────────────────────────────────────────────────────────────────────

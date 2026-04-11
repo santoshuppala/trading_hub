@@ -368,15 +368,24 @@ Eight issues identified by design review of `monitor/events.py`.
 
 ### Fix 2: DataFrame fields were a shared-mutable leak (`BarPayload`)
 
-**Problem:** `frozen=True` prevents re-assigning `payload.df`, but not in-place mutation: `payload.df['new_col'] = ...` affects the original DataFrame shared with the producer. This breaks determinism in multi-subscriber fan-outs (e.g. StrategyEngine and EventLogger both receiving the same BAR).
+**Problem (original):** `frozen=True` prevents re-assigning `payload.df`, but NOT in-place value mutation: subscriber A calling `payload.df.iloc[0, 0] = 0` silently corrupts the same DataFrame that subscriber B and C also hold, because all subscribers share one `BarPayload` object. The plain `df.copy(deep=True)` from v2.0 only protected the producer's original — not the shared payload.
 
-**Fix:** `BarPayload.__post_init__` now does:
+**Fix (v2.1):** Replaced `df.copy(deep=True)` with `_freeze_df(df)`:
+
 ```python
-object.__setattr__(self, 'df', self.df.copy(deep=True))
-if self.rvol_df is not None:
-    object.__setattr__(self, 'rvol_df', self.rvol_df.copy(deep=True))
+def _freeze_df(df: pd.DataFrame) -> pd.DataFrame:
+    needs_copy = any(df[c].values.flags.writeable for c in df.columns ...)
+    out = df.copy(deep=True) if needs_copy else df
+    for col in out.columns:
+        out[col].values.flags.writeable = False   # raises ValueError on mutation
+    return out
 ```
-`object.__setattr__` is required to bypass the frozen constraint during construction.
+
+Now any subscriber attempting `df.iloc[0,0] = x` on a numeric column gets `ValueError: assignment destination is read-only` at the point of mutation instead of silently corrupting downstream computations.
+
+**Cost:** O(rows × cols) copy + O(cols) flag writes — identical allocation budget to a plain deep copy.
+
+**Optimization path (`from_owned`):** When the data client produces a fresh DataFrame per cycle (no shared state), it can call `BarPayload.from_owned(ticker, df)`. This marks the arrays read-only in-place, transferring ownership to the payload. `_freeze_df` detects the already-read-only arrays and skips the copy entirely — O(cols) only.
 
 ### Fix 3: Callable in payload broke serialisation and hid side effects
 

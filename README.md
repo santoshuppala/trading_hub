@@ -28,7 +28,7 @@ monitor.run() → emit_batch(BAR[])
 | Layer | File | Responsibility |
 |-------|------|----------------|
 | T1 EventBus | `event_bus.py` | Pub/sub backbone; priority queues; backpressure; idempotency; SLA tracking |
-| T1.5 Event Schema | `events.py` | Frozen, validated dataclasses for every event payload; typed enums; PositionSnapshot |
+| T1.5 Event Schema | `events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; read-only numpy arrays on BAR DataFrames |
 | T2 DurableEventLog | `event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
 | T3 RiskEngine | `risk_engine.py` | 6 pre-trade checks; position limits; spread filter; cooldown |
 | T4 StrategyEngine | `strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |

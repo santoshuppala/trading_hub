@@ -74,7 +74,7 @@ class AlpacaBroker(BaseBroker):
     Buy strategy — marketable limit at exact ask:
       1. Submit limit order at ask.
       2. Poll for fill every FILL_POLL_SEC seconds up to FILL_TIMEOUT_SEC.
-      3. If unfilled: cancel, fetch fresh ask via payload.refresh_ask, retry.
+      3. If unfilled: cancel, fetch fresh ask via quote_fn(ticker), retry.
       4. Abandon after MAX_RETRIES and emit ORDER_FAIL.
 
     Sell strategy — market order for exit speed.
@@ -85,9 +85,22 @@ class AlpacaBroker(BaseBroker):
     FILL_POLL_SEC    = 0.25     # poll interval while waiting for fill
     MAX_RETRIES      = 3        # cancel-and-retry attempts per entry
 
-    def __init__(self, trading_client, bus: EventBus, alert_email: Optional[str] = None):
+    def __init__(
+        self,
+        trading_client,
+        bus:         EventBus,
+        alert_email: Optional[str]                     = None,
+        quote_fn:    Optional[callable]                = None,
+    ):
+        """
+        quote_fn: callable(ticker: str) -> Optional[float]
+            Called before each retry when p.needs_ask_refresh is True to fetch
+            the latest ask price.  Typically wired to DataClient.check_spread.
+            Pass None to disable ask-refresh (single-attempt mode per order).
+        """
         super().__init__(bus, alert_email)
-        self._client = trading_client
+        self._client   = trading_client
+        self._quote_fn = quote_fn   # ticker -> Optional[float]
 
     def _execute_buy(self, p: OrderRequestPayload) -> None:
         from alpaca.trading.requests import LimitOrderRequest
@@ -162,7 +175,7 @@ class AlpacaBroker(BaseBroker):
                 log.warning(f"Cancel error ({order_id}): {e}")
 
             # ── Retry or abandon ──────────────────────────────────────
-            if p.refresh_ask is None or attempt == self.MAX_RETRIES:
+            if not p.needs_ask_refresh or self._quote_fn is None or attempt == self.MAX_RETRIES:
                 log.warning(f"BUY abandoned: {p.ticker} after {attempt} attempt(s).")
                 send_alert(
                     self._alert_email,
@@ -171,7 +184,7 @@ class AlpacaBroker(BaseBroker):
                 self._fail(p)
                 return
 
-            new_ask = p.refresh_ask()
+            new_ask = self._quote_fn(p.ticker)
             if not new_ask or new_ask <= 0:
                 self._fail(p)
                 return

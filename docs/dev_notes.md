@@ -11,8 +11,10 @@
 3. [EventBus v4 → v5 (7 + 5 improvements)](#3-eventbus-v4--v5)
 4. [EventBus v5 → v6 (6 CRITICAL + 4 MEDIUM fixes)](#4-eventbus-v5--v6)
 5. [EventBus v6 → v6.1 (7 correctness/reliability fixes)](#5-eventbus-v6--v61)
-6. [Files Changed Summary](#6-files-changed-summary)
-7. [Key Design Decisions](#7-key-design-decisions)
+6. [EventBus v6.1 → v5.2 — Partition correctness](#6-eventbus-v61--v52)
+7. [Event Schema v1 → v2 — 8 correctness fixes](#7-event-schema-v1--v2)
+8. [Files Changed Summary](#8-files-changed-summary)
+9. [Key Design Decisions](#9-key-design-decisions)
 
 ---
 
@@ -305,18 +307,146 @@ if missing:
 
 ---
 
-## 6. Files Changed Summary
+## 6. EventBus v6.1 → v5.2 — Partition correctness
+
+Two partitioning bugs identified by architecture review on `tradier_platform`.
+
+### BUG 1: Hot partition for no-ticker events
+
+**Problem:** No-ticker events (`HEARTBEAT`, `SYSTEM`, etc.) all hashed to the fixed key `"{EventType}:__no_ticker__"` — a constant string — so every such event always landed on the same worker partition. Under load, HEARTBEAT events piled up on one thread while other workers sat idle. This violates the core principle of Kafka-style partitioning: keyless records should distribute evenly.
+
+**Fix:**
+- Added `self._rr_counter = itertools.count()` to `_PartitionedAsyncDispatcher.__init__`.
+- `_partition()` for no-ticker events now returns `next(self._rr_counter) % self._n` (round-robin) instead of hashing `__no_ticker__`.
+
+This mirrors Kafka's own behaviour: records with a key → hash partition; records without a key → round-robin.
+
+### BUG 2: Over-constrained partition key breaks cross-EventType causal ordering
+
+**Problem:** The partition key was `f"{self._event_type.name}:{ticker}"`. Because each EventType has its own dispatcher, `hash("BAR:AAPL") % n` and `hash("SIGNAL:AAPL") % n` produce **different** partition indices. A causality pipeline:
+
+```
+BAR(AAPL) → worker 2  (BAR dispatcher)
+SIGNAL(AAPL) → worker 0  (SIGNAL dispatcher)
+ORDER_REQ(AAPL) → worker 3  (ORDER_REQ dispatcher)
+```
+
+can race: the SIGNAL handler may start before the BAR handler finishes, breaking causal ordering across event types for the same ticker.
+
+**Fix:** Partition key changed from `f"{event_type.name}:{ticker}"` to `ticker` only. All EventType dispatchers now produce `hash("AAPL") % n` → the **same** partition index, so the entire `BAR → SIGNAL → ORDER → FILL` chain for AAPL routes to logical partition slot `k` across all dispatchers.
+
+### Configurable flag: `causal_partitioning`
+
+A `causal_partitioning: bool = True` parameter was added to `_PartitionedAsyncDispatcher.__init__` and wired through `async_config` per EventType:
+
+| Mode | Key | Use case |
+|------|-----|----------|
+| `True` (default) | `ticker` | Causality pipelines — all AAPL events share partition index |
+| `False` | `EventType:ticker` | Max parallelism — each EventType independently partitions tickers |
+
+Configure per EventType:
+```python
+async_config = {
+    EventType.BAR:   {'causal_partitioning': True, 'n_workers': 4},
+    EventType.QUOTE: {'causal_partitioning': False, 'n_workers': 2},
+}
+```
+
+ORDER_REQ/FILL/POSITION with `n_workers=1` are unaffected by the flag.
+
+---
+
+## 7. Event Schema v1 → v2 — 8 correctness fixes
+
+Eight issues identified by design review of `monitor/events.py`.
+
+### Fix 1: Payloads were mutable (`frozen=True`)
+
+**Problem:** All payload dataclasses used plain `@dataclass`. Any handler could silently mutate a field (`event.payload.current_price = 0`), corrupting the event for all subsequent subscribers.
+
+**Fix:** Applied `@dataclass(frozen=True)` to all 8 payload classes. Python raises `FrozenInstanceError` on any attempted field assignment after construction.
+
+### Fix 2: DataFrame fields were a shared-mutable leak (`BarPayload`)
+
+**Problem:** `frozen=True` prevents re-assigning `payload.df`, but not in-place mutation: `payload.df['new_col'] = ...` affects the original DataFrame shared with the producer. This breaks determinism in multi-subscriber fan-outs (e.g. StrategyEngine and EventLogger both receiving the same BAR).
+
+**Fix:** `BarPayload.__post_init__` now does:
+```python
+object.__setattr__(self, 'df', self.df.copy(deep=True))
+if self.rvol_df is not None:
+    object.__setattr__(self, 'rvol_df', self.rvol_df.copy(deep=True))
+```
+`object.__setattr__` is required to bypass the frozen constraint during construction.
+
+### Fix 3: Callable in payload broke serialisation and hid side effects
+
+**Problem:** `SignalPayload.refresh_ask` and `OrderRequestPayload.refresh_ask` embedded a live lambda (`lambda t=ticker: self._data.check_spread(t)[1]`) inside the event payload. Callables cannot be serialised to Redpanda/Kafka, break replay/backtesting, make payloads non-comparable, and hide side effects in what should be pure data.
+
+**Fix:** Replaced with `needs_ask_refresh: bool = False`. The handler (broker) owns the fetch logic; the flag is the contract. `AlpacaBroker` now accepts an injectable `quote_fn: Optional[callable] = None` at construction time — the callable is wired once at startup, not per event.
+
+**Impact on callers:**
+- `strategy_engine.py`: `refresh_ask=lambda…` → `needs_ask_refresh=(self._data is not None)`
+- `risk_engine.py`: `refresh_ask=p.refresh_ask` → `needs_ask_refresh=p.needs_ask_refresh`
+- `brokers.py`: `AlpacaBroker(…, quote_fn=data_client.check_spread_ask)` at construction; retry uses `self._quote_fn(p.ticker)`
+
+### Fix 4: Duplicate timestamp in HeartbeatPayload
+
+**Problem:** `HeartbeatPayload` had its own `timestamp: datetime = field(default_factory=lambda: datetime.now(ET))`. `Event.timestamp` (set by the bus at `emit()` time) is the authoritative clock. Two competing timestamps create ambiguity in replay and make it unclear which one to trust.
+
+**Fix:** Removed `timestamp` field from `HeartbeatPayload`. All consumers use `event.timestamp`.
+
+### Fix 5: `position: Optional[dict]` had no schema or validation
+
+**Problem:** `PositionPayload.position` was an untyped `dict`. Consumers accessed `position['entry_price']` with no guarantee the key existed. Adding or renaming a field in `PositionManager` silently broke downstream handlers.
+
+**Fix:** Added `@dataclass(frozen=True) PositionSnapshot` with typed, validated fields:
+```
+entry_price, entry_time, quantity, partial_done, order_id,
+stop_price, target_price, half_target, atr_value
+```
+`PositionPayload.position` is now `Optional[PositionSnapshot]`. `position_manager.py` constructs `PositionSnapshot(...)` at all three emit sites.
+
+### Fix 6: Bare strings for action/side fields — typo-unsafe
+
+**Problem:** `action: str`, `side: str` allowed any string to pass construction; a typo (`'byu'`, `'SELL'`) would only surface at runtime deep in a handler.
+
+**Fix:** Added `Side`, `SignalAction`, `PositionAction` as `str, Enum` classes with `__str__` returning `.value`. `__post_init__` coerces raw strings via `Side(self.side)`, so callers may pass either `Side.BUY` or `'buy'` — both work. Downstream comparisons (`p.side == 'buy'`) continue to work due to the `str` mixin.
+
+### Fix 7: Float validation did not reject NaN / ±inf
+
+**Problem:** `_require_positive` and `_require_non_negative` only checked `<= 0` / `< 0`. `float('nan')` and `float('inf')` passed validation and could propagate into signal math, causing silent `nan` order quantities.
+
+**Fix:** Added `math.isfinite(value)` guard to both helpers:
+```python
+if value is None or not math.isfinite(value) or value <= 0:
+    raise ValueError(...)
+```
+
+### Fix 8: `open_tickers` list was mutable and weakly validated
+
+**Problem:** `HeartbeatPayload.open_tickers: List[str]` was a mutable list. A handler could do `payload.open_tickers.append('FOO')` in-place. The validation only checked `isinstance(self.open_tickers, list)`, not that every element was a `str`.
+
+**Fix:** `__post_init__` coerces to tuple via `object.__setattr__(self, 'open_tickers', tuple(self.open_tickers))` and validates `all(isinstance(t, str) for t in self.open_tickers)`.
+
+---
+
+## 8. Files Changed Summary
 
 | File | Changes |
 |------|---------|
 | `monitor/monitor.py` | Added `_sync_broker_positions()` for Alpaca reconciliation on startup; added `state_engine.seed()` call |
 | `monitor/state_engine.py` | Added `seed(positions, trade_log)` method to pre-populate snapshot on restart |
-| `monitor/event_bus.py` | Major v4→v5→v6→v6.1 evolution (see sections 3, 4, and 5 above) |
+| `monitor/event_bus.py` | Major v4→v5→v6→v6.1→v5.2 evolution (see sections 3–6 above) |
+| `monitor/events.py` | v1→v2: frozen payloads, DataFrame copy, callable removal, PositionSnapshot, Enums, isfinite, timestamp removal (see section 7) |
+| `monitor/strategy_engine.py` | Updated SignalPayload construction: removed `refresh_ask` lambda, added `needs_ask_refresh` |
+| `monitor/risk_engine.py` | Updated OrderRequestPayload construction: propagates `needs_ask_refresh` |
+| `monitor/position_manager.py` | Updated PositionPayload construction: replaced `dict(pos)` with `PositionSnapshot(...)` |
+| `monitor/brokers.py` | AlpacaBroker gains `quote_fn` constructor param; retry logic uses `p.needs_ask_refresh` |
 | `README.md` | Full rewrite to document 9-layer event-driven architecture |
 
 ---
 
-## 7. Key Design Decisions
+## 9. Key Design Decisions
 
 ### Why coalescing must be per-handler
 

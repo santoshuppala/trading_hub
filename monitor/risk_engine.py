@@ -182,7 +182,7 @@ class RiskEngine:
                 qty=qty,
                 price=effective_entry,
                 reason='VWAP reclaim',
-                refresh_ask=p.refresh_ask,
+                needs_ask_refresh=p.needs_ask_refresh,
             ),
             correlation_id=event.event_id,
         ))

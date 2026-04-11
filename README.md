@@ -28,7 +28,7 @@ monitor.run() → emit_batch(BAR[])
 | Layer | File | Responsibility |
 |-------|------|----------------|
 | T1 EventBus | `event_bus.py` | Pub/sub backbone; priority queues; backpressure; idempotency; SLA tracking |
-| T1.5 Event Schema | `events.py` | Typed, validated dataclasses for every event payload |
+| T1.5 Event Schema | `events.py` | Frozen, validated dataclasses for every event payload; typed enums; PositionSnapshot |
 | T2 DurableEventLog | `event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
 | T3 RiskEngine | `risk_engine.py` | 6 pre-trade checks; position limits; spread filter; cooldown |
 | T4 StrategyEngine | `strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
@@ -38,12 +38,14 @@ monitor.run() → emit_batch(BAR[])
 | T8 Observability | `observability.py` | EventLogger, HeartbeatEmitter, EODSummary |
 | T9 Monitor | `monitor.py` | Thin orchestrator; data-fetch loop; Alpaca reconciliation on startup |
 
-### Event Bus (v4)
+### Event Bus (v5.2)
 
 Key capabilities built into `event_bus.py`:
 
 - **Priority queues** — `_BoundedPriorityQueue` (heapq); DROP_OLDEST evicts lowest-urgency items, preserving FILL/ORDER_REQ over BAR
-- **Partitioned workers** — `_PartitionedAsyncDispatcher`; N workers per EventType; `hash(ticker) % n_workers` routing (Kafka partition model) preserves per-ticker ordering while parallelizing across tickers
+- **Partitioned workers** — `_PartitionedAsyncDispatcher`; N workers per EventType; ticker-based routing (Kafka partition model) preserves per-ticker causal ordering across all EventType dispatchers
+- **Causal vs. max-throughput mode** — `causal_partitioning=True` (default) keys on `ticker` only so `BAR→SIGNAL→ORDER→FILL` for the same ticker always share a partition index; `False` keys on `EventType:ticker` for maximum parallelism
+- **Round-robin for keyless events** — no-ticker events (HEARTBEAT, SYSTEM) distribute evenly across workers instead of piling on a fixed hot partition
 - **Stable partitioning** — `hashlib.md5` instead of Python's `hash()`, which is process-randomized (PEP 456)
 - **Split locks** — `_sub_lock`, `_seq_lock`, `_count_lock`, `_idem_lock`; per-handler `_HandlerState._lock` — no global contention
 - **`emit_batch()`** — O(4) lock acquisitions for N events vs O(4N) for N×`emit()`; used in the BAR fan-out for 100+ tickers
@@ -68,8 +70,8 @@ Default async config:
 ```
 trading_hub/
 ├── monitor/
-│   ├── event_bus.py          # T1  — EventBus v4 (priority queues, partitioned workers, backpressure)
-│   ├── events.py             # T1.5 — Typed payload dataclasses with validation
+│   ├── event_bus.py          # T1  — EventBus v5.2 (priority queues, causal partitioning, backpressure)
+│   ├── events.py             # T1.5 — Frozen payload dataclasses; Enums; PositionSnapshot
 │   ├── event_log.py          # T2  — Redpanda durable event log
 │   ├── risk_engine.py        # T3  — Pre-trade risk checks (6 filters)
 │   ├── strategy_engine.py    # T4  — VWAP Reclaim signal generation
@@ -215,7 +217,7 @@ Only one monitor can run at a time. A second start attempt (from UI or CLI) is r
 
 ### Order execution
 
-- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask up to 3 times before abandoning
+- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask (via injected `quote_fn`) up to 3 times before abandoning
 - **Sells**: market order for guaranteed exit speed
 - **Slippage model**: 0.01% applied to entry price for accounting; Alpaca is commission-free
 

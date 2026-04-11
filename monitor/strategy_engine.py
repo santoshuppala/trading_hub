@@ -201,10 +201,7 @@ class StrategyEngine:
                 target_price=target_price,
                 half_target=half_target,
                 reclaim_candle_low=reclaim_candle_low,
-                refresh_ask=(
-                    (lambda t=ticker: self._data.check_spread(t)[1])
-                    if self._data is not None else None
-                ),
+                needs_ask_refresh=(self._data is not None),
             ),
             correlation_id=parent.event_id,
         ))

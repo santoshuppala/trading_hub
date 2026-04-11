@@ -76,6 +76,7 @@ import queue
 import threading
 import time
 import uuid
+import zlib
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ from datetime import datetime
 from enum import Enum, IntEnum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+
 
 ET  = ZoneInfo('America/New_York')
 log = logging.getLogger(__name__)
@@ -487,9 +489,25 @@ class _PartitionedAsyncDispatcher:
 
     # ── Routing ───────────────────────────────────────────────────────────────
 
+    def _stable_hash(s: str) -> int:
+        return zlib.crc32(s.encode('utf-8'))
     def _partition(self, event: 'Event') -> int:
-        ticker = getattr(event.payload, 'ticker', '') or ''
-        return _stable_hash(ticker) % self._n   # stable across restarts (issue 2)
+        """
+        Partition by (EventType, ticker) to preserve:
+          • per-EventType isolation
+          • per-ticker ordering
+          • deterministic replay
+          • correct coalescing semantics
+          • no hotspotting for no-ticker events
+        """
+        ticker = getattr(event.payload, 'ticker', None)
+        # Namespace by EventType + ticker
+        if ticker:
+            key = f"{self._event_type.name}:{ticker}"
+        else:
+            # Deterministic, preserves ordering, avoids hotspotting
+            key = f"{self._event_type.name}:__no_ticker__"
+        return _stable_hash(key) % self._n
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 

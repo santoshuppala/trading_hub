@@ -1,6 +1,6 @@
 """
-T1 — Event Bus  (production hardened, v5)
-==========================================
+T1 — Event Bus  (production hardened, v5.2)
+============================================
 Central pub/sub backbone for the trading system.
 
 Seven production gaps fixed in v4
@@ -35,6 +35,18 @@ Seven production gaps fixed in v4
    Hooks run synchronously before any handler.  DurableEventLog registers
    a produce+flush hook so Redpanda acks the event before in-process state
    changes begin — eliminating the async-write/handler-race window.
+
+New in v5.2
+-----------
+12. Hot-partition fix (no-ticker round-robin) — No-ticker events (HEARTBEAT,
+    SYSTEM, etc.) now distribute via round-robin instead of hashing to a fixed
+    key ("__no_ticker__"), which previously pinned them all to one worker.
+
+13. Cross-EventType causal ordering — Partition key changed from
+    EventType:ticker → ticker only.  All EventType dispatchers now map the
+    same ticker to the same partition index, so pipelines like
+    BAR(AAPL) → SIGNAL(AAPL) → ORDER(AAPL) → FILL(AAPL) cannot race across
+    workers.
 
 New in v5
 ---------
@@ -448,18 +460,24 @@ class _PartitionedAsyncDispatcher:
 
     def __init__(
         self,
-        event_type: EventType,
-        maxsize:    int,
-        policy:     BackpressurePolicy,
-        bus:        'EventBus',
-        n_workers:  int = 2,
-        coalesce:   bool = False,
+        event_type:          EventType,
+        maxsize:             int,
+        policy:              BackpressurePolicy,
+        bus:                 'EventBus',
+        n_workers:           int = 2,
+        coalesce:            bool = False,
+        causal_partitioning: bool = True,
     ) -> None:
-        self._event_type = event_type
-        self._policy     = policy
-        self._bus        = bus
-        self._n          = max(1, n_workers)
-        self._coalesce   = coalesce
+        self._event_type          = event_type
+        self._policy              = policy
+        self._bus                 = bus
+        self._n                   = max(1, n_workers)
+        self._coalesce            = coalesce
+        # True  → key=ticker only   → same ticker always hits same partition
+        #         across all EventType dispatchers → causal pipeline ordering.
+        # False → key=EventType:ticker → max parallelism, EventType isolation,
+        #         trades cross-type causal guarantees for higher throughput.
+        self._causal_partitioning = causal_partitioning
         # Coalescing state: ticker → current version number
         self._cv:      Dict[str, int] = {}
         self._cv_lock: threading.Lock = threading.Lock()
@@ -475,6 +493,9 @@ class _PartitionedAsyncDispatcher:
         ]
         self._dropped  = 0
         self._d_lock   = threading.Lock()
+
+        # Round-robin counter for no-ticker events (Issue 1)
+        self._rr_counter = itertools.count()
 
         self._threads: List[threading.Thread] = []
         for i in range(self._n):
@@ -493,21 +514,35 @@ class _PartitionedAsyncDispatcher:
         return zlib.crc32(s.encode('utf-8'))
     def _partition(self, event: 'Event') -> int:
         """
-        Partition by (EventType, ticker) to preserve:
-          • per-EventType isolation
-          • per-ticker ordering
-          • deterministic replay
-          • correct coalescing semantics
-          • no hotspotting for no-ticker events
+        Route an event to a worker partition.
+
+        causal_partitioning=True  (default — trading pipelines)
+            key = ticker
+            → hash("AAPL") % n is identical in every EventType dispatcher,
+              so BAR(AAPL)→SIGNAL(AAPL)→ORDER(AAPL)→FILL(AAPL) all land on
+              the same partition index.  Causal order across event types is
+              preserved at the cost of EventType-level isolation.
+
+        causal_partitioning=False  (high-throughput / Kafka-style isolation)
+            key = EventType:ticker
+            → each EventType independently partitions its tickers for maximum
+              parallelism.  Use when downstream handlers are truly stateless
+              and cross-type ordering is not required.
+
+        No-ticker events (HEARTBEAT, SYSTEM, …) always use round-robin to
+        spread load evenly — never hashed to a fixed hot partition.
         """
         ticker = getattr(event.payload, 'ticker', None)
-        # Namespace by EventType + ticker
+
         if ticker:
-            key = f"{self._event_type.name}:{ticker}"
-        else:
-            # Deterministic, preserves ordering, avoids hotspotting
-            key = f"{self._event_type.name}:__no_ticker__"
-        return _stable_hash(key) % self._n
+            if self._causal_partitioning:
+                key = ticker
+            else:
+                key = f"{self._event_type.name}:{ticker}"
+            return _stable_hash(key) % self._n
+
+        # No ticker → round-robin; avoids hot partition for keyless events.
+        return next(self._rr_counter) % self._n
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
@@ -1048,6 +1083,7 @@ class EventBus:
                     bus=self,
                     n_workers=merged[et].get('n_workers', 2),
                     coalesce=merged[et].get('coalesce', False),
+                    causal_partitioning=merged[et].get('causal_partitioning', True),
                 )
                 for et in EventType
             }

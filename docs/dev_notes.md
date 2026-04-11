@@ -1,0 +1,367 @@
+# Trading Hub — Development Notes
+
+> Covers all architectural decisions, bugs found, and fixes applied across the development sessions for this project. Intended as a living reference for future sessions.
+
+---
+
+## Table of Contents
+
+1. [Bug Fix: ZS Orphaned Positions](#1-bug-fix-zs-orphaned-positions)
+2. [StateEngine Seeding](#2-stateengine-seeding)
+3. [EventBus v4 → v5 (7 + 5 improvements)](#3-eventbus-v4--v5)
+4. [EventBus v5 → v6 (6 CRITICAL + 4 MEDIUM fixes)](#4-eventbus-v5--v6)
+5. [EventBus v6 → v6.1 (7 correctness/reliability fixes)](#5-eventbus-v6--v61)
+6. [Files Changed Summary](#6-files-changed-summary)
+7. [Key Design Decisions](#7-key-design-decisions)
+
+---
+
+## 1. Bug Fix: ZS Orphaned Positions
+
+### Problem
+
+One day 8 ZS positions were bought but only 1 was tracked and sold. The other 7 were silently abandoned. The root cause was positions opened in a prior session (or after a restart) that existed in Alpaca but not in `bot_state.json`.
+
+Additionally, `[HEARTBEAT]` log lines showed `positions=0, trades=0, pnl=$0` even when positions were open — the `StateEngine` snapshot was empty after restart.
+
+### Root Causes
+
+1. **No Alpaca reconciliation on startup.** If the bot restarted mid-session, positions already held in Alpaca were not imported into `self.positions`, so `RiskEngine` would not protect against duplicates and `PositionManager` would not manage exits.
+2. **`StateEngine` not seeded from restored state.** `load_state()` restored positions into `self.positions`, but `StateEngine` started with an empty snapshot. The `[HEARTBEAT]` emitter reads from `StateEngine.snapshot()`, not from `self.positions` directly.
+
+### Fix: Alpaca Reconciliation (`monitor/monitor.py`)
+
+Added `_sync_broker_positions(trading_client)` called during `__init__`, before any engine is wired:
+
+```python
+def _sync_broker_positions(self, trading_client) -> None:
+    if not trading_client:
+        return
+    try:
+        alpaca_positions = trading_client.get_all_positions()
+    except Exception as e:
+        log.warning(f"[reconcile] Could not fetch Alpaca positions: {e}")
+        return
+
+    reconciled = 0
+    for ap in alpaca_positions:
+        ticker = str(ap.symbol)
+        if ticker in self.positions:
+            continue  # already tracked locally — trust local record
+        avg_entry = float(ap.avg_entry_price or 0)
+        qty = int(float(ap.qty or 0))
+        if qty <= 0 or avg_entry <= 0:
+            continue
+        self.positions[ticker] = {
+            'entry_price': avg_entry,
+            'qty':         qty,
+            'stop':        round(avg_entry * 0.97, 4),
+            'target':      round(avg_entry * 1.05, 4),
+            'entry_time':  'alpaca_restored',
+            'reason':      'alpaca_reconciliation',
+        }
+        self._reclaimed_today.add(ticker)
+        log.warning(f"[reconcile] Imported orphaned Alpaca position: {qty} {ticker} @ ${avg_entry:.2f}")
+        reconciled += 1
+
+    if reconciled:
+        log.warning(f"[reconcile] Imported {reconciled} orphaned position(s). Verify stop/target — defaults are ±3%/±5%.")
+    else:
+        log.info("[reconcile] Local positions are in sync with Alpaca.")
+```
+
+**Call order in `__init__`:**
+```
+load_state()
+→ create TradingClient
+→ _sync_broker_positions(trading_client)    ← new
+→ create EventBus + engines
+→ state_engine.seed(self.positions, self.trade_log)  ← new
+```
+
+---
+
+## 2. StateEngine Seeding
+
+### Problem
+
+After restart, `load_state()` correctly restores positions into `self.positions`, but `StateEngine` started fresh with an empty `_positions` dict. Until the first `POSITION` event arrived (which might not happen for hours if no new fills occur), `HeartbeatEmitter` and the Streamlit UI showed zero positions and trades.
+
+### Fix: `seed()` method (`monitor/state_engine.py`)
+
+```python
+def seed(self, positions: dict, trade_log: list) -> None:
+    with self._lock:
+        self._positions = {k: copy.deepcopy(v) for k, v in positions.items()}
+        self._trade_log = copy.deepcopy(trade_log)
+    log.info(
+        f"[StateEngine] Seeded: {len(self._positions)} open positions, "
+        f"{len(self._trade_log)} completed trades"
+    )
+```
+
+Called once after all engines are wired:
+```python
+self._state_engine = StateEngine(self._bus)
+self._state_engine.seed(self.positions, self.trade_log)  # ← new
+```
+
+---
+
+## 3. EventBus v4 → v5
+
+### v4 improvements (7 fixes in original build)
+
+1. **Priority enforced in async queues** — `_BoundedPriorityQueue` (heapq). `DROP_OLDEST` evicts lowest-urgency item, not FIFO-oldest.
+2. **N workers per EventType** — `_PartitionedAsyncDispatcher`; `hash(ticker) % n_workers` routing (Kafka model). Per-ticker order preserved; tickers processed in parallel.
+3. **Split locks** — four purpose-specific locks instead of a single `RLock`: `_sub_lock`, `_seq_lock`, `_count_lock`, `_idem_lock`. Per-handler `_HandlerState._lock` for CB fields.
+4. **`emit_batch()`** — O(4) lock acquisitions for N events vs O(4N). Used in the BAR fan-out for 170 tickers.
+5. **Systemic backpressure** — `_BackpressureMonitor`; 60%/80%/95% thresholds; fixed sleep on throttle.
+6. **LRU stream_seqs** — `OrderedDict` capped at `max_streams=1000`; O(1) eviction.
+7. **Durable write-then-deliver** — `add_before_emit_hook()` + `emit(durable=True)`. Redpanda ACKs before any handler runs.
+
+### v5 additions (5 new features)
+
+8. **Retry with backoff + DLQ** — `RetryPolicy` on `subscribe()`; `_deliver()` retries before counting a failure. Permanently failed events → `_dead_letters` deque + optional `dlq_handler`.
+9. **Event TTL / expiry** — `event.expiry_ts` (monotonic). `_deliver()` silently skips expired events.
+10. **Per-(handler, ticker) circuit breaker** — `_cb_states: Dict[(key, ticker), state]`. One bad ticker does NOT trip the circuit for all other tickers.
+11. **Event coalescing** — dispatcher-level `coalesce=True` (later replaced in v6; see below).
+12. **SLA tracking** — `event.deadline` field; `_deliver()` logs breaches and counts in `BusMetrics.sla_breaches`.
+
+### v5 structural upgrades
+
+- **Dual-heap O(log n) eviction** — `_BoundedPriorityQueue` now uses `_heap` (min) + `_evict_heap` (max via `-priority`) + `_invalid` set. Eviction is O(log n) instead of O(n).
+- **Adaptive backpressure sleep** — `THROTTLE_SLEEP_SEC=0.001`, `MAX_SLEEP_SEC=0.010`; sleep scales linearly from 1ms at 80% pressure to 10ms at 100%.
+- **Thread-safe=False** — `subscribe(thread_safe=False)` sets `state._call_lock = threading.Lock()`; `_deliver()` acquires it before calling the handler to serialise concurrent worker invocations.
+- **Stable partition hash** — `hashlib.md5` instead of Python `hash()` (which is process-randomised; PEP 456). Ensures the same ticker always routes to the same partition across restarts.
+- **`PrometheusExporter`** — optional; delta-based counters + gauges; `collect()` method.
+
+---
+
+## 4. EventBus v5 → v6
+
+Six CRITICAL and four MEDIUM issues were identified and fixed.
+
+### CRITICAL 1: Global sequence counter (fixed in user's manual edit)
+
+**Problem:** `_next_global_seq` was module-level, shared across all `EventBus` instances. Parallel backtests (two buses running simultaneously) raced on a single counter, producing non-monotonic per-bus sequences and breaking replay ordering.
+
+**Fix:** Remove module-level `_global_seq_lock/_global_seq_iter/_next_global_seq`. Add `self._bus_seq_lock = threading.Lock()` and `self._bus_seq_iter = itertools.count(1)` per bus instance.
+
+### CRITICAL 2: Dispatcher-level coalescing broke causal ordering
+
+**Problem:** `coalesce=True` on `_PartitionedAsyncDispatcher` skipped events for **all** handlers — including `StrategyEngine` which needs the complete bar sequence to compute VWAP and RSI correctly. If a bar was coalesced out, the strategy's indicators drifted.
+
+**Fix:**
+1. **Removed dispatcher-level coalescing** — removed `coalesce` param from `_PartitionedAsyncDispatcher.__init__`, removed `self._coalesce`, `self._cv`, `self._cv_lock`; reverted `put()` to 2-tuple `(event, snapshot)` items; reverted `_worker()` to 2-tuple unpack.
+2. **Per-handler coalescing** — added `coalesce: bool = False` to `subscribe()`; added `_coalesce_seqs: Optional[Dict[str, int]] = None` to `_HandlerState.__slots__` and `__init__`; when `coalesce=True`, `put()` updates `state._coalesce_seqs[ticker] = max(current, event.stream_seq)` for the handler; `_deliver()` checks if `event.stream_seq < state._coalesce_seqs[ticker]` and skips with `event.coalesced = True` if stale.
+
+**Usage:**
+```python
+# StrategyEngine — DO NOT use coalesce; needs every bar
+bus.subscribe(EventType.BAR, strategy.on_bar)
+
+# EventLogger — fine with coalescing; only needs latest state per ticker
+bus.subscribe(EventType.BAR, logger.on_event, coalesce=True)
+```
+
+### CRITICAL 3: Per-ticker CB state leaked memory
+
+**Problem:** `_cb_states: Dict[(handler, ticker), _HandlerState]` grew without bound. With 165+ tickers and 8+ handlers, it could accumulate thousands of entries — one per (handler, ticker) pair — that were never evicted.
+
+**Fix:**
+- Added `MAX_CB_STATES = 2_000` tuning constant.
+- Changed `_cb_states` from `Dict` to `OrderedDict`.
+- Updated `_get_cb_state()` to use LRU pattern: `move_to_end()` on access, `popitem(last=False)` when `len >= MAX_CB_STATES`.
+
+### CRITICAL 4: RetryPolicy on side-effectful handlers caused duplicate orders
+
+**Problem:** A handler registered with `RetryPolicy(max_retries=2)` on `ORDER_REQ` events would submit the same order up to 3 times if Alpaca's API returned a transient error. The bus-level retry is designed for stateless handlers only.
+
+**Fix:**
+- Added `_NO_RETRY_TYPES = frozenset({EventType.ORDER_REQ, EventType.FILL, EventType.POSITION})`.
+- In `_deliver()`, before the retry loop: `if event.type in _NO_RETRY_TYPES: max_attempts = 1`.
+
+### CRITICAL 5: TTL expiry broke idempotency (phantom stream_seq gaps)
+
+**Problem:** When `event.expiry_ts` was set and an event expired, the TTL check in `_deliver()` caused the event to be skipped **after** stream_seq and idempotency-window slots were already consumed. The result was a gap in the stream_seq sequence — `StreamMonitor` would log false "gap" warnings on the next delivery. Replaying expired events from the idempotency window was also impossible (already consumed).
+
+**Fix in `emit()`:** Added Step 0 before payload type check:
+```python
+if event.expiry_ts is not None and self._time_source.monotonic() > event.expiry_ts:
+    log.debug(f"[ttl-expired] {event.type.name} dropped at emit() — already expired")
+    return BackpressureStatus.SYNC if self._mode == DispatchMode.SYNC else BackpressureStatus.OK
+```
+
+**Fix in `emit_batch()`:** Added TTL pre-filter step before idempotency:
+```python
+_now_mono = self._time_source.monotonic()
+events = [e for e in events if e.expiry_ts is None or _now_mono <= e.expiry_ts]
+```
+
+### CRITICAL 6 (same as CRITICAL 5 — resolved together)
+
+Coalescing version counter was not partition-local (namespaced only by ticker). Fixed by namespacing the partition key as `f"{event_type.name}:{ticker}"` in `_partition()`.
+
+### MEDIUM 1: Uneven partition capacity (fixed in user's manual edit)
+
+The `_stable_hash` in `_partition()` was updated from `hashlib.md5` (module-level) to `zlib.crc32` (class-level override) for faster hashing. The key was namespaced by EventType: `f"{self._event_type.name}:{ticker}"` to ensure a ticker maps to the same partition index regardless of which dispatcher is calling.
+
+### MEDIUM 2: DLQ was global, not per-handler
+
+**Problem:** A single `deque(maxlen=1_000)` for all handlers meant high-volume `BAR` failures could evict `ORDER_REQ` failures from the DLQ before they were inspected.
+
+**Fix:**
+- Changed `self._dead_letters` from `deque(maxlen=1_000)` to `defaultdict(lambda: deque(maxlen=500))`.
+- In `_deliver()`: `self._dead_letters[key.__qualname__].append(entry)`.
+- Added public method:
+```python
+def dead_letters(self, handler_name: Optional[str] = None) -> List[DLQEntry]:
+    """Return DLQ entries; None returns all handlers sorted by failed_at."""
+```
+
+### MEDIUM 3: BackpressureMonitor hid per-EventType pressure
+
+**Problem:** `_BackpressureMonitor.check()` returned a single global pressure ratio. Operators could not tell if it was `BAR` queues (benign) or `ORDER_REQ` queues (dangerous) causing the pressure.
+
+**Fix:**
+- Added `pressure_by_type() -> Dict[str, float]` to `_BackpressureMonitor`.
+- Added `pressure_by_type: Dict[str, float]` field to `BusMetrics`.
+- Populated in `EventBus.metrics()`.
+
+### MEDIUM 4: Coalescing broke CausalityTracker
+
+**Problem:** `CausalityTracker._record()` logged every event including coalesced-out events (which had `event.coalesced = True`). Coalesced events should not appear in the causality DAG since they were never delivered.
+
+**Fix (partial — done in user's edit):** `CausalityTracker._record()` skips events where `event.coalesced = True`.
+
+**Fix (completed in v6):** `_deliver()` sets `event.coalesced = True` when per-handler coalescing skips delivery, so the `CausalityTracker` correctly ignores them.
+
+---
+
+## 5. EventBus v6 → v6.1
+
+Seven correctness and reliability fixes identified by code review on the `tradier_platform` branch.
+
+### CRITICAL 1: Tab/space mixing in `emit_batch` (line 1368–1371)
+
+**Problem:** `# Step 3.5` comment used a tab character while all surrounding code used spaces. Python 3 raises `TabError` when tabs and spaces are mixed in the same block. The comment was also misplaced — inside the `for event in events` loop instead of between Step 3 and Step 3.5 (the `with self._bus_seq_lock` block). This could cause an `IndentationError` at import time, preventing the entire `monitor` package from loading.
+
+**Fix:** Replaced tab with spaces; moved comment to the correct nesting level (outside the for loop, before `with self._bus_seq_lock:`).
+
+### CRITICAL 2: Tab/space mixing in `_deliver` (line 1636)
+
+**Problem:** `# Increment handler-level trip_count` comment used a tab for indentation. Same `TabError` risk as above.
+
+**Fix:** Replaced tab with consistent space indentation (8 spaces, matching the `if state:` block below it).
+
+### HIGH 3: `BaseException` silently kills worker threads
+
+**Problem:** `_deliver()` catches `except Exception` around the handler call (`key(event)`). `KeyboardInterrupt` and `SystemExit` inherit from `BaseException`, not `Exception`, so they propagate through `_deliver()` and up to `_worker()` which has no catch either. Since workers are daemon threads, they die silently — no circuit-breaker trip, no DLQ entry, no log. The partition for that ticker stops processing entirely with no observability.
+
+**Fix:** Changed `except Exception` to `except BaseException`. Added a check for `(KeyboardInterrupt, SystemExit)` that logs at CRITICAL, records the failure for circuit-breaker and DLQ accounting, then breaks out of the retry loop so the permanent-failure path runs. The worker thread still terminates (daemon threads don't re-raise), but now with proper accounting and a log trail.
+
+### HIGH 4: `DROP_OLDEST` livelock under contention
+
+**Problem:** In `_PartitionedAsyncDispatcher.put()`, the `DROP_OLDEST` policy retries `put_nowait()` in a `while True` loop when the queue is full, evicting the lowest-urgency item and retrying. Between `put_nowait` raising `Full` and `evict_lowest_urgency()` being called, another thread can consume an item, making `evict` return `None`. The loop then retries `put_nowait` immediately with no yield — a CPU-bound spin that can starve worker threads under high contention.
+
+**Fix:** Added `time.sleep(0.0001)` (100µs yield) when `evict_lowest_urgency()` returns `None`, giving worker threads time to drain the queue before the next retry.
+
+### HIGH 5: Dead `_stable_hash` method with different algorithm
+
+**Problem:** `_PartitionedAsyncDispatcher` had a dead instance method `_stable_hash(s)` using `zlib.crc32`, but `_partition()` called the **module-level** `_stable_hash()` using `hashlib.md5`. Two different hash algorithms for the same conceptual operation is a maintenance trap — switching the call from module-level to `self._stable_hash()` would silently change partition assignments, breaking per-ticker ordering in replay and backtesting.
+
+**Fix:** Removed the dead method entirely. Only the module-level `_stable_hash` (MD5) is used, matching the architecture docstring and the existing production behavior.
+
+### MEDIUM 6: New `EventType` crashes ASYNC bus with bare `KeyError`
+
+**Problem:** The `EventBus.__init__` ASYNC path iterates `for et in EventType` and indexes `merged[et]`. Adding a new `EventType` enum member without updating `_DEFAULT_ASYNC_CONFIG` causes a bare `KeyError` with no context about which member is missing or how to fix it.
+
+**Fix:** Added pre-flight validation before creating dispatchers:
+```python
+missing = [et.name for et in EventType if et not in merged]
+if missing:
+    raise ValueError(
+        f"EventBus ASYNC mode requires config for every EventType. "
+        f"Missing: {missing}. Add entries to _DEFAULT_ASYNC_CONFIG or "
+        f"pass async_config override."
+    )
+```
+
+### LOW 7: `SimulatedTimeSource.set_time` allows backwards wall clock
+
+**Problem:** `self._t = dt` is set unconditionally, so `now()` can return a time earlier than the previous call. `self._mono` is clamped with `max(0.0, elapsed)`, creating an inconsistency where the wall clock goes backwards but the monotonic clock doesn't. Handlers comparing `event.timestamp` values in backtests could see out-of-order events.
+
+**Fix:** Only update `self._t` when `elapsed > 0` (same guard as the monotonic clock). A backwards `set_time` call is now a no-op for both clocks.
+
+### Known issues (documented, not fixed)
+
+| ID | Severity | Description |
+|----|----------|-------------|
+| K1 | Medium | `BackpressureStatus.OK` returned for TTL-expired and deduplicated events — callers can't distinguish "delivered" from "silently dropped" |
+| K2 | Medium | `emit_batch` with `durable_fail_fast` aborts batch without rollback — events already persisted to Redpanda by earlier hooks are not compensated |
+| K3 | Low | `_invalid` set in `_BoundedPriorityQueue` grows without bound when eviction pressure is absent — phantom entries from `get()` accumulate in `_evict_heap` |
+| K4 | Low | `itertools.count()` in `_BoundedPriorityQueue._seq` never wraps — not a practical concern for most deployments but slows heap comparisons after billions of events |
+
+---
+
+## 6. Files Changed Summary
+
+| File | Changes |
+|------|---------|
+| `monitor/monitor.py` | Added `_sync_broker_positions()` for Alpaca reconciliation on startup; added `state_engine.seed()` call |
+| `monitor/state_engine.py` | Added `seed(positions, trade_log)` method to pre-populate snapshot on restart |
+| `monitor/event_bus.py` | Major v4→v5→v6→v6.1 evolution (see sections 3, 4, and 5 above) |
+| `README.md` | Full rewrite to document 9-layer event-driven architecture |
+
+---
+
+## 7. Key Design Decisions
+
+### Why coalescing must be per-handler
+
+Dispatcher-level coalescing drops an event before it reaches **any** handler. `StrategyEngine` subscribes to BAR and computes RSI, VWAP, and RVOL incrementally — it needs every bar. If bars are coalesced at the dispatcher level, the indicator state diverges from reality. Per-handler coalescing lets `EventLogger` (which only needs the latest value for display) skip stale bars without affecting `StrategyEngine`.
+
+### Why ORDER_REQ / FILL / POSITION must not retry
+
+The bus-level retry loop calls the handler again for the same event. For a stateless handler (e.g. a metrics aggregator), this is safe. For `AlpacaBroker.on_order_req()`, a retry submits the same order a second time — resulting in a duplicate position. Bus-level retry is categorically unsafe for side-effectful handlers; idempotency must be implemented inside the handler itself (e.g. via Alpaca's client_order_id dedup).
+
+### Why TTL check must happen before stream_seq assignment
+
+Stream sequence numbers are monotonic and contiguous per (EventType, ticker). If an expired event consumes a sequence number and is then silently dropped by `_deliver()`, a gap appears at the consumer. `StreamMonitor` would report a false "missed 1 event" warning on every BAR stream that had an expired event. Checking TTL before `emit()` touches `_stream_seqs` or `_seen_ids` keeps the sequence clean.
+
+### Why per-bus sequence counter (not module-level)
+
+Module-level `_global_seq_iter` is shared across all `EventBus` instances in the same process. In backtesting, two buses (one per strategy or one per year in year-by-year compounding) run concurrently. Events from bus A and bus B interleave in the global counter, so replaying bus A's events by sequence number would include bus B's events in the sequence. Per-bus counters (`self._bus_seq_iter`) isolate each bus's sequence space completely.
+
+### Why `hashlib.md5` (not Python `hash()`) for stable partitioning
+
+Python randomises `__hash__` seeds per process (PEP 456 / `PYTHONHASHSEED`). Two restarts may assign ticker AAPL to different partitions. If partition 0 processes AAPL in session 1 and partition 2 does in session 2, replaying session 1's events through session 2's dispatcher breaks per-ticker ordering. MD5 (or CRC32) produces the same integer for the same string across all restarts.
+
+### Why durable hooks run before handlers (not after)
+
+`DurableEventLog` registers a hook that calls `producer.produce(event); producer.flush()`. If this ran after handlers (e.g. after `PositionManager` updated `self.positions`), a crash between the handler completing and the flush completing would leave Redpanda without a record of a position that already changed in memory. Running the hook first means: if Redpanda fails, the event is never delivered to handlers and the position is never mutated — a clean failure.
+
+### Why `BaseException` is caught (not just `Exception`)
+
+Worker threads in `_PartitionedAsyncDispatcher._worker()` are daemon threads — if they die, the JVM (Python runtime) doesn't notice. Before v6.1, `except Exception` in `_deliver()` did not catch `KeyboardInterrupt` or `SystemExit` (both `BaseException` subclasses). A handler raising either would silently kill the worker thread for that partition: no circuit-breaker trip, no DLQ entry, no log, and the partition permanently stops processing events. Catching `BaseException` ensures the failure is accounted for (circuit-breaker + DLQ) and logged at CRITICAL before the thread exits, giving operators visibility into which partition died and why.
+
+### Why `DROP_OLDEST` yields on empty eviction
+
+When the queue is full and `evict_lowest_urgency()` returns `None` (another thread consumed an item between the `put_nowait` failure and the eviction attempt), the producer would immediately retry `put_nowait` in a tight loop. Under sustained high contention with many producers and few consumers, this creates a CPU-bound spin that starves the very workers the producer is waiting for. Adding a 100µs yield (`time.sleep(0.0001)`) gives workers time to drain the queue, and the next `put_nowait` succeeds.
+
+### Default async config
+
+| EventType | Queue size | Overflow | Workers |
+|-----------|-----------|----------|---------:|
+| BAR | 200 | DROP_OLDEST | 4 |
+| QUOTE | 100 | DROP_OLDEST | 2 |
+| SIGNAL | 50 | DROP_OLDEST | 2 |
+| ORDER_REQ | 100 | BLOCK | 1 |
+| FILL | 100 | BLOCK | 1 |
+| ORDER_FAIL | 50 | BLOCK | 1 |
+| POSITION | 50 | BLOCK | 1 |
+| RISK_BLOCK | 50 | DROP_NEWEST | 1 |
+| HEARTBEAT | 10 | DROP_OLDEST | 1 |
+
+ORDER_REQ / FILL / POSITION use BLOCK (never drop) + n_workers=1 (strict global ordering). BAR uses DROP_OLDEST (stale bars are worthless) + n_workers=4 (parallel ticker processing).

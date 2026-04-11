@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 
 from .alerts import send_alert
 from .event_bus import Event, EventBus, EventType
-from .events import FillPayload, PositionPayload
+from .events import FillPayload, PositionPayload, PositionSnapshot
 from .state import save_state
 
 ET = ZoneInfo('America/New_York')
@@ -141,7 +141,17 @@ class PositionManager:
             payload=PositionPayload(
                 ticker=ticker,
                 action='opened',
-                position=dict(pos),
+                position=PositionSnapshot(
+                    entry_price=pos['entry_price'],
+                    entry_time=pos['entry_time'],
+                    quantity=pos['quantity'],
+                    partial_done=pos['partial_done'],
+                    order_id=pos['order_id'],
+                    stop_price=pos['stop_price'],
+                    target_price=pos['target_price'],
+                    half_target=pos['half_target'],
+                    atr_value=pos.get('atr_value'),
+                ),
             ),
             correlation_id=parent.event_id,
         ))
@@ -203,7 +213,17 @@ class PositionManager:
                 payload=PositionPayload(
                     ticker=ticker,
                     action='partial_exit',
-                    position=dict(pos),
+                    position=PositionSnapshot(
+                        entry_price=pos['entry_price'],
+                        entry_time=pos.get('entry_time', ''),
+                        quantity=pos['quantity'],
+                        partial_done=pos['partial_done'],
+                        order_id=pos.get('order_id', ''),
+                        stop_price=pos['stop_price'],
+                        target_price=pos['target_price'],
+                        half_target=pos['half_target'],
+                        atr_value=pos.get('atr_value'),
+                    ),
                     pnl=pnl,
                 ),
                 correlation_id=parent.event_id,

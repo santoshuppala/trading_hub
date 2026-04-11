@@ -158,6 +158,10 @@ class RiskEngine:
 
         # 6. Spread — fetch fresh Level-1 quote
         spread_pct, ask_price = self._get_spread(ticker, p.ask_price)
+        if ask_price is None:
+            self._block(ticker, p.action,
+                        "live quote unavailable — cannot verify spread", event)
+            return
         if spread_pct > MAX_SPREAD_PCT:
             self._block(ticker, p.action,
                         f"spread too wide ({spread_pct:.3%} > {MAX_SPREAD_PCT:.3%})",
@@ -236,17 +240,33 @@ class RiskEngine:
             correlation_id=event.event_id,
         ))
 
-    def _get_spread(self, ticker: str, fallback_ask: float):
+    def _get_spread(self, ticker: str, signal_ask: float):
         """
         Fetch a fresh Level-1 quote from the data client.
-        Returns (spread_pct, ask_price).  Falls back to the signal's ask_price
-        and spread_pct=0.0 if the quote call fails.
+
+        Returns (spread_pct, ask_price) on success.
+        Returns (None, None) on any failure so the caller can block the trade
+        rather than silently accepting stale or missing price data.
+
+        Also returns (None, None) if the live ask diverges more than 0.5% from
+        the signal's ask — a fast-moving price means the entry thesis has changed.
         """
         try:
             spread_pct, ask_price = self._data.check_spread(ticker)
             if spread_pct is None or ask_price is None or ask_price <= 0:
-                return 0.0, fallback_ask
+                log.warning(
+                    f"[RiskEngine] check_spread({ticker}) returned invalid data "
+                    f"({spread_pct}, {ask_price}) — blocking entry"
+                )
+                return None, None
+            # Price-divergence guard: signal ask may be stale if the market moved
+            if signal_ask > 0 and abs(ask_price - signal_ask) / signal_ask > 0.005:
+                log.warning(
+                    f"[RiskEngine] {ticker}: live ask ${ask_price:.2f} diverges "
+                    f">0.5% from signal ask ${signal_ask:.2f} — blocking entry"
+                )
+                return None, None
             return spread_pct, ask_price
         except Exception as e:
-            log.warning(f"[RiskEngine] check_spread({ticker}) failed: {e}; using signal ask")
-            return 0.0, fallback_ask
+            log.warning(f"[RiskEngine] check_spread({ticker}) failed: {e} — blocking entry")
+            return None, None

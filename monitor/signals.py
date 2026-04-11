@@ -51,7 +51,16 @@ def get_rvol(hist_df, current_volume_sum, current_bar_index):
             avg = sum(avg_cum_vol) / len(avg_cum_vol)
             return current_volume_sum / avg if avg > 0 else 1.0
         else:
-            # Daily bars: estimate expected volume using time-fraction of trading day
+            # Daily bars: estimate expected volume using time-fraction of trading day.
+            # Before 10:15 AM ET (45 min of trading) the denominator is tiny and
+            # RVOL is artificially inflated — return 1.0 (neutral) to avoid
+            # false momentum signals during the volatile open.
+            now = datetime.now(ET)
+            market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+            elapsed = max(0.0, (now - market_open).total_seconds())
+            if elapsed < 45 * 60:
+                return 1.0
+
             daily_vols = [
                 float(hist_df.loc[hist_df.index.date == d, 'volume'].iloc[0])
                 for d in past_dates
@@ -60,10 +69,7 @@ def get_rvol(hist_df, current_volume_sum, current_bar_index):
             if not daily_vols:
                 return 1.0
             avg_daily_vol = sum(daily_vols) / len(daily_vols)
-            now = datetime.now(ET)
-            market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
             market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-            elapsed = max(0.0, (now - market_open).total_seconds())
             total   = (market_close - market_open).total_seconds()
             time_frac = min(elapsed / total, 1.0) if total > 0 else 0.5
             expected = avg_daily_vol * time_frac

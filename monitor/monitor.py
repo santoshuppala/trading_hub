@@ -95,6 +95,7 @@ def _remove_lock():
 
 from alpaca.trading.client import TradingClient
 
+from .alerts import send_alert
 from .brokers import make_broker
 from .data_client import make_data_client
 from .event_bus import BarPayload, Event, EventBus, EventType, DispatchMode
@@ -139,6 +140,7 @@ class RealTimeMonitor:
         redpanda_brokers=None,
     ):
         # ── Watchlist ──────────────────────────────────────────────────────
+        self._alert_email = alert_email
         self.base_tickers = list(tickers)
         self.tickers      = list(tickers)
 
@@ -346,6 +348,16 @@ class RealTimeMonitor:
     def run(self):
         """Main monitoring loop. Runs in the background thread started by start()."""
         self.running = True
+        try:
+            self._run_loop()
+        except Exception as e:
+            log.critical(f"[Monitor] Fatal error in run loop: {e}", exc_info=True)
+            send_alert(self._alert_email, f"Monitor crashed — manual restart required: {e}")
+            self.running = False
+            _remove_lock()
+
+    def _run_loop(self):
+        """Inner loop extracted so run() can wrap it in a single try/except."""
         while self.running:
             self._reset_daily_state()
 

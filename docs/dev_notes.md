@@ -13,8 +13,9 @@
 5. [EventBus v6 → v6.1 (7 correctness/reliability fixes)](#5-eventbus-v6--v61)
 6. [EventBus v6.1 → v5.2 — Partition correctness](#6-eventbus-v61--v52)
 7. [Event Schema v1 → v2 — 8 correctness fixes](#7-event-schema-v1--v2)
-8. [Files Changed Summary](#8-files-changed-summary)
-9. [Key Design Decisions](#9-key-design-decisions)
+8. [Multi-file Production Hardening — 11 fixes](#8-multi-file-production-hardening)
+9. [Files Changed Summary](#9-files-changed-summary)
+10. [Key Design Decisions](#10-key-design-decisions)
 
 ---
 
@@ -439,23 +440,243 @@ if value is None or not math.isfinite(value) or value <= 0:
 
 ---
 
-## 8. Files Changed Summary
+## 8. Multi-file Production Hardening — 11 fixes
+
+Code review of the full pipeline identified 11 bugs across 9 files.  Prioritised by financial impact.
+
+### FIX 1: Synchronous SMTP blocked the trading loop (`alerts.py`)
+
+**Problem:** `send_alert()` was fully synchronous — it opened an SMTP connection and waited for the server's response on the calling thread.  During a high-volatility alert storm (stop hit on multiple positions simultaneously) or a SMTP server timeout (10–30 s is common), every component that called `send_alert` — `AlpacaBroker`, `PositionManager`, `RiskEngine` — would stall.  The `ORDER_REQ` handler could miss a time-sensitive fill poll window.
+
+**Fix:** Added a `queue.Queue(maxsize=200)` + background daemon thread (`alert-smtp`).  `send_alert()` now enqueues and returns immediately.  The daemon thread delivers emails asynchronously.  If the queue overflows (> 200 pending), the alert is dropped and logged — the trading loop is never blocked.
+
+```python
+_alert_queue: queue.Queue = queue.Queue(maxsize=200)
+
+def send_alert(alert_email, message):
+    _ensure_worker()
+    try:
+        _alert_queue.put_nowait((alert_email, message))
+    except queue.Full:
+        log.warning(f"Alert queue full — dropping: {message[:120]}")
+```
+
+Added `timeout=10` to the SMTP `SMTP(…)` constructor to bound the delivery worker's per-email wait.
+
+---
+
+### FIX 2: No max slippage cap on buy retry (`brokers.py`)
+
+**Problem:** `AlpacaBroker._execute_buy()` retried with a fresh ask on every cancel, but had no upper bound on how far the ask could drift.  On a fast-moving stock (e.g. momentum breakout), three retries over 6 seconds could result in paying 1.5–2% above the original signal price — erasing the entire expected profit of a 2×ATR trade.
+
+**Fix:** Added `MAX_SLIPPAGE_PCT = 0.005` (0.5%).  Before each retry, the fresh ask is compared to `original_ask` (captured once at the start of `_execute_buy`):
+
+```python
+original_ask = p.price
+...
+if new_ask > original_ask * (1 + self.MAX_SLIPPAGE_PCT):
+    log.warning(f"BUY abandoned: {p.ticker} — slippage cap breached ...")
+    send_alert(...)
+    self._fail(p)
+    return
+```
+
+0.5% is deliberately tight: the VWAP reclaim strategy targets 2×ATR profit (typically 1–2%).  Paying more than 0.5% extra means the risk/reward is already compromised before the position is open.
+
+---
+
+### FIX 3: Spread check failure silently bypassed the spread filter (`risk_engine.py`)
+
+**Problem:** `_get_spread()` returned `(0.0, fallback_ask)` when `check_spread()` failed (network error, stale quote, zero bid/ask).  `spread_pct = 0.0` always passes the `> MAX_SPREAD_PCT` check, so the trade was approved based on the signal's potentially stale ask price — the exact situation the live quote check was designed to prevent.
+
+A second problem: if the live ask was > 0.5% away from the signal ask, the entry thesis had already changed but was still approved.
+
+**Fix:** `_get_spread()` now returns `(None, None)` on any failure.  The caller blocks the trade:
+
+```python
+spread_pct, ask_price = self._get_spread(ticker, p.ask_price)
+if ask_price is None:
+    self._block(ticker, p.action, "live quote unavailable — cannot verify spread", event)
+    return
+```
+
+Added price-divergence guard inside `_get_spread()`:
+```python
+if signal_ask > 0 and abs(ask_price - signal_ask) / signal_ask > 0.005:
+    log.warning(f"[RiskEngine] {ticker}: live ask ${ask_price:.2f} diverges >0.5% ...")
+    return None, None
+```
+
+---
+
+### FIX 4: Race condition on partial fills (`position_manager.py`)
+
+**Problem:** `_on_fill()` is called from the EventBus dispatch thread.  In ASYNC mode with multiple FILL workers, two concurrent FILL events for the same ticker (e.g. two partial fills from a single order) could interleave:
+- Thread A reads `pos['quantity'] = 10`, calculates `remaining = 5`
+- Thread B reads `pos['quantity'] = 10` (before Thread A writes)
+- Both write `pos['quantity'] = 5` — one sell is silently lost
+
+**Fix:** Added `self._lock = threading.Lock()` to `PositionManager.__init__`.  `_on_fill()` acquires the lock for the entire open/close sequence:
+
+```python
+def _on_fill(self, event: Event) -> None:
+    p: FillPayload = event.payload
+    with self._lock:
+        if p.side == 'buy':
+            self._open_position(p, event)
+        else:
+            self._close_position(p, event)
+```
+
+---
+
+### FIX 5: Run loop died silently on unhandled exception (`monitor.py`)
+
+**Problem:** `run()` had no top-level exception handler.  Any uncaught exception in `_reset_daily_state()`, `_screener.refresh()`, `fetch_batch_bars()`, or `emit_batch()` would terminate the daemon thread with no alert.  The bot appeared running (PID lock file present) but processed no new events.
+
+**Fix:** Extracted the loop body into `_run_loop()`.  `run()` wraps it in a try/except that fires an alert and cleans up:
+
+```python
+def run(self):
+    self.running = True
+    try:
+        self._run_loop()
+    except Exception as e:
+        log.critical(f"[Monitor] Fatal error in run loop: {e}", exc_info=True)
+        send_alert(self._alert_email, f"Monitor crashed — manual restart required: {e}")
+        self.running = False
+        _remove_lock()
+```
+
+Also stored `self._alert_email = alert_email` in `__init__` so `run()` has access to it.
+
+---
+
+### FIX 6: Stale pending signal after sell fill (`execution_feedback.py`)
+
+**Problem:** `_on_fill()` cleared `_pending[ticker]` on buy fill via `pop()`, but on sell fill it only called `_evict_stale()`.  If (due to event bus async delivery) a SIGNAL(buy) was cached after an ORDER_FAIL (e.g. the SIGNAL arrived before the bus confirmed the fail), and then a subsequent sell fill arrived, the stale pending entry survived into the next trade cycle for that ticker.
+
+**Fix:** Added explicit `_pending.pop(p.ticker, None)` on sell fill:
+```python
+if p.side != 'buy':
+    self._pending.pop(p.ticker, None)
+    return
+```
+
+---
+
+### FIX 7: RVOL inflated before 10:15 AM — false momentum signals (`signals.py`)
+
+**Problem:** In the daily-bars RVOL path, `time_frac` is computed as `elapsed / total_day_seconds`.  At 9:35 AM, `elapsed = 5 min` and `expected_volume ≈ avg_daily_vol × 0.008`.  A stock that traded 3% of its daily volume in 5 minutes would show `RVOL = 3.75×` — far above the 2× threshold — even if that's completely normal opening-range activity.  This generated false VWAP-reclaim buy signals in the volatile open.
+
+**Fix:** Return `1.0` (neutral / no signal) if fewer than 45 minutes of trading have elapsed (before 10:15 AM ET):
+
+```python
+elapsed = max(0.0, (now - market_open).total_seconds())
+if elapsed < 45 * 60:
+    return 1.0   # too early — RVOL denominator too small
+```
+
+This aligns with the strategy's documented `TRADE_START_HOUR=9, TRADE_START_MIN=45` window.
+
+---
+
+### FIX 8: Replay returned events in partition order, not causal order (`event_log.py`)
+
+**Problem:** The topic has 9 partitions (one per EventType).  Reading from all partitions with `consumer.poll()` interleaves records by partition arrival order, which is not wall-clock order.  A crash-recovery replay could see `FILL` before `ORDER_REQ` for the same trade — `CrashRecovery.rebuild()` would then attempt to close a position that hadn't been opened yet, discarding the fill.
+
+**Fix:** Collected all records into a list, then sorted by `stream_seq` (globally monotonic counter assigned by the EventBus at `emit()` time) before yielding:
+
+```python
+def _sort_key(r):
+    seq = r.get('stream_seq')
+    if seq is not None:
+        try:
+            return (0, int(seq), '')
+        except (TypeError, ValueError):
+            pass
+    return (1, 0, r.get('timestamp', ''))
+
+records.sort(key=_sort_key)
+```
+
+Timestamp is the fallback for events without a `stream_seq` (e.g. HEARTBEAT).
+
+---
+
+### FIX 9: Corrupt state file wiped without backup (`state.py`)
+
+**Problem:** `load_state()` caught all exceptions and returned empty state.  If `bot_state.json` was corrupted mid-write (e.g. power cut during `os.replace()`), the original corrupt file was silently discarded — impossible to inspect for recovery.
+
+**Fix:** On `json.JSONDecodeError` or any other parse failure, the corrupt file is backed up before returning empty state:
+
+```python
+except Exception as e:
+    log.error(f"State load failed: {e}")
+    if os.path.exists(_STATE_FILE):
+        backup = _STATE_FILE + '.corrupt'
+        shutil.copy2(_STATE_FILE, backup)
+        log.warning(f"Corrupt state file backed up to {backup}")
+    return {}, set(), []
+```
+
+---
+
+### FIX 10: No 429 backoff on Tradier API (`tradier_client.py`)
+
+**Problem:** `_get()` called `resp.raise_for_status()` on every response.  Tradier's sandbox and live APIs return HTTP 429 (Too Many Requests) during high-traffic periods (e.g. the morning batch fetch for 200 tickers).  `raise_for_status()` on a 429 propagated immediately, leaving the ticker without bars for that cycle.
+
+**Fix:** Added exponential backoff (1 s / 2 s / 4 s) for 429 responses:
+
+```python
+for attempt in range(3):
+    resp = self._session.get(url, params=params, timeout=15)
+    if resp.status_code == 429:
+        wait = 2 ** attempt
+        log.warning(f"Tradier 429 rate-limit; retrying in {wait}s")
+        time.sleep(wait)
+        continue
+    resp.raise_for_status()
+    return resp.json()
+resp.raise_for_status()   # final attempt — propagate
+```
+
+Also added `f.result(timeout=30)` to `fetch_batch_bars()` so a hung thread worker doesn't hold up the entire batch indefinitely.
+
+---
+
+### FIX 11: No timeout on concurrent RS-filter fetches (`screener.py`)
+
+**Problem:** `_filter_by_relative_strength()` called `f.result()` with no timeout.  A single slow or hung Tradier connection could block the screener's `ThreadPoolExecutor` indefinitely.  The screener is called every 30 minutes from `run()`, so a hung screener call would freeze the entire monitoring loop.
+
+**Fix:** Added `f.result(timeout=30)` — a 30-second per-ticker timeout matches the `_get()` socket timeout (15 s) plus Tradier's 429 backoff budget (max 7 s).
+
+---
+
+## 9. Files Changed Summary
 
 | File | Changes |
 |------|---------|
-| `monitor/monitor.py` | Added `_sync_broker_positions()` for Alpaca reconciliation on startup; added `state_engine.seed()` call |
+| `monitor/monitor.py` | Added `_sync_broker_positions()` for Alpaca reconciliation on startup; `state_engine.seed()` call; `self._alert_email`; run loop wrapped in try/except; `_run_loop()` extracted |
 | `monitor/state_engine.py` | Added `seed(positions, trade_log)` method to pre-populate snapshot on restart |
 | `monitor/event_bus.py` | Major v4→v5→v6→v6.1→v5.2 evolution (see sections 3–6 above) |
 | `monitor/events.py` | v1→v2: frozen payloads, DataFrame copy, callable removal, PositionSnapshot, Enums, isfinite, timestamp removal (see section 7) |
 | `monitor/strategy_engine.py` | Updated SignalPayload construction: removed `refresh_ask` lambda, added `needs_ask_refresh` |
-| `monitor/risk_engine.py` | Updated OrderRequestPayload construction: propagates `needs_ask_refresh` |
-| `monitor/position_manager.py` | Updated PositionPayload construction: replaced `dict(pos)` with `PositionSnapshot(...)` |
-| `monitor/brokers.py` | AlpacaBroker gains `quote_fn` constructor param; retry logic uses `p.needs_ask_refresh` |
+| `monitor/risk_engine.py` | `_get_spread()` now returns `(None, None)` on failure; caller blocks trade; price-divergence guard (>0.5%); `needs_ask_refresh` propagation |
+| `monitor/position_manager.py` | `threading.Lock` around `_on_fill`; `PositionSnapshot(...)` replaces `dict(pos)` at all emit sites |
+| `monitor/brokers.py` | `MAX_SLIPPAGE_PCT = 0.005`; `original_ask` captured; cap check before retry; `quote_fn` param; `needs_ask_refresh` |
+| `monitor/alerts.py` | Async queue + background daemon thread; SMTP never blocks calling thread |
+| `monitor/execution_feedback.py` | `_pending.pop(ticker)` on sell fill to clear stale cached signals |
+| `monitor/signals.py` | RVOL returns 1.0 before 10:15 AM ET (daily-bars path only) |
+| `monitor/event_log.py` | `replay()` collects all records then sorts by `stream_seq` before yielding |
+| `monitor/state.py` | Corrupt state file backed up to `.corrupt` before returning empty state |
+| `monitor/tradier_client.py` | 429 exponential backoff in `_get()`; `f.result(timeout=30)` in `fetch_batch_bars` |
+| `monitor/screener.py` | `f.result(timeout=30)` in `_filter_by_relative_strength` |
 | `README.md` | Full rewrite to document 9-layer event-driven architecture |
 
 ---
 
-## 9. Key Design Decisions
+## 10. Key Design Decisions
 
 ### Why coalescing must be per-handler
 

@@ -107,6 +107,10 @@ class ExecutionFeedback:
         self._evict_stale()
 
         if p.side != 'buy':
+            # Clear any stale pending entry for this ticker on sell — guards
+            # against a signal cached after a failed buy being applied to the
+            # next open position on the same ticker.
+            self._pending.pop(p.ticker, None)
             return
 
         ticker = p.ticker

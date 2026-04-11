@@ -477,11 +477,15 @@ class EventLogConsumer:
 
             consumer.assign(partitions)
 
-            count = 0
+            # Collect all records first so we can sort by stream_seq before
+            # yielding.  Reading from N partitions without sorting would produce
+            # a replay order determined by partition interleaving, not causal
+            # sequence — ORDER_REQ could appear after FILL, corrupting recovery.
+            records: list = []
             while True:
                 msg = consumer.poll(timeout=2.0)
                 if msg is None:
-                    break   # no more messages in the given window
+                    break
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         break
@@ -490,10 +494,26 @@ class EventLogConsumer:
 
                 record = self._decode(msg)
                 if record:
-                    yield record
-                    count += 1
-                    if n is not None and count >= n:
-                        break
+                    records.append(record)
+
+            # Sort by stream_seq (globally monotonic), fallback to ISO timestamp.
+            def _sort_key(r):
+                seq = r.get('stream_seq')
+                if seq is not None:
+                    try:
+                        return (0, int(seq), '')
+                    except (TypeError, ValueError):
+                        pass
+                return (1, 0, r.get('timestamp', ''))
+
+            records.sort(key=_sort_key)
+
+            count = 0
+            for record in records:
+                yield record
+                count += 1
+                if n is not None and count >= n:
+                    break
         finally:
             consumer.close()
 

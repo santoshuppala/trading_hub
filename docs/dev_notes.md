@@ -23,6 +23,7 @@
 15. [BAR Queue Depth + HTTP Pool Sizing](#15-bar-queue-depth--http-pool-sizing)
 16. [PopExecutor — Dedicated Alpaca Execution Account](#16-popexecutor--dedicated-alpaca-execution-account)
 17. [run_monitor.py — PopStrategyEngine Wiring](#17-run_monitorpy--popstrategyengine-wiring)
+18. [Pro-Setup Multi-Tier Strategy System](#18-pro-setup-multi-tier-strategy-system)
 
 ---
 
@@ -1218,5 +1219,114 @@ from config import (
     ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
     POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
 )
+```
+
+---
+
+## 18. Pro-Setup Multi-Tier Strategy System
+
+**Session:** 2026-04-12 (branch `tradier_platform`)
+
+### Motivation
+
+The existing system has two strategies: VWAP Reclaim (T4) and Pop-Stock (T3.5).  Both are catalyst-driven and share similar entry mechanics.  To broaden coverage across different intraday setups (trend, range, volatility, order-flow), 11 new rule-based setups were added as a fully additive module (`pro_setups/`) that does not touch any existing code path.
+
+### Design decisions
+
+**1. Fully additive — zero modification to existing layers**
+
+`ProSetupEngine` subscribes to `BAR` at `priority=2` (existing `StrategyEngine` at `priority=1`).  The only changes to existing files are:
+- `monitor/event_bus.py`: `PRO_STRATEGY_SIGNAL` EventType + async config + priority + payload type
+- `monitor/events.py`: `ProStrategySignalPayload` frozen dataclass
+- `config.py`: three `PRO_*` constants
+- `run_monitor.py`: `ProSetupEngine` instantiation
+
+**2. Three-tier stop/exit structure**
+
+| Tier | SL | Partial | Full | Trail |
+|------|-----|---------|------|-------|
+| 1 | 0.3–0.4 ATR | 1R | 2R | Higher lows |
+| 2 | 0.8–1.0 ATR | 1.5R | 3R | EMA20/VWAP |
+| 3 | 1.5–2.0 ATR | 3R | 6–8R | Structure |
+
+**3. Execution via shared AlpacaBroker (ORDER_REQ path)**
+
+`RiskAdapter` emits `ORDER_REQ` (durable) after its own risk checks.  The existing `AlpacaBroker` (subscribed to `ORDER_REQ`) executes the order — no new broker client or credentials needed.  Uses `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` (main account).
+
+This differs from `PopExecutor` which uses separate pop credentials.
+
+**4. Independent risk gate (RiskAdapter)**
+
+The existing `RiskEngine` is NOT used for pro setups (its RVOL ≥ 2.0 and RSI 50–70 checks are VWAP-Reclaim-specific and would incorrectly block Tier 3 momentum setups).  `RiskAdapter` does its own checks: max positions, cooldown, duplicate position, R:R floor, ATR validity, and risk-based position sizing (2% budget per trade).
+
+**5. Deterministic pipeline**
+
+All 5 stages (detector → classifier → strategy → risk → emit) are pure functions with no ML, no randomness, no global state.  The same BAR always produces the same output.
+
+### New EventType: PRO_STRATEGY_SIGNAL
+
+```python
+PRO_STRATEGY_SIGNAL = auto()
+# Config: maxsize=100, DROP_OLDEST, n_workers=2, priority=MEDIUM
+```
+
+Payload: `ProStrategySignalPayload` — ticker, strategy_name, tier, direction, entry/stop/target levels, ATR, RVOL, RSI, VWAP, confidence, detector_signals (JSON).
+
+### File structure (38 new files)
+
+```
+pro_setups/
+├── __init__.py
+├── engine.py                   # ProSetupEngine — main orchestrator
+├── detectors/
+│   ├── base.py                 # DetectorSignal dataclass + BaseDetector ABC
+│   ├── _compute.py             # shared: VWAP, ATR, RSI, EMA, BB, Fib, pivots
+│   ├── trend_detector.py       # EMA9/20/50 alignment + HH+HL structure
+│   ├── vwap_detector.py        # above/below VWAP, reclaim pattern
+│   ├── sr_detector.py          # pivot-based S/R + flip detection
+│   ├── orb_detector.py         # 15-min opening range breakout
+│   ├── inside_bar_detector.py  # harami pattern + trend context
+│   ├── gap_detector.py         # gap-up/down + unfilled + continuation
+│   ├── flag_detector.py        # pole + tight channel + breakout
+│   ├── liquidity_detector.py   # sweep of swing low/high + reversal
+│   ├── volatility_detector.py  # BB squeeze + directional breakout
+│   ├── fib_detector.py         # 38.2%/61.8% Fib levels + proximity
+│   └── momentum_detector.py    # 3× volume + 1.5 ATR 3-bar expansion
+├── classifiers/
+│   └── strategy_classifier.py  # Tier 3→2→1 priority rule chain
+├── strategies/
+│   ├── base.py                 # BaseProStrategy ABC; tier constants
+│   ├── tier1/trend_pullback.py
+│   ├── tier1/vwap_reclaim.py
+│   ├── tier1/sr_flip.py
+│   ├── tier2/orb.py
+│   ├── tier2/inside_bar.py
+│   ├── tier2/gap_and_go.py
+│   ├── tier2/flag_pennant.py
+│   ├── tier3/liquidity_sweep.py
+│   ├── tier3/bollinger_squeeze.py
+│   ├── tier3/fib_confluence.py
+│   └── tier3/momentum_ignition.py
+├── router/
+│   └── strategy_router.py      # PRO_STRATEGY_SIGNAL → RiskAdapter
+└── risk/
+    └── risk_adapter.py         # Risk gate + position sizing + ORDER_REQ emit
+```
+
+### Enhanced logging
+
+Every fired signal produces two structured log lines:
+
+1. **ProSetupEngine** (when signal is emitted): strategy, tier, direction, all price levels, R:R, ATR, RVOL, RSI, confidence, fired detectors, elapsed ms.
+2. **RiskAdapter** (when ORDER_REQ is emitted): direction, entry, stop, targets, qty, R:R, dollar risk, confidence, ATR.
+
+Blocked signals also log with reason: `BLOCKED: max_positions reached`, `BLOCKED: cooldown 143s remaining`, `BLOCKED: R:R=1.20 < min 3.50`, etc.
+
+### config.py additions
+
+```python
+PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))
+PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))
+PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))
 ```
 

@@ -627,3 +627,106 @@ class PopSignalPayload:
             raise ValueError(
                 f"strategy_confidence must be in [0, 1], got {self.strategy_confidence!r}"
             )
+
+
+# ── PRO_STRATEGY_SIGNAL ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ProStrategySignalPayload:
+    """
+    Intermediate routing payload emitted by ProSetupEngine (pro_setups/).
+
+    Producer  : ProSetupEngine (pro_setups/engine.py)
+    Consumers : ProStrategyRouter → RiskAdapter → ORDER_REQ → AlpacaBroker
+
+    Pipeline
+    --------
+    BAR → 11 detectors → StrategyClassifier → PRO_STRATEGY_SIGNAL
+        → ProStrategyRouter → RiskAdapter.validate_and_emit() → ORDER_REQ
+
+    The existing RiskEngine / AlpacaBroker are NOT bypassed for execution —
+    ORDER_REQ is emitted so the existing AlpacaBroker handles fills.
+    The existing RiskEngine's SIGNAL handler is NOT used; RiskAdapter is the
+    risk gate for pro setups.
+
+    Fields
+    ------
+    ticker          : stock symbol
+    strategy_name   : one of the 11 pro setup names (e.g. 'trend_pullback')
+    tier            : 1 (high win-rate), 2 (moderate), 3 (high expectancy)
+    direction       : 'long' or 'short'
+    entry_price     : proposed entry (close of signal bar)
+    stop_price      : tier-based hard stop
+    target_1        : partial-exit target  (1R / 1.5R / 3R depending on tier)
+    target_2        : full-exit target     (2R / 3R  / 5–8R depending on tier)
+    atr_value       : ATR(14) at signal time
+    rvol            : relative volume ratio
+    rsi_value       : RSI(14) at signal time [0, 100]
+    vwap            : current session VWAP
+    confidence      : classifier confidence [0, 1]
+    detector_signals: JSON string — {detector_name: {fired, direction, strength}}
+    """
+    ticker:           str
+    strategy_name:    str
+    tier:             int    # 1 | 2 | 3
+    direction:        str    # 'long' | 'short'
+    entry_price:      float
+    stop_price:       float
+    target_1:         float
+    target_2:         float
+    atr_value:        float
+    rvol:             float
+    rsi_value:        float
+    vwap:             float
+    confidence:       float
+    detector_signals: str = '{}'   # JSON snapshot
+
+    def __post_init__(self):
+        _require_ticker(self.ticker)
+        if not self.strategy_name:
+            raise ValueError("strategy_name must be non-empty")
+        if self.tier not in (1, 2, 3):
+            raise ValueError(f"tier must be 1, 2, or 3; got {self.tier!r}")
+        if self.direction not in ('long', 'short'):
+            raise ValueError(f"direction must be 'long' or 'short'; got {self.direction!r}")
+        _require_positive('entry_price', self.entry_price)
+        _require_positive('stop_price',  self.stop_price)
+        _require_positive('target_1',    self.target_1)
+        _require_positive('target_2',    self.target_2)
+        _require_positive('atr_value',   self.atr_value)
+        _require_non_negative('rvol',    self.rvol)
+        if not (0.0 <= self.rsi_value <= 100.0):
+            raise ValueError(f"rsi_value must be [0, 100]; got {self.rsi_value!r}")
+        _require_positive('vwap', self.vwap)
+        if not math.isfinite(self.confidence) or not (0.0 <= self.confidence <= 1.0):
+            raise ValueError(f"confidence must be [0, 1]; got {self.confidence!r}")
+        if self.direction == 'long':
+            if self.stop_price >= self.entry_price:
+                raise ValueError(
+                    f"stop_price ({self.stop_price}) must be < entry_price "
+                    f"({self.entry_price}) for long direction"
+                )
+            if self.target_1 <= self.entry_price:
+                raise ValueError(
+                    f"target_1 ({self.target_1}) must be > entry_price "
+                    f"({self.entry_price}) for long direction"
+                )
+            if self.target_2 <= self.target_1:
+                raise ValueError(
+                    f"target_2 ({self.target_2}) must be > target_1 ({self.target_1})"
+                )
+        else:  # short
+            if self.stop_price <= self.entry_price:
+                raise ValueError(
+                    f"stop_price ({self.stop_price}) must be > entry_price "
+                    f"({self.entry_price}) for short direction"
+                )
+            if self.target_1 >= self.entry_price:
+                raise ValueError(
+                    f"target_1 ({self.target_1}) must be < entry_price "
+                    f"({self.entry_price}) for short direction"
+                )
+            if self.target_2 >= self.target_1:
+                raise ValueError(
+                    f"target_2 ({self.target_2}) must be < target_1 ({self.target_1})"
+                )

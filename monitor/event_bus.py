@@ -288,6 +288,11 @@ class EventType(Enum):
     # The pop_strategy_engine.py layer also translates each POP_SIGNAL into a
     # standard SIGNAL so the existing RiskEngine pipeline handles execution.
     POP_SIGNAL   = auto()
+    # ── Pro-setups subsystem (pro_setups/) ────────────────────────────────────
+    # Emitted by ProSetupEngine (BAR subscriber) after 11 detectors + classifier
+    # fire.  Consumed by ProStrategyRouter → RiskAdapter → ORDER_REQ.
+    # Does NOT route through the existing RiskEngine — has its own risk gate.
+    PRO_STRATEGY_SIGNAL = auto()
 
 
 # Populate config dicts now that EventType exists
@@ -310,6 +315,8 @@ _DEFAULT_ASYNC_CONFIG.update({
     EventType.HEARTBEAT:  {'maxsize':  10, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
     # Pop-strategy signals — same profile as SIGNAL; latest supersedes stale
     EventType.POP_SIGNAL: {'maxsize':  50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},
+    # Pro-setup signals — same profile as POP_SIGNAL
+    EventType.PRO_STRATEGY_SIGNAL: {'maxsize': 100, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},
 })
 
 _DEFAULT_PRIORITY.update({
@@ -318,7 +325,8 @@ _DEFAULT_PRIORITY.update({
     EventType.ORDER_REQ:  EventPriority.HIGH,
     EventType.POSITION:   EventPriority.HIGH,
     EventType.SIGNAL:     EventPriority.MEDIUM,
-    EventType.POP_SIGNAL: EventPriority.MEDIUM,
+    EventType.POP_SIGNAL:          EventPriority.MEDIUM,
+    EventType.PRO_STRATEGY_SIGNAL: EventPriority.MEDIUM,
     EventType.RISK_BLOCK: EventPriority.MEDIUM,
     EventType.BAR:        EventPriority.LOW,
     EventType.QUOTE:      EventPriority.LOW,
@@ -746,20 +754,21 @@ from .events import (           # noqa: E402
     BarPayload, QuotePayload, SignalPayload,
     OrderRequestPayload, FillPayload, OrderFailPayload,
     PositionPayload, RiskBlockPayload, HeartbeatPayload,
-    PopSignalPayload,
+    PopSignalPayload, ProStrategySignalPayload,
 )
 
 _PAYLOAD_TYPES: Dict[EventType, type] = {
-    EventType.BAR:        BarPayload,
-    EventType.QUOTE:      QuotePayload,
-    EventType.SIGNAL:     SignalPayload,
-    EventType.ORDER_REQ:  OrderRequestPayload,
-    EventType.FILL:       FillPayload,
-    EventType.ORDER_FAIL: OrderFailPayload,
-    EventType.POSITION:   PositionPayload,
-    EventType.RISK_BLOCK: RiskBlockPayload,
-    EventType.HEARTBEAT:  HeartbeatPayload,
-    EventType.POP_SIGNAL: PopSignalPayload,
+    EventType.BAR:                 BarPayload,
+    EventType.QUOTE:               QuotePayload,
+    EventType.SIGNAL:              SignalPayload,
+    EventType.ORDER_REQ:           OrderRequestPayload,
+    EventType.FILL:                FillPayload,
+    EventType.ORDER_FAIL:          OrderFailPayload,
+    EventType.POSITION:            PositionPayload,
+    EventType.RISK_BLOCK:          RiskBlockPayload,
+    EventType.HEARTBEAT:           HeartbeatPayload,
+    EventType.POP_SIGNAL:          PopSignalPayload,
+    EventType.PRO_STRATEGY_SIGNAL: ProStrategySignalPayload,
 }
 
 __all__ = [

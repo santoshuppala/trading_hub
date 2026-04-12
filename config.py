@@ -82,6 +82,15 @@ POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 3))    # max conc
 POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 500))   # dollars per pop trade
 POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds cooldown per ticker
 
+# ── Pro-setups subsystem (pro_setups/) ────────────────────────────────────────
+# Uses APCA_API_KEY_ID / APCA_API_SECRET_KEY (same main account as VWAP strategy).
+# Execution goes through the shared AlpacaBroker via ORDER_REQ events.
+# RiskAdapter is the independent risk gate; existing RiskEngine is not used for
+# pro-setup entries.
+PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))    # max concurrent pro positions
+PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))   # dollars allocated per pro trade
+PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))  # seconds cooldown per ticker
+
 # ── Data source ────────────────────────────────────────────────────────────────
 # 'tradier' — Tradier REST API (recommended; commission-free data, no SDK)
 # 'alpaca'  — Alpaca Data API (uses same key/secret as order execution)

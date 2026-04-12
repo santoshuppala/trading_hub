@@ -30,6 +30,7 @@ from config import (
     PAPER_TRADING, DATA_SOURCE,
     ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
     POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
+    PRO_MAX_POSITIONS, PRO_TRADE_BUDGET, PRO_ORDER_COOLDOWN,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -66,6 +67,19 @@ def main():
         order_cooldown=ORDER_COOLDOWN,
         trade_budget=TRADE_BUDGET,
         data_source=DATA_SOURCE,
+    )
+
+    # ── Pro-setups engine (11 strategies, shared Alpaca account) ─────────────
+    from pro_setups.engine import ProSetupEngine
+    pro_engine = ProSetupEngine(
+        bus            = monitor._bus,
+        max_positions  = PRO_MAX_POSITIONS,
+        order_cooldown = PRO_ORDER_COOLDOWN,
+        trade_budget   = float(PRO_TRADE_BUDGET),
+    )
+    log.info(
+        f"ProSetupEngine ready | max_positions={PRO_MAX_POSITIONS} | "
+        f"budget=${PRO_TRADE_BUDGET} | cooldown={PRO_ORDER_COOLDOWN}s"
     )
 
     # ── T3.5: Pop-strategy engine (dedicated Alpaca account) ──────────────────

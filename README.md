@@ -12,7 +12,8 @@ The system is organised as a 10-layer event pipeline. Each layer subscribes to o
 
 ```
 monitor.run() → emit_batch(BAR[])
-    └─ PopStrategyEngine  BAR  → POP_SIGNAL (durable) + direct fill via PopExecutor [T3.5 — new]
+    └─ ProSetupEngine     BAR  → PRO_STRATEGY_SIGNAL → ORDER_REQ (11 setups, 3 tiers) [T3.6 — new]
+    └─ PopStrategyEngine  BAR  → POP_SIGNAL (durable) + direct fill via PopExecutor [T3.5]
     └─ StrategyEngine     BAR  → SIGNAL (buy / sell_* / partial_sell / hold)        [T4]
     └─ RiskEngine         SIGNAL → ORDER_REQ | RISK_BLOCK                           [T3]
     └─ Broker             ORDER_REQ → FILL | ORDER_FAIL
@@ -32,6 +33,7 @@ monitor.run() → emit_batch(BAR[])
 | T1.5 Event Schema | `monitor/events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; PopSignalPayload; read-only numpy arrays on BAR DataFrames |
 | T2 DurableEventLog | `monitor/event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
 | T3 RiskEngine | `monitor/risk_engine.py` | 6 pre-trade checks; blocks on spread fetch failure; price-divergence guard |
+| T3.6 ProSetupEngine | `pro_setups/engine.py` | 11 pro setups across 3 tiers; 11 detectors + classifier + router + RiskAdapter → ORDER_REQ → AlpacaBroker |
 | T3.5 PopStrategyEngine | `pop_strategy_engine.py` | Pop-stock screener → classifier → router → POP_SIGNAL + direct execution via PopExecutor (dedicated Alpaca account) |
 | T4 StrategyEngine | `monitor/strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
 | T5 PositionManager | `monitor/position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json`; thread-safe fill handler |
@@ -109,6 +111,18 @@ trading_hub/
 │       ├── ema_trend_engine.py         # Pullback-to-EMA in a confirmed uptrend
 │       └── bopb_engine.py              # Breakout → pullback → confirmation entry
 │
+├── pro_setups/               # 11-setup pro strategy subsystem (NEW)
+│   ├── engine.py             # T3.6 — ProSetupEngine: BAR → 11 detectors → PRO_STRATEGY_SIGNAL
+│   ├── detectors/            # 11 detectors: Trend, VWAP, SR, ORB, InsideBar, Gap, Flag,
+│   │                         #               Liquidity, Volatility(BB), Fib, Momentum
+│   ├── classifiers/          # StrategyClassifier: detector outputs → (strategy, tier)
+│   ├── strategies/           # 11 strategy modules in tier1/ tier2/ tier3/
+│   │   ├── tier1/            # trend_pullback, vwap_reclaim, sr_flip
+│   │   ├── tier2/            # orb, inside_bar, gap_and_go, flag_pennant
+│   │   └── tier3/            # liquidity_sweep, bollinger_squeeze, fib_confluence, momentum_ignition
+│   ├── router/               # ProStrategyRouter: PRO_STRATEGY_SIGNAL → RiskAdapter
+│   └── risk/                 # RiskAdapter: tier-aware risk gate → ORDER_REQ
+│
 ├── pop_strategy_engine.py    # T3.5 — BAR subscriber; runs pop pipeline; emits POP_SIGNAL + SIGNAL
 ├── demo_pop_strategies.py    # Offline demo: full pipeline with synthetic data
 │
@@ -184,6 +198,11 @@ ALERT_EMAIL_USER=you@yahoo.com
 ALERT_EMAIL_PASS=your16charapppassword
 ALERT_EMAIL_FROM=you@yahoo.com
 ALERT_EMAIL_TO=you@yahoo.com
+
+# Pro-setups subsystem (uses main Alpaca account, same as VWAP strategy)
+PRO_MAX_POSITIONS=3
+PRO_TRADE_BUDGET=1000
+PRO_ORDER_COOLDOWN=300
 
 # Pop-strategy dedicated Alpaca account (separate from main VWAP account)
 APCA_POPUP_KEY=PKxxxxxxxxxxxxxxxx
@@ -353,6 +372,88 @@ Each source adapter in `pop_screener/ingestion.py` is a plain class with one pub
 1. Implement the same method signature (e.g. `get_news(symbol, window_hours) → list[NewsData]`)
 2. Inject into `PopStrategyEngine` via the constructor
 3. No other code changes required
+
+---
+
+---
+
+### Strategy 3: Pro-Setup Multi-Tier System (new, T3.6)
+
+11 deterministic setups across 3 tiers, each with tier-specific stop/exit rules. Runs additively alongside existing strategies — no shared state or interference.
+
+#### Tier rules
+
+| Tier | Win-rate profile | SL | Partial exit | Full exit | Trail |
+|------|-----------------|-----|-------------|-----------|-------|
+| **Tier 1** | High (>55%) | 0.3–0.4 ATR | 1R | 2R | Higher lows (long) |
+| **Tier 2** | Moderate (45–55%) | 0.8–1.0 ATR | 1.5R | 3R | EMA20 or VWAP |
+| **Tier 3** | Low (<45%) | 1.5–2.0 ATR | 3R | 6–8R | Structure (swing) |
+
+#### Setups
+
+| Setup | Tier | Detector(s) | Entry trigger | Direction |
+|-------|------|-------------|---------------|-----------|
+| **Trend Pullback** | 1 | TrendDetector + VWAPDetector | EMA alignment + pull to EMA9/20 + bullish bar | Long |
+| **VWAP Reclaim** | 1 | VWAPDetector | Dip below → close above VWAP + EMA20 positive slope | Long |
+| **S/R Flip** | 1 | SRDetector | Former resistance acting as support (or vice versa) | Long/Short |
+| **ORB** | 2 | ORBDetector | Close above 15-min OR high + 1.5× volume | Long |
+| **Inside Bar** | 2 | InsideBarDetector | Break of mother bar boundary with trend context | Long/Short |
+| **Gap and Go** | 2 | GapDetector + VWAPDetector | Gap ≥ 0.5%, unfilled, close near session extreme | Long/Short |
+| **Flag/Pennant** | 2 | FlagDetector | Pole + tight consolidation + channel breakout | Long/Short |
+| **Liquidity Sweep** | 3 | LiquidityDetector | Stop-hunt pierce of swing + reversal candle | Long/Short |
+| **Bollinger Squeeze** | 3 | VolatilityDetector | BB bandwidth squeeze → directional breakout + volume | Long/Short |
+| **Fib Confluence** | 3 | FibDetector + (SR/VWAP/Trend) | 38.2% or 61.8% Fib + ≥1 confirming factor | Long/Short |
+| **Momentum Ignition** | 3 | MomentumDetector | 3× volume + 1.5 ATR 3-bar expansion + directional close | Long/Short |
+
+#### Pipeline flow
+
+```
+BAR event
+  └─ ProSetupEngine (T3.6)
+       ├─ 11 detectors run in sequence (each returns DetectorSignal)
+       ├─ StrategyClassifier → (strategy_name, tier, direction, confidence)
+       ├─ strategy.detect_signal() → final confirmation
+       ├─ strategy.generate_entry/stop/exit() → price levels
+       ├─ emit PRO_STRATEGY_SIGNAL (non-durable, for routing)
+       └─ ProStrategyRouter → RiskAdapter.validate_and_emit()
+            ├─ checks: max_positions, cooldown, duplicate, R:R, ATR
+            ├─ sizes position: 2% budget risk per trade
+            └─ emit ORDER_REQ (durable) → AlpacaBroker → FILL → PositionManager
+```
+
+#### Detailed entry/exit logging
+
+Every signal logs:
+```
+[ProSetupEngine][NVDA] SIGNAL  strategy=momentum_ignition  tier=3  dir=long
+  entry=487.3200  stop=483.6400  t1=498.9200  t2=516.8000
+  R:R=8.00  ATR=1.9200  RVOL=4.23  RSI=68.5  conf=82%
+  detectors_fired=['momentum', 'trend']  elapsed=3.2ms
+
+[RiskAdapter][NVDA][momentum_ignition][T3] ENTRY ▶ dir=long  entry=487.3200
+  stop=483.6400  target1=498.9200  target2=516.8000
+  qty=4  R:R=8.00  risk_$=14.72  conf=82%  ATR=1.9200
+```
+
+#### Activating
+
+```python
+from pro_setups.engine import ProSetupEngine
+pro_engine = ProSetupEngine(
+    bus            = monitor._bus,
+    max_positions  = PRO_MAX_POSITIONS,     # default 3
+    order_cooldown = PRO_ORDER_COOLDOWN,    # default 300 s
+    trade_budget   = float(PRO_TRADE_BUDGET),  # default $1000
+)
+```
+
+Already wired in `run_monitor.py`. Configure via `.env`:
+
+```
+PRO_MAX_POSITIONS=3
+PRO_TRADE_BUDGET=1000
+PRO_ORDER_COOLDOWN=300
+```
 
 ---
 

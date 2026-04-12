@@ -20,6 +20,7 @@
 
 ```
 monitor.run() → emit_batch(BAR[])
+    └─ ProSetupEngine     (T3.6)  BAR → 11 detectors → PRO_STRATEGY_SIGNAL → ORDER_REQ
     └─ PopStrategyEngine  (T3.5)  BAR → POP_SIGNAL (durable) + PopExecutor → FILL
     └─ StrategyEngine     (T4)    BAR → SIGNAL
     └─ RiskEngine         (T3)    SIGNAL → ORDER_REQ | RISK_BLOCK
@@ -40,7 +41,7 @@ All inter-layer communication goes through the `EventBus` (`monitor/event_bus.py
 
 - **Version:** v5.2
 - **File:** `monitor/event_bus.py`
-- **EventType enum** (all values): `BAR, QUOTE, SIGNAL, ORDER_REQ, FILL, ORDER_FAIL, POSITION, RISK_BLOCK, HEARTBEAT, POP_SIGNAL`
+- **EventType enum** (all values): `BAR, QUOTE, SIGNAL, ORDER_REQ, FILL, ORDER_FAIL, POSITION, RISK_BLOCK, HEARTBEAT, POP_SIGNAL, PRO_STRATEGY_SIGNAL`
 - **Partitioning:** ticker-based hash (md5, stable across restarts).  Same ticker → same worker across ALL EventTypes.  This guarantees `BAR→SIGNAL→ORDER→FILL` for one ticker never races across workers.
 - **Backpressure:** `DROP_OLDEST` for market data; `BLOCK` for order/fill path.
 - **Durable delivery:** `emit(durable=True)` runs all `before_emit_hooks` (Redpanda produce+flush) synchronously before any handler is called.
@@ -62,6 +63,7 @@ All payloads are **frozen dataclasses** in `monitor/events.py`.  Every field is 
 | ORDER_REQ | `OrderRequestPayload` | `ticker, side (Side), qty, price, reason, needs_ask_refresh, stop_price?, target_price?, atr_value?` |
 | FILL | `FillPayload` | `ticker, side, qty, fill_price, order_id, reason, stop_price?, target_price?, atr_value?` |
 | POP_SIGNAL | `PopSignalPayload` | `symbol, strategy_type (str), entry_price, stop_price, target_1, target_2, pop_reason (str), atr_value, rvol, vwap_distance, strategy_confidence, features_json` |
+| PRO_STRATEGY_SIGNAL | `ProStrategySignalPayload` | `ticker, strategy_name, tier (1/2/3), direction ('long'/'short'), entry_price, stop_price, target_1, target_2, atr_value, rvol, rsi_value, vwap, confidence, detector_signals (JSON)` |
 | POSITION | `PositionPayload` | `ticker, action (PositionAction), position (PositionSnapshot?), pnl?` |
 | RISK_BLOCK | `RiskBlockPayload` | `ticker, reason, signal_action` |
 
@@ -143,6 +145,11 @@ BAR → PopStrategyEngine._on_bar()
 | Pop feature engineering | `pop_screener/features.py` |
 | Pop screening rules | `pop_screener/screener.py` |
 | Pop classifier | `pop_screener/classifier.py` |
+| Pro-setup engine (T3.6) | `pro_setups/engine.py` |
+| 11 detectors | `pro_setups/detectors/*.py` |
+| Pro strategy classifier | `pro_setups/classifiers/strategy_classifier.py` |
+| 11 strategy modules | `pro_setups/strategies/tier{1,2,3}/*.py` |
+| Pro risk adapter | `pro_setups/risk/risk_adapter.py` |
 | T3.5 BAR subscriber + PopExecutor | `pop_strategy_engine.py` |
 | All configuration (incl. pop credentials) | `config.py` (tickers, strategy params, credentials, ALPACA_POPUP_KEY, POP_*) |
 | Architectural decisions | `docs/dev_notes.md` |
@@ -164,6 +171,10 @@ BAR → PopStrategyEngine._on_bar()
 
 ### What was added in the most recent session
 
+- `PRO_STRATEGY_SIGNAL` EventType + `ProStrategySignalPayload` payload
+- `pro_setups/` package: 38 new files — 11 detectors, 11 strategies (3 tiers), classifier, router, RiskAdapter, ProSetupEngine
+- `run_monitor.py` wired to instantiate `ProSetupEngine` before `monitor.start()`
+- `config.py` added: `PRO_MAX_POSITIONS`, `PRO_TRADE_BUDGET`, `PRO_ORDER_COOLDOWN`
 - `POP_SIGNAL` EventType + `PopSignalPayload` payload
 - `pop_screener/` package: 6 rule-based screeners, 6 strategy engines, feature engineering, classifier, router
 - `pop_strategy_engine.py` T3.5 layer with `PopExecutor` (dedicated Alpaca account, independent risk gate)
@@ -268,6 +279,14 @@ uncommitted changes: yes (README, dev_notes, pop_screener/*, pop_strategy_engine
 ```
 
 Commit all before merging to main.
+
+### Pro-setup env vars (`.env`)
+
+```
+PRO_MAX_POSITIONS=3
+PRO_TRADE_BUDGET=1000
+PRO_ORDER_COOLDOWN=300
+```
 
 ### Pop-strategy env vars (`.env`)
 

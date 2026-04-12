@@ -1,6 +1,6 @@
 # Trading Hub
 
-A real-time algorithmic trading system built on an event-driven architecture. Supports live execution via Alpaca, intraday bar data from Tradier or Alpaca, durable event logging via Redpanda, and a VWAP Reclaim momentum strategy with institutional-grade pre-trade risk filters.
+A real-time algorithmic trading system built on an event-driven architecture. Supports live execution via Alpaca, intraday bar data from Tradier or Alpaca, durable event logging via Redpanda, and multiple intraday strategies with institutional-grade pre-trade risk filters.
 
 > **Disclaimer:** This is for educational purposes only. Trading involves significant risk. Always start with paper trading. Consult a financial advisor before trading with real money.
 
@@ -8,35 +8,37 @@ A real-time algorithmic trading system built on an event-driven architecture. Su
 
 ## Architecture
 
-The system is organized as a 9-layer event pipeline. Each layer subscribes to one or more `EventType`s on the shared `EventBus` and emits downstream events.
+The system is organised as a 10-layer event pipeline. Each layer subscribes to one or more `EventType`s on the shared `EventBus` and emits downstream events.
 
 ```
 monitor.run() → emit_batch(BAR[])
-    └─ StrategyEngine   BAR  → SIGNAL (buy / sell_* / partial_sell / hold)
-    └─ RiskEngine        SIGNAL → ORDER_REQ | RISK_BLOCK
-    └─ Broker            ORDER_REQ → FILL | ORDER_FAIL
-    └─ ExecutionFeedback FILL(buy) → patches stop/target on position record
-    └─ PositionManager   FILL → POSITION (opened / partial_exit / closed)
-    └─ StateEngine       POSITION → read-only UI snapshot
-    └─ HeartbeatEmitter  tick() → HEARTBEAT every 60 s
-    └─ EventLogger       * → structured log line for every event
-    └─ DurableEventLog   ORDER_REQ/FILL → Redpanda (ACKed before handlers run)
+    └─ PopStrategyEngine  BAR  → POP_SIGNAL (durable) + direct fill via PopExecutor [T3.5 — new]
+    └─ StrategyEngine     BAR  → SIGNAL (buy / sell_* / partial_sell / hold)        [T4]
+    └─ RiskEngine         SIGNAL → ORDER_REQ | RISK_BLOCK                           [T3]
+    └─ Broker             ORDER_REQ → FILL | ORDER_FAIL
+    └─ ExecutionFeedback  FILL(buy) → patches stop/target on position record
+    └─ PositionManager    FILL → POSITION (opened / partial_exit / closed)
+    └─ StateEngine        POSITION → read-only UI snapshot
+    └─ HeartbeatEmitter   tick() → HEARTBEAT every 60 s
+    └─ EventLogger        * → structured log line for every event
+    └─ DurableEventLog    ORDER_REQ/FILL/POP_SIGNAL → Redpanda (ACKed before handlers run)
 ```
 
 ### Monitor layers
 
 | Layer | File | Responsibility |
 |-------|------|----------------|
-| T1 EventBus | `event_bus.py` | Pub/sub backbone; priority queues; backpressure; idempotency; SLA tracking |
-| T1.5 Event Schema | `events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; read-only numpy arrays on BAR DataFrames |
-| T2 DurableEventLog | `event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
-| T3 RiskEngine | `risk_engine.py` | 6 pre-trade checks; blocks on spread fetch failure; price-divergence guard |
-| T4 StrategyEngine | `strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
-| T5 PositionManager | `position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json`; thread-safe fill handler |
-| T6 StateEngine | `state_engine.py` | Maintains read-only portfolio snapshot for UI and heartbeat |
-| T7 ExecutionFeedback | `execution_feedback.py` | Patches stop/target prices after a buy fill |
-| T8 Observability | `observability.py` | EventLogger, HeartbeatEmitter, EODSummary |
-| T9 Monitor | `monitor.py` | Thin orchestrator; data-fetch loop; Alpaca reconciliation; crash-alerting run loop |
+| T1 EventBus | `monitor/event_bus.py` | Pub/sub backbone; priority queues; causal partitioning; backpressure; idempotency; SLA tracking |
+| T1.5 Event Schema | `monitor/events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; PopSignalPayload; read-only numpy arrays on BAR DataFrames |
+| T2 DurableEventLog | `monitor/event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
+| T3 RiskEngine | `monitor/risk_engine.py` | 6 pre-trade checks; blocks on spread fetch failure; price-divergence guard |
+| T3.5 PopStrategyEngine | `pop_strategy_engine.py` | Pop-stock screener → classifier → router → POP_SIGNAL + direct execution via PopExecutor (dedicated Alpaca account) |
+| T4 StrategyEngine | `monitor/strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
+| T5 PositionManager | `monitor/position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json`; thread-safe fill handler |
+| T6 StateEngine | `monitor/state_engine.py` | Maintains read-only portfolio snapshot for UI and heartbeat |
+| T7 ExecutionFeedback | `monitor/execution_feedback.py` | Patches stop/target prices after a buy fill |
+| T8 Observability | `monitor/observability.py` | EventLogger, HeartbeatEmitter, EODSummary |
+| T9 Monitor | `monitor/monitor.py` | Thin orchestrator; data-fetch loop; Alpaca reconciliation; crash-alerting run loop |
 
 ### Event Bus (v5.2)
 
@@ -44,12 +46,12 @@ Key capabilities built into `event_bus.py`:
 
 - **Priority queues** — `_BoundedPriorityQueue` (heapq); DROP_OLDEST evicts lowest-urgency items, preserving FILL/ORDER_REQ over BAR
 - **Partitioned workers** — `_PartitionedAsyncDispatcher`; N workers per EventType; ticker-based routing (Kafka partition model) preserves per-ticker causal ordering across all EventType dispatchers
-- **Causal vs. max-throughput mode** — `causal_partitioning=True` (default) keys on `ticker` only so `BAR→SIGNAL→ORDER→FILL` for the same ticker always share a partition index; `False` keys on `EventType:ticker` for maximum parallelism
-- **Round-robin for keyless events** — no-ticker events (HEARTBEAT, SYSTEM) distribute evenly across workers instead of piling on a fixed hot partition
-- **Stable partitioning** — `hashlib.md5` instead of Python's `hash()`, which is process-randomized (PEP 456)
+- **Causal ordering** — `BAR→SIGNAL→ORDER→FILL` for the same ticker always share a partition index; same-ticker events cannot race
+- **Round-robin for keyless events** — no-ticker events (HEARTBEAT) distribute evenly across workers instead of pinning to a hot partition
+- **Stable partitioning** — `hashlib.md5` instead of Python's `hash()` (PEP 456 randomisation)
 - **Split locks** — `_sub_lock`, `_seq_lock`, `_count_lock`, `_idem_lock`; per-handler `_HandlerState._lock` — no global contention
 - **`emit_batch()`** — O(4) lock acquisitions for N events vs O(4N) for N×`emit()`; used in the BAR fan-out for 100+ tickers
-- **Systemic backpressure** — `_BackpressureMonitor`; 60%/80%/95% thresholds; adaptive micro-sleep; returns `BackpressureStatus` enum to callers
+- **Systemic backpressure** — `_BackpressureMonitor`; 60%/80%/95% thresholds; adaptive micro-sleep; returns `BackpressureStatus` enum
 - **LRU stream_seqs** — `OrderedDict` capped at `max_streams=1000`; O(1) eviction
 - **Durable write-then-deliver** — `add_before_emit_hook()` + `emit(durable=True)`; Redpanda ACKs before any in-process handler runs
 - **SLA tracking** — `event.deadline` field; `_deliver()` counts breaches in `BusMetrics.sla_breaches`
@@ -57,11 +59,12 @@ Key capabilities built into `event_bus.py`:
 
 Default async config:
 
-| EventType | Queue size | Overflow | Workers |
-|-----------|-----------|----------|---------|
-| BAR | 200 | DROP_OLDEST | 4 |
-| ORDER_REQ, FILL | 100 | BLOCK | 1 (strict ordering) |
-| HEARTBEAT | 10 | DROP_OLDEST | 1 |
+| EventType | Queue size | Overflow | Workers | Notes |
+|-----------|-----------|----------|---------|-------|
+| BAR | 500 | DROP_OLDEST | 4 | 125 slots/partition; no drops on 200-ticker burst |
+| SIGNAL, POP_SIGNAL | 50 | DROP_OLDEST | 2 | Latest supersedes stale |
+| ORDER_REQ, FILL | 100 | BLOCK | 1 | Strict ordering; never dropped |
+| HEARTBEAT | 10 | DROP_OLDEST | 1 | |
 
 ---
 
@@ -70,25 +73,65 @@ Default async config:
 ```
 trading_hub/
 ├── monitor/
-│   ├── event_bus.py          # T1  — EventBus v5.2 (priority queues, causal partitioning, backpressure)
-│   ├── events.py             # T1.5 — Frozen payload dataclasses; Enums; PositionSnapshot
-│   ├── event_log.py          # T2  — Redpanda durable event log
-│   ├── risk_engine.py        # T3  — Pre-trade risk checks (6 filters)
-│   ├── strategy_engine.py    # T4  — VWAP Reclaim signal generation
-│   ├── position_manager.py   # T5  — Position lifecycle + bot_state.json persistence
-│   ├── state_engine.py       # T6  — Read-only portfolio snapshot (seeded on restart)
-│   ├── execution_feedback.py # T7  — Stop/target patch after buy fill
-│   ├── observability.py      # T8  — EventLogger, HeartbeatEmitter, EODSummary
-│   ├── monitor.py            # T9  — Orchestrator; run loop; Alpaca reconciliation
+│   ├── event_bus.py          # T1   — EventBus v5.2 (priority queues, causal partitioning, backpressure)
+│   ├── events.py             # T1.5 — Frozen payload dataclasses; enums; PopSignalPayload
+│   ├── event_log.py          # T2   — Redpanda durable event log + CrashRecovery
+│   ├── risk_engine.py        # T3   — Pre-trade risk checks (6 filters)
+│   ├── strategy_engine.py    # T4   — VWAP Reclaim signal generation
+│   ├── position_manager.py   # T5   — Position lifecycle + bot_state.json persistence
+│   ├── state_engine.py       # T6   — Read-only portfolio snapshot (seeded on restart)
+│   ├── execution_feedback.py # T7   — Stop/target patch after buy fill
+│   ├── observability.py      # T8   — EventLogger, HeartbeatEmitter, EODSummary
+│   ├── monitor.py            # T9   — Orchestrator; run loop; Alpaca reconciliation
 │   ├── brokers.py            # AlpacaBroker (limit+retry buy, market sell) + PaperBroker
 │   ├── data_client.py        # Factory: TradierDataClient | AlpacaDataClient
-│   ├── tradier_client.py     # Tradier REST API: bars, quotes
+│   ├── tradier_client.py     # Tradier REST API: bars, quotes; pooled HTTP adapter
 │   ├── alpaca_data_client.py # Alpaca data API: bars, quotes, screener
 │   ├── screener.py           # MomentumScreener — refreshes watchlist every 30 min
-│   ├── signals.py            # VWAP Reclaim signal math (used by StrategyEngine)
+│   ├── signals.py            # VWAP Reclaim signal math; LRU indicator cache (500 entries)
 │   ├── state.py              # load_state() / save_state() — atomic bot_state.json I/O
 │   ├── alerts.py             # Email alerts via Yahoo SMTP
 │   └── orders.py             # (legacy) direct order helpers
+│
+├── pop_screener/             # Multi-strategy pop-stock subsystem (NEW)
+│   ├── config.py             # All 60+ configurable thresholds (one place)
+│   ├── models.py             # Data models: NewsData, SocialData, EngineeredFeatures, etc.
+│   ├── ingestion.py          # Pluggable adapters: news / social / market / momentum
+│   ├── features.py           # FeatureEngineer: VWAP, ATR, RSI, trend cleanliness, sentiment
+│   ├── screener.py           # PopScreener: 6 rule-based pop detectors
+│   ├── classifier.py         # StrategyClassifier: deterministic pop → strategy mapping
+│   ├── strategy_router.py    # StrategyRouter: primary → secondary fallback engine dispatch
+│   └── strategies/
+│       ├── vwap_reclaim_engine.py      # Dip-and-reclaim pattern with RVOL/RSI filters
+│       ├── orb_engine.py               # Opening Range Breakout with volume confirmation
+│       ├── halt_resume_engine.py       # Halt-like spike + consolidation + breakout
+│       ├── parabolic_reversal_engine.py# Exhaustion candle → short reversal
+│       ├── ema_trend_engine.py         # Pullback-to-EMA in a confirmed uptrend
+│       └── bopb_engine.py              # Breakout → pullback → confirmation entry
+│
+├── pop_strategy_engine.py    # T3.5 — BAR subscriber; runs pop pipeline; emits POP_SIGNAL + SIGNAL
+├── demo_pop_strategies.py    # Offline demo: full pipeline with synthetic data
+│
+├── strategies/               # Backtrader strategy definitions
+│   ├── vwap_reclaim.py
+│   ├── ema_rsi.py
+│   ├── trend_atr.py
+│   ├── momentum_breakout.py
+│   └── mean_reversion.py
+│
+├── test/                     # Integration + unit test suite (10 tests)
+│   ├── test_1_synthetic_feed.py
+│   ├── test_2_tradier_sandbox.py
+│   ├── test_3_redpanda_consistency.py
+│   ├── test_4_market_open_latency.py
+│   ├── test_5_network_warmup.py
+│   ├── test_6_pipeline_integration.py
+│   ├── test_7_risk_boundaries.py
+│   ├── test_8_signal_edge_cases.py
+│   ├── test_9_eventbus_advanced.py
+│   ├── test_10_state_persistence.py
+│   └── run_all_tests.py
+│
 ├── app.py                    # Streamlit UI — live monitor + backtest tabs
 ├── config.py                 # Shared settings: tickers, strategy params, credentials
 ├── main.py                   # Backtrader backtesting engine
@@ -96,6 +139,7 @@ trading_hub/
 ├── vwap_utils.py             # VWAP computation utilities
 ├── start_monitor.sh          # Shell launcher for cron
 ├── bot_state.json            # Intraday state — positions, reclaimed tickers, trade log
+├── docs/dev_notes.md         # Full architectural decision log + bug fix history
 ├── logs/                     # Daily log files: monitor_YYYY-MM-DD.log
 ├── .env                      # API keys and SMTP credentials (never commit)
 └── requirements.txt
@@ -111,7 +155,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Python 3.10+ required (uses `match` statement).
+Python 3.10+ required.
 
 ---
 
@@ -141,6 +185,14 @@ ALERT_EMAIL_PASS=your16charapppassword
 ALERT_EMAIL_FROM=you@yahoo.com
 ALERT_EMAIL_TO=you@yahoo.com
 
+# Pop-strategy dedicated Alpaca account (separate from main VWAP account)
+APCA_POPUP_KEY=PKxxxxxxxxxxxxxxxx
+APCA_PUPUP_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+POP_PAPER_TRADING=true          # set false for live pop execution
+POP_MAX_POSITIONS=3
+POP_TRADE_BUDGET=500
+POP_ORDER_COOLDOWN=300
+
 # Redpanda / Kafka (optional — for durable event log)
 REDPANDA_BROKERS=127.0.0.1:9092
 ```
@@ -148,6 +200,10 @@ REDPANDA_BROKERS=127.0.0.1:9092
 ### `config.py`
 
 All tunable strategy values live in `config.py` — tickers, per-ticker params, max positions, trade budget, order cooldown, etc. Both the UI and headless launcher read from it.
+
+### `pop_screener/config.py`
+
+All 60+ pop-screener thresholds (RVOL, gap size, sentiment delta, ATR multipliers, etc.) are isolated here. Change one value and every downstream rule picks it up automatically. No magic numbers elsewhere.
 
 ---
 
@@ -174,6 +230,14 @@ bash start_monitor.sh
 
 Logs to `logs/monitor_YYYY-MM-DD.log`. Stops automatically at 3:15 PM ET with an EOD summary.
 
+### Pop-strategy demo (offline, no API keys)
+
+```bash
+python demo_pop_strategies.py
+python demo_pop_strategies.py --verbose          # shows full feature vectors
+python demo_pop_strategies.py --symbols AAPL NVDA TSLA
+```
+
 ### Cron (auto-start daily)
 
 ```
@@ -184,17 +248,19 @@ Runs at 6:00 AM PST (9:00 AM ET) on weekdays.
 
 ### Single-instance enforcement
 
-Only one monitor can run at a time. A second start attempt (from UI or CLI) is refused with the PID of the running process. The lock file is `.monitor.lock` in the project root; cleaned up automatically on stop.
+Only one monitor can run at a time. A second start attempt is refused with the PID of the running process. Lock file is `.monitor.lock`; cleaned up automatically on stop.
 
 ---
 
-## Trading Strategy: VWAP Reclaim
+## Strategies
 
-### Entry — all 9 conditions must hold simultaneously
+### Strategy 1: VWAP Reclaim (existing, T4)
+
+#### Entry — all 9 conditions must hold simultaneously
 
 | # | Filter | Detail |
 |---|--------|--------|
-| 1 | **2-bar VWAP reclaim** | Was above VWAP → dipped below → closed above VWAP for 2 consecutive bars |
+| 1 | **2-bar VWAP reclaim** | Dipped below VWAP → closed above VWAP for 2 consecutive bars |
 | 2 | **Opened above VWAP** | Day bias is bullish |
 | 3 | **RSI 50–70** | Momentum without being overbought |
 | 4 | **RVOL ≥ 2×** | Twice the usual volume at this time of day |
@@ -204,7 +270,7 @@ Only one monitor can run at a time. A second start attempt (from UI or CLI) is r
 | 8 | **Trading hours 9:45–3:00 PM ET** | Avoid noisy open and illiquid close |
 | 9 | **Max positions not exceeded** | Configurable; default 5 |
 
-### Exit conditions (first triggered wins)
+#### Exit conditions (first triggered wins)
 
 | Condition | Description |
 |-----------|-------------|
@@ -215,11 +281,86 @@ Only one monitor can run at a time. A second start attempt (from UI or CLI) is r
 | **VWAP breakdown** | Price closes below VWAP |
 | **EOD force-close** | All positions closed at 3:00 PM ET |
 
+---
+
+### Strategy 2: Pop-Stock Multi-Strategy Architecture (new, T3.5)
+
+A parallel strategy layer that screens for "pop" events and routes each candidate to the best-fit strategy engine. All rules are deterministic — same inputs always produce the same output.
+
+#### Pop detection (6 rule-sets, priority-ordered)
+
+| Rule | Key conditions | Strategy assigned |
+|------|---------------|-------------------|
+| **High-Impact News** | `sentiment_delta > 0.40`, `headline_velocity > 8×`, `\|gap\| ≥ 4%` | ORB; +HALT/PARABOLIC if extreme |
+| **Earnings** | Large gap + earnings flag proxy | VWAP_RECLAIM (gap < 8%) or ORB (gap ≥ 8%) |
+| **Low Float** | `float < 20M shares`, `RVOL > 4×`, `\|gap\| > 5%` | HALT_RESUME or PARABOLIC; VWAP explicitly blocked |
+| **Moderate News** | `sentiment_delta > 0.20`, `headline_velocity 1.5–8×`, `\|gap\| < 4%` | VWAP_RECLAIM or EMA_TREND |
+| **Sentiment Pop** | `social_velocity > 3×`, `bullish_skew > 20%` | VWAP_RECLAIM or EMA_TREND + BOPB |
+| **Unusual Volume** | `RVOL > 3×`, `price_momentum > 2%` | VWAP_RECLAIM or EMA_TREND or BOPB |
+
+#### Strategy engines
+
+| Engine | Signal type | Entry trigger | Key exit |
+|--------|-------------|---------------|----------|
+| **VWAP Reclaim** | Long | 2-bar dip+reclaim, RVOL ≥ 1.5×, RSI 50–70 | VWAP breakdown × 2 bars |
+| **ORB** | Long | Breakout above 15-min OR high, vol ≥ 1.5× OR avg | Price re-enters OR range on low vol |
+| **Halt Resume** | Long | Halt-like bar → consolidation → breakout | 7% reversal from session high |
+| **Parabolic Reversal** | Short | 50%+ intraday move + exhaustion candle wick | Price reclaims exhaustion high |
+| **EMA Trend** | Long | Pullback to EMA9, confirmation candle above EMA20 | 2 bars below EMA20 |
+| **BOPB** | Long | Prior-high breakout → pullback test → confirmation | 2 bars back below prior high |
+
+#### Pipeline flow
+
+```
+BAR event
+  └─ PopStrategyEngine (T3.5)
+       ├─ ingestion:   get_news() + get_social() + MarketDataSlice from BarPayload
+       ├─ features:    EngineeredFeatures (ATR, RSI, VWAP distance, trend cleanliness…)
+       ├─ screener:    PopCandidate (first matching rule wins)
+       ├─ classifier:  StrategyAssignment (primary + secondaries + confidence)
+       ├─ router:      EntrySignal + ExitSignal via best-fit engine
+       ├─ emit:        POP_SIGNAL (durable → Redpanda)
+       └─ execute:     PopExecutor → dedicated Alpaca account → FILL (durable) → PositionManager
+                       (short/PARABOLIC_REVERSAL: POP_SIGNAL only — execution deferred)
+```
+
+#### Activating the pop strategy engine
+
+`PopStrategyEngine` is wired in `run_monitor.py` automatically after `RealTimeMonitor` is constructed:
+
+```python
+from pop_strategy_engine import PopStrategyEngine
+pop_engine = PopStrategyEngine(
+    bus=monitor._bus,
+    pop_alpaca_key=ALPACA_POPUP_KEY,       # APCA_POPUP_KEY env var
+    pop_alpaca_secret=ALPACA_PUPUP_SECRET_KEY,  # APCA_PUPUP_SECRET_KEY env var
+    pop_paper=POP_PAPER_TRADING,           # default True
+    pop_max_positions=POP_MAX_POSITIONS,   # default 3
+    pop_trade_budget=float(POP_TRADE_BUDGET),   # default $500
+    pop_order_cooldown=POP_ORDER_COOLDOWN, # default 300 s
+    alert_email=ALERT_EMAIL,
+)
+```
+
+The `PopExecutor` inside uses its own `TradingClient` (separate Alpaca sub-account), submits orders directly, and emits `FILL` events on the shared bus so `PositionManager` tracks pop positions normally. The main `AlpacaBroker` never sees pop orders — no double-execution risk.
+
+If `APCA_POPUP_KEY` / `APCA_PUPUP_SECRET_KEY` are absent or `POP_PAPER_TRADING=true`, `PopExecutor` runs in paper mode (simulated fills at signal price, no real orders).
+
+#### Swapping mock data sources for real APIs
+
+Each source adapter in `pop_screener/ingestion.py` is a plain class with one public method. To swap:
+
+1. Implement the same method signature (e.g. `get_news(symbol, window_hours) → list[NewsData]`)
+2. Inject into `PopStrategyEngine` via the constructor
+3. No other code changes required
+
+---
+
 ### Order execution
 
-- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask (via injected `quote_fn`) up to 3 times before abandoning; **0.5% max slippage cap** — abandons retry if ask drifts > 0.5% from original signal price
+- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask up to 3 times; **0.5% max slippage cap** — abandons retry if ask drifts > 0.5%
 - **Sells**: market order for guaranteed exit speed
-- **Slippage model**: 0.01% applied to entry price for accounting; Alpaca is commission-free
+- **Slippage model**: 0.01% applied to entry price; Alpaca is commission-free
 
 ---
 
@@ -237,24 +378,24 @@ Filtered by **Relative Strength**: only stocks outperforming SPY over the last 5
 
 ---
 
-## State Persistence
+## State Persistence & Crash Recovery
 
 `bot_state.json` is written atomically (tmp → replace) after every position change:
 
 ```json
 {
-  "date": "2026-04-10",
+  "date": "2026-04-11",
   "positions": {
-    "AAPL": {"entry_price": 175.0, "qty": 5, "stop": 172.0, "target": 178.5, ...}
+    "AAPL": {"entry_price": 175.0, "qty": 5, "stop": 172.0, "target": 178.5}
   },
   "reclaimed_today": ["ZS"],
   "trade_log": [
-    {"ticker": "ZS", "entry_price": 116.9, "exit_price": 116.64, "qty": 1, "pnl": -0.26, ...}
+    {"ticker": "ZS", "entry_price": 116.9, "exit_price": 116.64, "qty": 1, "pnl": -0.26}
   ]
 }
 ```
 
-On restart, `load_state()` validates the date and restores positions and trade history. Then `RealTimeMonitor.__init__` runs **Alpaca reconciliation**: any position that Alpaca holds but `bot_state.json` doesn't know about is imported automatically, preventing orphaned positions from being ignored.
+On restart, `load_state()` validates the date and restores positions. Then `RealTimeMonitor.__init__` runs **Alpaca reconciliation**: any position Alpaca holds but `bot_state.json` doesn't know about is imported automatically. `CrashRecovery` in `event_log.py` replays Redpanda events to rebuild exact stop/target/ATR values (no more ±3%/5% fallback approximations since stop_price/target_price/atr_value now flow through the full OrderRequestPayload → FillPayload chain).
 
 ---
 
@@ -266,6 +407,7 @@ Both run modes write to `logs/monitor_YYYY-MM-DD.log`:
 |-------|-------|---------------|
 | Monitor start/stop | INFO | Strategy, tickers, broker, data source, PID |
 | Heartbeat (60 s) | INFO | Tickers, open positions, trades, win rate, running PnL |
+| POP_SIGNAL | INFO | Symbol, strategy_type, entry, stop, targets, pop_reason, confidence |
 | SIGNAL | INFO | Ticker, action, price, RSI, RVOL |
 | ORDER_REQ | INFO | Side, qty, ticker, price, reason |
 | FILL | INFO | Side, qty, ticker, fill price, order ID |
@@ -286,18 +428,42 @@ Logged (and optionally emailed) when the monitor stops:
 
 ---
 
+## Test Suite
+
+Ten integration tests live in `test/`. Run all:
+
+```bash
+python test/run_all_tests.py
+```
+
+| Test | Coverage |
+|------|----------|
+| `test_1` | Synthetic bar feed correctness |
+| `test_2` | Tradier sandbox connectivity + bar fetch |
+| `test_3` | Redpanda event ordering consistency |
+| `test_4` | Market-open latency budget |
+| `test_5` | Network warmup + connection pool readiness |
+| `test_6` | Pipeline integration (feed → signal → order → fill) |
+| `test_7` | Risk engine boundary conditions |
+| `test_8` | Signal edge cases (RSI extremes, flat VWAP, zero volume) |
+| `test_9` | EventBus advanced (backpressure, coalescing, ordering) |
+| `test_10` | State persistence + crash recovery round-trip |
+
+---
+
 ## Backtesting
 
 Powered by Backtrader. Strategies in `strategies/`:
 
 | Strategy | Description |
 |----------|-------------|
+| VWAP Reclaim | Dip-and-reclaim with RSI/RVOL filters |
 | EMA + RSI Crossover | Fast/slow EMA crossover with RSI filter |
 | Trend Following ATR | EMA crossover with ATR-based trailing stop |
 | Momentum Breakout | N-bar high breakout with ATR stop |
 | Mean Reversion | Bollinger Band lower touch + RSI oversold |
 
-Supports single-ticker backtests and year-by-year compounding (reinvest returns each year). Run via the Streamlit UI or directly via `main.py`.
+Supports single-ticker backtests and year-by-year compounding. Run via the Streamlit UI or directly via `main.py`.
 
 ---
 
@@ -309,4 +475,3 @@ Supports single-ticker backtests and year-by-year compounding (reinvest returns 
 - Yahoo Mail app password for email alerts (optional)
 - Redpanda or Kafka broker for durable event log (optional — bot runs without it)
 - macOS/Linux for cron scheduling
-

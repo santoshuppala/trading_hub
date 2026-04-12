@@ -50,7 +50,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -546,3 +546,84 @@ class HeartbeatPayload:
         object.__setattr__(self, 'open_tickers', tuple(self.open_tickers))
         if not all(isinstance(t, str) for t in self.open_tickers):
             raise ValueError("every element of open_tickers must be a str")
+
+
+# ── POP_SIGNAL ────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PopSignalPayload:
+    """
+    Entry signal produced by the PopStrategyEngine (T3.5 layer).
+
+    Producer  : PopStrategyEngine
+    Consumers : RiskEngine (via SIGNAL translation), DurableEventLog (audit)
+
+    Integration path
+    ----------------
+    PopStrategyEngine emits POP_SIGNAL (durable) for full audit trail, then
+    immediately translates the signal into a standard SIGNAL event so the
+    existing RiskEngine → Broker → PositionManager pipeline handles execution
+    without modification.
+
+    Fields
+    ------
+    symbol          : ticker symbol
+    strategy_type   : one of StrategyType enum values (str)
+    entry_price     : proposed entry price from the strategy engine
+    stop_price      : hard stop loss price (stop_price < entry_price for longs)
+    target_1        : first profit target (partial exit)
+    target_2        : second profit target (full exit)
+    pop_reason      : why this symbol was flagged (PopReason enum value as str)
+    atr_value       : ATR used to size stop/targets
+    rvol            : relative volume ratio at signal time
+    vwap_distance   : (entry_price − vwap) / vwap; negative = below VWAP
+    strategy_confidence : classifier confidence [0, 1]
+    features_json   : JSON-serialised EngineeredFeatures snapshot for audit.
+                      Stored as str to keep the payload truly immutable.
+    """
+    symbol:               str
+    strategy_type:        str    # StrategyType.value
+    entry_price:          float
+    stop_price:           float
+    target_1:             float
+    target_2:             float
+    pop_reason:           str    # PopReason.value
+    atr_value:            float
+    rvol:                 float
+    vwap_distance:        float
+    strategy_confidence:  float  # [0, 1]
+    features_json:        str = '{}'   # JSON snapshot — empty dict default
+
+    def __post_init__(self):
+        _require_ticker(self.symbol)
+        if not self.strategy_type:
+            raise ValueError("strategy_type must be a non-empty string")
+        if not self.pop_reason:
+            raise ValueError("pop_reason must be a non-empty string")
+        _require_positive('entry_price', self.entry_price)
+        _require_positive('stop_price',  self.stop_price)
+        _require_positive('target_1',    self.target_1)
+        _require_positive('target_2',    self.target_2)
+        if self.stop_price >= self.entry_price:
+            raise ValueError(
+                f"stop_price ({self.stop_price}) must be < entry_price "
+                f"({self.entry_price}) for a long entry"
+            )
+        if self.target_1 <= self.entry_price:
+            raise ValueError(
+                f"target_1 ({self.target_1}) must be > entry_price ({self.entry_price})"
+            )
+        if self.target_2 <= self.target_1:
+            raise ValueError(
+                f"target_2 ({self.target_2}) must be > target_1 ({self.target_1})"
+            )
+        _require_positive('atr_value', self.atr_value)
+        _require_non_negative('rvol', self.rvol)
+        if not math.isfinite(self.vwap_distance):
+            raise ValueError(f"vwap_distance must be finite, got {self.vwap_distance!r}")
+        if not math.isfinite(self.strategy_confidence) or not (
+            0.0 <= self.strategy_confidence <= 1.0
+        ):
+            raise ValueError(
+                f"strategy_confidence must be in [0, 1], got {self.strategy_confidence!r}"
+            )

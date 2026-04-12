@@ -282,6 +282,12 @@ class EventType(Enum):
     POSITION     = auto()
     RISK_BLOCK   = auto()
     HEARTBEAT    = auto()
+    # ── Pop-strategy subsystem (T3.5) ─────────────────────────────────────────
+    # Emitted by PopStrategyEngine after the screener → classifier → router
+    # pipeline fires.  Same priority and coalescing behaviour as SIGNAL.
+    # The pop_strategy_engine.py layer also translates each POP_SIGNAL into a
+    # standard SIGNAL so the existing RiskEngine pipeline handles execution.
+    POP_SIGNAL   = auto()
 
 
 # Populate config dicts now that EventType exists
@@ -302,6 +308,8 @@ _DEFAULT_ASYNC_CONFIG.update({
     # Informational — acceptable to lose some
     EventType.RISK_BLOCK: {'maxsize':  50, 'policy': BackpressurePolicy.DROP_NEWEST, 'n_workers': 1},
     EventType.HEARTBEAT:  {'maxsize':  10, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
+    # Pop-strategy signals — same profile as SIGNAL; latest supersedes stale
+    EventType.POP_SIGNAL: {'maxsize':  50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},
 })
 
 _DEFAULT_PRIORITY.update({
@@ -310,6 +318,7 @@ _DEFAULT_PRIORITY.update({
     EventType.ORDER_REQ:  EventPriority.HIGH,
     EventType.POSITION:   EventPriority.HIGH,
     EventType.SIGNAL:     EventPriority.MEDIUM,
+    EventType.POP_SIGNAL: EventPriority.MEDIUM,
     EventType.RISK_BLOCK: EventPriority.MEDIUM,
     EventType.BAR:        EventPriority.LOW,
     EventType.QUOTE:      EventPriority.LOW,
@@ -737,6 +746,7 @@ from .events import (           # noqa: E402
     BarPayload, QuotePayload, SignalPayload,
     OrderRequestPayload, FillPayload, OrderFailPayload,
     PositionPayload, RiskBlockPayload, HeartbeatPayload,
+    PopSignalPayload,
 )
 
 _PAYLOAD_TYPES: Dict[EventType, type] = {
@@ -749,6 +759,7 @@ _PAYLOAD_TYPES: Dict[EventType, type] = {
     EventType.POSITION:   PositionPayload,
     EventType.RISK_BLOCK: RiskBlockPayload,
     EventType.HEARTBEAT:  HeartbeatPayload,
+    EventType.POP_SIGNAL: PopSignalPayload,
 }
 
 __all__ = [

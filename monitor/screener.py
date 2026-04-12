@@ -151,7 +151,7 @@ class MomentumScreener:
             futures = {ex.submit(_fetch, s): s for s in symbols}
             for f in as_completed(futures):
                 try:
-                    sym, df = f.result()
+                    sym, df = f.result(timeout=30)
                     if not df.empty:
                         bars[sym] = df
                 except Exception:

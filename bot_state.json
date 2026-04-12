@@ -1,20 +1,20 @@
 {
-  "date": "2026-04-10",
+  "date": "2026-04-12",
   "positions": {},
   "reclaimed_today": [
-    "ZS"
+    "CONC"
   ],
   "trade_log": [
     {
-      "ticker": "ZS",
-      "entry_price": 116.9,
-      "entry_time": "11:25:06",
-      "exit_price": 116.64,
+      "ticker": "CONC",
+      "entry_price": 100.0,
+      "entry_time": "01:13:59",
+      "exit_price": 101.0,
       "qty": 1,
-      "pnl": -0.26,
-      "reason": "sell_vwap",
-      "time": "11:26:39",
-      "is_win": false
+      "pnl": 1.0,
+      "reason": "sell_stop",
+      "time": "01:13:59",
+      "is_win": true
     }
   ]
 }

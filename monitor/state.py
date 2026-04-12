@@ -13,6 +13,7 @@ A threading.Lock serialises concurrent saves from the ThreadPoolExecutor.
 import json
 import logging
 import os
+import shutil
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -97,4 +98,12 @@ def load_state():
 
     except Exception as e:
         log.error(f"State load failed: {e}")
+        # Preserve the corrupt file for post-mortem inspection.
+        if os.path.exists(_STATE_FILE):
+            backup = _STATE_FILE + '.corrupt'
+            try:
+                shutil.copy2(_STATE_FILE, backup)
+                log.warning(f"Corrupt state file backed up to {backup}")
+            except Exception as be:
+                log.warning(f"Could not back up corrupt state file: {be}")
         return {}, set(), []

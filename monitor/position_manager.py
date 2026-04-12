@@ -40,6 +40,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
@@ -77,6 +78,7 @@ class PositionManager:
         self._last_order_time = last_order_time
         self._trade_log       = trade_log
         self._alert_email     = alert_email
+        self._lock            = threading.Lock()
 
         bus.subscribe(EventType.FILL, self._on_fill)
 
@@ -84,10 +86,11 @@ class PositionManager:
 
     def _on_fill(self, event: Event) -> None:
         p: FillPayload = event.payload
-        if p.side == 'buy':
-            self._open_position(p, event)
-        else:
-            self._close_position(p, event)
+        with self._lock:
+            if p.side == 'buy':
+                self._open_position(p, event)
+            else:
+                self._close_position(p, event)
 
     # ── Open ──────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,91 @@
+=== STDOUT ===
+2026-04-11 22:14:08,726 INFO     test_10: === 10a: Round-trip save/load ===
+2026-04-11 22:14:08,727 DEBUG    monitor.state: State saved: 3 open position(s), 5 trade(s).
+2026-04-11 22:14:08,728 WARNING  monitor.state: Restored 3 open position(s) from previous session: ['TICK000', 'TICK001', 'TICK002']. Verify these are still open in Alpaca before trading!
+2026-04-11 22:14:08,728 INFO     monitor.state: Restored 5 completed trade(s) from earlier today.
+2026-04-11 22:14:08,728 INFO     test_10:   PASS: Round-trip save/load verified
+2026-04-11 22:14:08,728 INFO     test_10: === 10b: Yesterday's state discarded ===
+2026-04-11 22:14:08,729 DEBUG    monitor.state: State saved: 2 open position(s), 2 trade(s).
+2026-04-11 22:14:08,730 INFO     monitor.state: State file is from 2026-04-11 — discarding (today is 2026-04-12).
+2026-04-11 22:14:08,730 INFO     test_10:   PASS: Yesterday's state correctly discarded
+2026-04-11 22:14:08,730 INFO     test_10: === 10c: Corrupt JSON creates .corrupt backup ===
+2026-04-11 22:14:08,731 ERROR    monitor.state: State load failed: Expecting property name enclosed in double quotes: line 1 column 3 (char 2)
+2026-04-11 22:14:08,732 WARNING  monitor.state: Corrupt state file backed up to /var/folders/k9/sqp9gggd6tq995qlxty6hgrm0000gn/T/tmpp1amlbj0/bot_state.json.corrupt
+2026-04-11 22:14:08,732 INFO     test_10:   PASS: Corrupt JSON returns empty state and creates .corrupt backup
+2026-04-11 22:14:08,733 INFO     test_10: === 10d: Concurrent save — valid JSON ===
+2026-04-11 22:14:08,735 DEBUG    monitor.state: State saved: 1 open position(s), 0 trade(s).
+2026-04-11 22:14:08,736 DEBUG    monitor.state: State saved: 2 open position(s), 1 trade(s).
+2026-04-11 22:14:08,737 DEBUG    monitor.state: State saved: 3 open position(s), 2 trade(s).
+2026-04-11 22:14:08,738 DEBUG    monitor.state: State saved: 4 open position(s), 3 trade(s).
+2026-04-11 22:14:08,739 DEBUG    monitor.state: State saved: 5 open position(s), 4 trade(s).
+2026-04-11 22:14:08,739 DEBUG    monitor.state: State saved: 1 open position(s), 5 trade(s).
+2026-04-11 22:14:08,740 DEBUG    monitor.state: State saved: 2 open position(s), 6 trade(s).
+2026-04-11 22:14:08,741 DEBUG    monitor.state: State saved: 3 open position(s), 7 trade(s).
+2026-04-11 22:14:08,742 DEBUG    monitor.state: State saved: 4 open position(s), 8 trade(s).
+2026-04-11 22:14:08,743 DEBUG    monitor.state: State saved: 5 open position(s), 9 trade(s).
+2026-04-11 22:14:08,744 INFO     test_10:   PASS: Concurrent save produced valid JSON
+2026-04-11 22:14:08,744 INFO     test_10: === 10e: Large state (200 positions, 1000 trades) ===
+2026-04-11 22:14:08,764 DEBUG    monitor.state: State saved: 200 open position(s), 1000 trade(s).
+2026-04-11 22:14:08,769 WARNING  monitor.state: Restored 200 open position(s) from previous session: ['TICK000', 'TICK001', 'TICK002', 'TICK003', 'TICK004', 'TICK005', 'TICK006', 'TICK007', 'TICK008', 'TICK009', 'TICK010', 'TICK011', 'TICK012', 'TICK013', 'TICK014', 'TICK015', 'TICK016', 'TICK017', 'TICK018', 'TICK019', 'TICK020', 'TICK021', 'TICK022', 'TICK023', 'TICK024', 'TICK025', 'TICK026', 'TICK027', 'TICK028', 'TICK029', 'TICK030', 'TICK031', 'TICK032', 'TICK033', 'TICK034', 'TICK035', 'TICK036', 'TICK037', 'TICK038', 'TICK039', 'TICK040', 'TICK041', 'TICK042', 'TICK043', 'TICK044', 'TICK045', 'TICK046', 'TICK047', 'TICK048', 'TICK049', 'TICK050', 'TICK051', 'TICK052', 'TICK053', 'TICK054', 'TICK055', 'TICK056', 'TICK057', 'TICK058', 'TICK059', 'TICK060', 'TICK061', 'TICK062', 'TICK063', 'TICK064', 'TICK065', 'TICK066', 'TICK067', 'TICK068', 'TICK069', 'TICK070', 'TICK071', 'TICK072', 'TICK073', 'TICK074', 'TICK075', 'TICK076', 'TICK077', 'TICK078', 'TICK079', 'TICK080', 'TICK081', 'TICK082', 'TICK083', 'TICK084', 'TICK085', 'TICK086', 'TICK087', 'TICK088', 'TICK089', 'TICK090', 'TICK091', 'TICK092', 'TICK093', 'TICK094', 'TICK095', 'TICK096', 'TICK097', 'TICK098', 'TICK099', 'TICK100', 'TICK101', 'TICK102', 'TICK103', 'TICK104', 'TICK105', 'TICK106', 'TICK107', 'TICK108', 'TICK109', 'TICK110', 'TICK111', 'TICK112', 'TICK113', 'TICK114', 'TICK115', 'TICK116', 'TICK117', 'TICK118', 'TICK119', 'TICK120', 'TICK121', 'TICK122', 'TICK123', 'TICK124', 'TICK125', 'TICK126', 'TICK127', 'TICK128', 'TICK129', 'TICK130', 'TICK131', 'TICK132', 'TICK133', 'TICK134', 'TICK135', 'TICK136', 'TICK137', 'TICK138', 'TICK139', 'TICK140', 'TICK141', 'TICK142', 'TICK143', 'TICK144', 'TICK145', 'TICK146', 'TICK147', 'TICK148', 'TICK149', 'TICK150', 'TICK151', 'TICK152', 'TICK153', 'TICK154', 'TICK155', 'TICK156', 'TICK157', 'TICK158', 'TICK159', 'TICK160', 'TICK161', 'TICK162', 'TICK163', 'TICK164', 'TICK165', 'TICK166', 'TICK167', 'TICK168', 'TICK169', 'TICK170', 'TICK171', 'TICK172', 'TICK173', 'TICK174', 'TICK175', 'TICK176', 'TICK177', 'TICK178', 'TICK179', 'TICK180', 'TICK181', 'TICK182', 'TICK183', 'TICK184', 'TICK185', 'TICK186', 'TICK187', 'TICK188', 'TICK189', 'TICK190', 'TICK191', 'TICK192', 'TICK193', 'TICK194', 'TICK195', 'TICK196', 'TICK197', 'TICK198', 'TICK199']. Verify these are still open in Alpaca before trading!
+2026-04-11 22:14:08,769 INFO     monitor.state: Restored 1000 completed trade(s) from earlier today.
+2026-04-11 22:14:08,769 INFO     test_10:   Save: 18.1ms, Load: 4.2ms
+2026-04-11 22:14:08,769 INFO     test_10:   PASS: Large state (200 positions, 1000 trades) round-trips correctly
+2026-04-11 22:14:08,770 INFO     test_10: === 10f: Missing keys in loaded state ===
+2026-04-11 22:14:08,770 WARNING  monitor.state: Restored 1 open position(s) from previous session: ['AAPL']. Verify these are still open in Alpaca before trading!
+2026-04-11 22:14:08,771 INFO     test_10:   PASS: Missing 'reclaimed_today' key returns empty set without crash
+2026-04-11 22:14:08,771 INFO     test_10: === 10g: StateEngine seed + POSITION events ===
+2026-04-11 22:14:08,771 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:08,771 DEBUG    monitor.event_bus: Subscribed StateEngine._on_position → POSITION priority=0
+2026-04-11 22:14:08,771 INFO     monitor.state_engine: [StateEngine] Seeded: 3 open positions, 2 completed trades
+2026-04-11 22:14:08,772 DEBUG    monitor.state_engine: [StateEngine] Opened NEWT
+2026-04-11 22:14:08,772 DEBUG    monitor.state_engine: [StateEngine] Partial exit TICK000 pnl=5.0
+2026-04-11 22:14:08,772 DEBUG    monitor.state_engine: [StateEngine] Closed TICK001 pnl=-3.0
+2026-04-11 22:14:08,772 INFO     test_10:   PASS: StateEngine seed + events work. positions=['TICK000', 'TICK002', 'NEWT'] pnl=$17.50
+2026-04-11 22:14:08,772 INFO     test_10: === 10h: HeartbeatEmitter interval gating ===
+2026-04-11 22:14:08,772 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:08,773 DEBUG    monitor.event_bus: Subscribed StateEngine._on_position → POSITION priority=0
+2026-04-11 22:14:08,773 DEBUG    monitor.event_bus: Subscribed test_10h_heartbeat_emitter_interval_gating.<locals>.on_hb → HEARTBEAT priority=0
+2026-04-11 22:14:08,773 INFO     test_10:   100 rapid ticks -> 1 HEARTBEAT (correct)
+2026-04-11 22:14:08,928 INFO     test_10:   PASS: Interval gating correct. Total heartbeats=2
+2026-04-11 22:14:08,928 INFO     test_10: === 10i: EventLogger — all EventTypes logged without crash ===
+2026-04-11 22:14:08,928 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:08,928 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → BAR priority=0
+2026-04-11 22:14:08,928 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → QUOTE priority=0
+2026-04-11 22:14:08,928 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → SIGNAL priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → ORDER_REQ priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → FILL priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → ORDER_FAIL priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → POSITION priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → RISK_BLOCK priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed EventLogger._on_event → HEARTBEAT priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → BAR priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → QUOTE priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → SIGNAL priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → ORDER_REQ priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → FILL priority=0
+2026-04-11 22:14:08,929 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → ORDER_FAIL priority=0
+2026-04-11 22:14:08,930 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → POSITION priority=0
+2026-04-11 22:14:08,930 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → RISK_BLOCK priority=0
+2026-04-11 22:14:08,930 DEBUG    monitor.event_bus: Subscribed test_10i_event_logger_all_types.<locals>.tracker → HEARTBEAT priority=0
+2026-04-11 22:14:08,936 DEBUG    monitor.observability: [1a168da4] BAR AAPL rows=35 rvol=no
+2026-04-11 22:14:08,936 INFO     monitor.observability: [a9114175] FILL BUY 5 AAPL @ $100.00 order=2122e47c-5de4-4812-8d18-f95dfb604421
+2026-04-11 22:14:08,937 INFO     monitor.observability: [a3207709] SIGNAL AAPL action=buy price=$100.00 rsi=60.0 rvol=3.0x
+2026-04-11 22:14:08,937 INFO     monitor.observability: [e7200019] ORDER_REQ BUY 5 AAPL @ $100.00 reason=VWAP reclaim
+2026-04-11 22:14:08,937 INFO     monitor.observability: [eb08204d] POSITION AAPL action=opened
+2026-04-11 22:14:08,937 INFO     monitor.observability: [5520be1d] RISK_BLOCK AAPL signal=buy reason=max positions reached
+2026-04-11 22:14:08,937 WARNING  monitor.observability: [7d5f40b8] ORDER_FAIL BUY 5 AAPL @ $100.00 reason=abandoned
+2026-04-11 22:14:08,937 INFO     monitor.observability: [HEARTBEAT] tickers=10 positions=2 open=('AAPL', 'MSFT') trades=5 wins=3(60%) pnl=$+125.00
+2026-04-11 22:14:08,937 INFO     test_10:   PASS: EventLogger handled all 8 EventTypes without crash
+2026-04-11 22:14:08,937 INFO     test_10: === Results ===
+2026-04-11 22:14:08,937 INFO     test_10:   10a: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10b: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10c: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10d: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10e: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10f: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10g: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10h: PASS
+2026-04-11 22:14:08,938 INFO     test_10:   10i: PASS
+
+=== STDERR ===
+

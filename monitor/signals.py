@@ -51,7 +51,16 @@ def get_rvol(hist_df, current_volume_sum, current_bar_index):
             avg = sum(avg_cum_vol) / len(avg_cum_vol)
             return current_volume_sum / avg if avg > 0 else 1.0
         else:
-            # Daily bars: estimate expected volume using time-fraction of trading day
+            # Daily bars: estimate expected volume using time-fraction of trading day.
+            # Before 10:15 AM ET (45 min of trading) the denominator is tiny and
+            # RVOL is artificially inflated — return 1.0 (neutral) to avoid
+            # false momentum signals during the volatile open.
+            now = datetime.now(ET)
+            market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+            elapsed = max(0.0, (now - market_open).total_seconds())
+            if elapsed < 45 * 60:
+                return 1.0
+
             daily_vols = [
                 float(hist_df.loc[hist_df.index.date == d, 'volume'].iloc[0])
                 for d in past_dates
@@ -60,10 +69,7 @@ def get_rvol(hist_df, current_volume_sum, current_bar_index):
             if not daily_vols:
                 return 1.0
             avg_daily_vol = sum(daily_vols) / len(daily_vols)
-            now = datetime.now(ET)
-            market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
             market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-            elapsed = max(0.0, (now - market_open).total_seconds())
             total   = (market_close - market_open).total_seconds()
             time_frac = min(elapsed / total, 1.0) if total > 0 else 0.5
             expected = avg_daily_vol * time_frac
@@ -92,6 +98,11 @@ class SignalAnalyzer:
       - Force close at 3:00 PM ET
     """
 
+    # LRU indicator cache: (ticker, df_id) → computed indicator dict
+    # df_id is id(df) — unique per DataFrame object, so a new slice creates a new entry.
+    # Cache is bounded to 500 entries to avoid unbounded growth.
+    _MAX_CACHE = 500
+
     def __init__(self, strategy_params, per_ticker_params):
         """
         Parameters
@@ -103,6 +114,8 @@ class SignalAnalyzer:
         """
         self.strategy_params = strategy_params
         self.per_ticker_params = per_ticker_params or {}
+        # {(ticker, df_id): indicator_dict} — avoids recomputing for identical DataFrame objects
+        self._indicator_cache: dict = {}
 
     def _to_scalar(self, val):
         try:
@@ -164,26 +177,51 @@ class SignalAnalyzer:
         low = data['low']
         volume = data['volume']
 
-        # VWAP
-        vwap = compute_vwap(high, low, close, volume)
-        current_price = ts(close.iloc[-1])
-        prev_price    = ts(close.iloc[-2])
-        current_vwap  = ts(vwap.iloc[-1])
-        prev_vwap     = ts(vwap.iloc[-2])
+        # Check indicator cache first — avoids recomputing for same DataFrame object
+        _cache_key = (ticker, id(data), rsi_period, atr_period)
+        _cached = self._indicator_cache.get(_cache_key)
+        if _cached is not None:
+            vwap          = _cached['vwap_series']
+            current_price = _cached['current_price']
+            prev_price    = _cached['prev_price']
+            current_vwap  = _cached['current_vwap']
+            prev_vwap     = _cached['prev_vwap']
+            rsi_value     = _cached['rsi_value']
+            atr_value     = _cached['atr_value']
+        else:
+            # VWAP
+            vwap = compute_vwap(high, low, close, volume)
+            current_price = ts(close.iloc[-1])
+            prev_price    = ts(close.iloc[-2])
+            current_vwap  = ts(vwap.iloc[-1])
+            prev_vwap     = ts(vwap.iloc[-2])
 
-        # RSI
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(window=rsi_period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
-        rsi_value = ts((100 - (100 / (1 + gain / loss))).iloc[-1])
+            # RSI
+            delta = close.diff()
+            gain = delta.where(delta > 0, 0).rolling(window=rsi_period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
+            rsi_value = ts((100 - (100 / (1 + gain / loss))).iloc[-1])
 
-        # ATR
-        tr = pd.concat([
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs(),
-        ], axis=1).max(axis=1)
-        atr_value = ts(tr.rolling(window=atr_period).mean().iloc[-1])
+            # ATR
+            tr = pd.concat([
+                high - low,
+                (high - close.shift()).abs(),
+                (low - close.shift()).abs(),
+            ], axis=1).max(axis=1)
+            atr_value = ts(tr.rolling(window=atr_period).mean().iloc[-1])
+
+            # Store in cache (evict oldest entry if full)
+            if len(self._indicator_cache) >= self._MAX_CACHE:
+                try:
+                    self._indicator_cache.pop(next(iter(self._indicator_cache)))
+                except StopIteration:
+                    pass
+            self._indicator_cache[_cache_key] = {
+                'vwap_series': vwap,
+                'current_price': current_price, 'prev_price': prev_price,
+                'current_vwap': current_vwap,   'prev_vwap': prev_vwap,
+                'rsi_value': rsi_value,          'atr_value': atr_value,
+            }
 
         # Opening range bias
         open_price = ts(data['open'].iloc[0])

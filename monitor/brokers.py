@@ -84,6 +84,7 @@ class AlpacaBroker(BaseBroker):
     FILL_TIMEOUT_SEC = 2.0      # seconds to wait before cancel/retry
     FILL_POLL_SEC    = 0.25     # poll interval while waiting for fill
     MAX_RETRIES      = 3        # cancel-and-retry attempts per entry
+    MAX_SLIPPAGE_PCT = 0.005    # 0.5%  — abandon retry if ask drifts beyond this
 
     def __init__(
         self,
@@ -111,7 +112,8 @@ class AlpacaBroker(BaseBroker):
             self._fail(p)
             return
 
-        ask_price = p.price
+        ask_price    = p.price
+        original_ask = p.price
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             limit_price = round(ask_price, 2)
@@ -161,6 +163,8 @@ class AlpacaBroker(BaseBroker):
                 self._bus.emit(Event(EventType.FILL, FillPayload(
                     ticker=p.ticker, side='buy', qty=filled_qty,
                     fill_price=avg_price, order_id=order_id, reason=p.reason,
+                    stop_price=p.stop_price, target_price=p.target_price,
+                    atr_value=p.atr_value,
                 )))
                 return
 
@@ -186,6 +190,19 @@ class AlpacaBroker(BaseBroker):
 
             new_ask = self._quote_fn(p.ticker)
             if not new_ask or new_ask <= 0:
+                self._fail(p)
+                return
+
+            if new_ask > original_ask * (1 + self.MAX_SLIPPAGE_PCT):
+                log.warning(
+                    f"BUY abandoned: {p.ticker} — ask drifted too far "
+                    f"(${new_ask:.2f} > ${original_ask:.2f} + {self.MAX_SLIPPAGE_PCT:.1%})"
+                )
+                send_alert(
+                    self._alert_email,
+                    f"BUY abandoned: {p.ticker} — slippage cap breached "
+                    f"(fresh ask ${new_ask:.2f} vs original ${original_ask:.2f})",
+                )
                 self._fail(p)
                 return
 
@@ -249,6 +266,8 @@ class PaperBroker(BaseBroker):
         self._bus.emit(Event(EventType.FILL, FillPayload(
             ticker=p.ticker, side='buy', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
+            stop_price=p.stop_price, target_price=p.target_price,
+            atr_value=p.atr_value,
         )))
 
     def _execute_sell(self, p: OrderRequestPayload) -> None:

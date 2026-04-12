@@ -1,4 +1,5 @@
 import logging
+import time
 import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,13 @@ class TradierDataClient(BaseDataClient):
     def __init__(self, token):
         self._token = token
         self._session = requests.Session()
+        # Raise connection pool size to match _MAX_WORKERS so parallel
+        # fetch_batch_bars threads don't discard connections under load.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_MAX_WORKERS,
+            pool_maxsize=_MAX_WORKERS,
+        )
+        self._session.mount('https://', adapter)
         self._session.headers.update({
             'Authorization': f'Bearer {token}',
             'Accept': 'application/json',
@@ -34,10 +42,18 @@ class TradierDataClient(BaseDataClient):
     # ------------------------------------------------------------------
 
     def _get(self, path, params=None):
-        resp = self._session.get(
-            f'{TRADIER_BASE_URL}{path}', params=params, timeout=15
-        )
-        resp.raise_for_status()
+        for attempt in range(3):
+            resp = self._session.get(
+                f'{TRADIER_BASE_URL}{path}', params=params, timeout=15
+            )
+            if resp.status_code == 429:
+                wait = 2 ** attempt   # 1 s, 2 s, 4 s
+                log.warning(f"Tradier 429 rate-limit on {path}; retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        resp.raise_for_status()   # final attempt exhausted — propagate
         return resp.json()
 
     def _fetch_timesales(self, symbol, start, end, interval='1min'):
@@ -142,7 +158,7 @@ class TradierDataClient(BaseDataClient):
             futures = {ex.submit(_fetch_one, t): t for t in tickers}
             for f in as_completed(futures):
                 try:
-                    ticker, bars, hist = f.result()
+                    ticker, bars, hist = f.result(timeout=30)
                     if not bars.empty:
                         bars_cache[ticker] = bars
                     if not hist.empty:

@@ -1,0 +1,113 @@
+=== STDOUT ===
+2026-04-11 22:14:05,814 INFO     test_9: === 9a: Circuit breaker ===
+2026-04-11 22:14:05,814 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:05,814 DEBUG    monitor.event_bus: Subscribed test_9a_circuit_breaker.<locals>.failing_handler → FILL priority=0
+2026-04-11 22:14:05,815 ERROR    monitor.event_bus: [handler-error] test_9a_circuit_breaker.<locals>.failing_handler[AAPL] permanently failed on FILL (seq=1) after 1 attempt(s): deliberate failure
+NoneType: None
+2026-04-11 22:14:05,815 ERROR    monitor.event_bus: [handler-error] test_9a_circuit_breaker.<locals>.failing_handler[AAPL] permanently failed on FILL (seq=2) after 1 attempt(s): deliberate failure
+NoneType: None
+2026-04-11 22:14:05,815 ERROR    monitor.event_bus: [handler-error] test_9a_circuit_breaker.<locals>.failing_handler[AAPL] permanently failed on FILL (seq=3) after 1 attempt(s): deliberate failure
+NoneType: None
+2026-04-11 22:14:05,815 ERROR    monitor.event_bus: [handler-error] test_9a_circuit_breaker.<locals>.failing_handler[AAPL] permanently failed on FILL (seq=4) after 1 attempt(s): deliberate failure
+NoneType: None
+2026-04-11 22:14:05,816 ERROR    monitor.event_bus: [handler-error] test_9a_circuit_breaker.<locals>.failing_handler[AAPL] permanently failed on FILL (seq=5) after 1 attempt(s): deliberate failure
+NoneType: None
+2026-04-11 22:14:05,816 ERROR    monitor.event_bus: [circuit-open] test_9a_circuit_breaker.<locals>.failing_handler[AAPL] suspended for 60s after 5 consecutive failures
+2026-04-11 22:14:05,816 WARNING  monitor.event_bus: [circuit-open] Skipping test_9a_circuit_breaker.<locals>.failing_handler[AAPL] (60s remaining)
+2026-04-11 22:14:05,816 INFO     test_9:   PASS: Circuit tripped after 5 failures. 6th event skipped. trips=1
+2026-04-11 22:14:05,816 INFO     test_9: === 9b: DLQ after retry exhaustion ===
+2026-04-11 22:14:05,816 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:05,817 DEBUG    monitor.event_bus: Subscribed test_9b_dlq.<locals>.always_fail → RISK_BLOCK priority=0
+2026-04-11 22:14:05,817 WARNING  monitor.event_bus: [handler-error] test_9b_dlq.<locals>.always_fail[AAPL] attempt 1 failed (will retry): permanent failure
+2026-04-11 22:14:05,817 WARNING  monitor.event_bus: [retry] test_9b_dlq.<locals>.always_fail[AAPL] attempt 2/3 on RISK_BLOCK seq=1 (backoff=1ms)
+2026-04-11 22:14:05,818 WARNING  monitor.event_bus: [handler-error] test_9b_dlq.<locals>.always_fail[AAPL] attempt 2 failed (will retry): permanent failure
+2026-04-11 22:14:05,818 WARNING  monitor.event_bus: [retry] test_9b_dlq.<locals>.always_fail[AAPL] attempt 3/3 on RISK_BLOCK seq=1 (backoff=1ms)
+2026-04-11 22:14:05,820 ERROR    monitor.event_bus: [handler-error] test_9b_dlq.<locals>.always_fail[AAPL] permanently failed on RISK_BLOCK (seq=1) after 3 attempt(s): permanent failure
+NoneType: None
+2026-04-11 22:14:05,820 INFO     test_9:   PASS: DLQ count=1, retried_deliveries=2
+2026-04-11 22:14:05,820 INFO     test_9: === 9c: TTL expiry ===
+2026-04-11 22:14:05,820 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:05,820 DEBUG    monitor.event_bus: Subscribed test_9c_ttl_expiry.<locals>.handler → FILL priority=0
+2026-04-11 22:14:05,820 DEBUG    monitor.event_bus: [ttl-expired] FILL seq=1 expired 1000.0ms ago — skipping test_9c_ttl_expiry.<locals>.handler
+2026-04-11 22:14:05,820 INFO     test_9:   PASS: Expired event not delivered to handler
+2026-04-11 22:14:05,821 INFO     test_9: === 9d: Priority ordering in SYNC mode ===
+2026-04-11 22:14:05,821 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:05,821 DEBUG    monitor.event_bus: Subscribed test_9d_priority_ordering.<locals>.handler → FILL priority=0
+2026-04-11 22:14:05,821 DEBUG    monitor.event_bus: Subscribed test_9d_priority_ordering.<locals>.handler → RISK_BLOCK priority=0
+2026-04-11 22:14:05,821 INFO     test_9:   PASS: Priority stamps correct: [<EventPriority.MEDIUM: 2>, <EventPriority.CRITICAL: 0>]
+2026-04-11 22:14:05,821 INFO     test_9: === 9e: Event coalescing ===
+2026-04-11 22:14:05,823 INFO     monitor.event_bus: [EventBus] ASYNC mode: 9 dispatcher(s) started (total workers: 14)
+2026-04-11 22:14:05,823 DEBUG    monitor.event_bus: Subscribed test_9e_event_coalescing.<locals>.bar_handler → BAR priority=0
+2026-04-11 22:14:06,919 DEBUG    monitor.event_bus: [EventBus] Dispatcher BAR stopped.
+2026-04-11 22:14:06,920 DEBUG    monitor.event_bus: [EventBus] Dispatcher QUOTE stopped.
+2026-04-11 22:14:06,920 DEBUG    monitor.event_bus: [EventBus] Dispatcher SIGNAL stopped.
+2026-04-11 22:14:06,920 DEBUG    monitor.event_bus: [EventBus] Dispatcher ORDER_REQ stopped.
+2026-04-11 22:14:06,920 DEBUG    monitor.event_bus: [EventBus] Dispatcher FILL stopped.
+2026-04-11 22:14:06,920 DEBUG    monitor.event_bus: [EventBus] Dispatcher ORDER_FAIL stopped.
+2026-04-11 22:14:06,921 DEBUG    monitor.event_bus: [EventBus] Dispatcher POSITION stopped.
+2026-04-11 22:14:06,921 DEBUG    monitor.event_bus: [EventBus] Dispatcher RISK_BLOCK stopped.
+2026-04-11 22:14:06,921 DEBUG    monitor.event_bus: [EventBus] Dispatcher HEARTBEAT stopped.
+2026-04-11 22:14:06,921 INFO     monitor.event_bus: [EventBus] All async dispatchers shut down.
+2026-04-11 22:14:06,921 INFO     test_9:   Delivered 6 out of 50 BAR events (coalescing active)
+2026-04-11 22:14:06,921 INFO     test_9:   PASS: Coalescing reduced deliveries from 50 to 6
+2026-04-11 22:14:06,921 INFO     test_9: === 9f: Duplicate deduplication ===
+2026-04-11 22:14:06,921 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:06,922 DEBUG    monitor.event_bus: Subscribed test_9f_duplicate_deduplication.<locals>.handler → FILL priority=0
+2026-04-11 22:14:06,922 DEBUG    monitor.event_bus: [idempotent] Duplicate 5dec0060 (FILL) dropped.
+2026-04-11 22:14:06,922 INFO     test_9:   PASS: Duplicate event dropped. dup_dropped=1
+2026-04-11 22:14:06,922 INFO     test_9: === 9g: Unsubscribe mid-stream ===
+2026-04-11 22:14:06,922 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:06,922 DEBUG    monitor.event_bus: Subscribed test_9g_unsubscribe_mid_stream.<locals>.handler → FILL priority=0
+2026-04-11 22:14:06,923 INFO     test_9:   PASS: Unsubscribe stopped further delivery. Total calls=5
+2026-04-11 22:14:06,923 INFO     test_9: === 9h: Retry with backoff — success on attempt 3 ===
+2026-04-11 22:14:06,923 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:06,923 DEBUG    monitor.event_bus: Subscribed test_9h_retry_with_backoff_success_on_3.<locals>.flaky_handler → FILL priority=0
+2026-04-11 22:14:06,923 WARNING  monitor.event_bus: [handler-error] test_9h_retry_with_backoff_success_on_3.<locals>.flaky_handler[AAPL] attempt 1 failed (will retry): Failing on attempt 1
+2026-04-11 22:14:06,923 WARNING  monitor.event_bus: [retry] test_9h_retry_with_backoff_success_on_3.<locals>.flaky_handler[AAPL] attempt 2/4 on FILL seq=1 (backoff=1ms)
+2026-04-11 22:14:06,924 WARNING  monitor.event_bus: [handler-error] test_9h_retry_with_backoff_success_on_3.<locals>.flaky_handler[AAPL] attempt 2 failed (will retry): Failing on attempt 2
+2026-04-11 22:14:06,924 WARNING  monitor.event_bus: [retry] test_9h_retry_with_backoff_success_on_3.<locals>.flaky_handler[AAPL] attempt 3/4 on FILL seq=1 (backoff=1ms)
+2026-04-11 22:14:06,925 INFO     test_9:   PASS: Handler succeeded on attempt 3. DLQ empty. retried=2
+2026-04-11 22:14:06,926 INFO     test_9: === 9i: Emit batch empty ===
+2026-04-11 22:14:06,926 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:06,926 INFO     test_9:   PASS: emit_batch([]) returned BackpressureStatus.OK without error
+2026-04-11 22:14:06,926 INFO     test_9: === 9j: Multiple subscribers, same event ===
+2026-04-11 22:14:06,926 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:06,926 DEBUG    monitor.event_bus: Subscribed test_9j_multiple_subscribers_same_event.<locals>.h1 → FILL priority=0
+2026-04-11 22:14:06,926 DEBUG    monitor.event_bus: Subscribed test_9j_multiple_subscribers_same_event.<locals>.h2 → FILL priority=0
+2026-04-11 22:14:06,926 DEBUG    monitor.event_bus: Subscribed test_9j_multiple_subscribers_same_event.<locals>.h3 → FILL priority=0
+2026-04-11 22:14:06,926 INFO     test_9:   PASS: All 3 handlers called. counts=[1, 1, 1]
+2026-04-11 22:14:06,926 INFO     test_9: === 9k: Stream seq ordering ===
+2026-04-11 22:14:06,926 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:14:06,927 DEBUG    monitor.event_bus: Subscribed test_9k_stream_seq_ordering.<locals>.handler → BAR priority=0
+2026-04-11 22:14:06,948 INFO     test_9:   PASS: stream_seqs strictly monotonic: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+2026-04-11 22:14:06,949 INFO     test_9: === 9l: Shutdown with pending events ===
+2026-04-11 22:14:06,951 INFO     monitor.event_bus: [EventBus] ASYNC mode: 9 dispatcher(s) started (total workers: 14)
+2026-04-11 22:14:06,951 DEBUG    monitor.event_bus: Subscribed test_9l_shutdown_with_pending_events.<locals>.slow_handler → BAR priority=0
+2026-04-11 22:14:07,152 DEBUG    monitor.event_bus: [EventBus] Dispatcher BAR stopped.
+2026-04-11 22:14:07,153 DEBUG    monitor.event_bus: [EventBus] Dispatcher QUOTE stopped.
+2026-04-11 22:14:07,153 DEBUG    monitor.event_bus: [EventBus] Dispatcher SIGNAL stopped.
+2026-04-11 22:14:07,154 DEBUG    monitor.event_bus: [EventBus] Dispatcher ORDER_REQ stopped.
+2026-04-11 22:14:07,154 DEBUG    monitor.event_bus: [EventBus] Dispatcher FILL stopped.
+2026-04-11 22:14:07,154 DEBUG    monitor.event_bus: [EventBus] Dispatcher ORDER_FAIL stopped.
+2026-04-11 22:14:07,154 DEBUG    monitor.event_bus: [EventBus] Dispatcher POSITION stopped.
+2026-04-11 22:14:07,155 DEBUG    monitor.event_bus: [EventBus] Dispatcher RISK_BLOCK stopped.
+2026-04-11 22:14:07,155 DEBUG    monitor.event_bus: [EventBus] Dispatcher HEARTBEAT stopped.
+2026-04-11 22:14:07,155 INFO     monitor.event_bus: [EventBus] All async dispatchers shut down.
+2026-04-11 22:14:07,155 INFO     test_9:   Shutdown in 0.04s. Processed=47. dropped={'BAR': 0, 'QUOTE': 0, 'SIGNAL': 0, 'ORDER_REQ': 0, 'FILL': 0, 'ORDER_FAIL': 0, 'POSITION': 0, 'RISK_BLOCK': 0, 'HEARTBEAT': 0}
+2026-04-11 22:14:07,155 INFO     test_9:   PASS: Shutdown completed within 5s without hang
+2026-04-11 22:14:07,156 INFO     test_9: === Results ===
+2026-04-11 22:14:07,156 INFO     test_9:   9a: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9b: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9c: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9d: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9e: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9f: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9g: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9h: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9i: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9j: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9k: PASS
+2026-04-11 22:14:07,156 INFO     test_9:   9l: PASS
+
+=== STDERR ===
+

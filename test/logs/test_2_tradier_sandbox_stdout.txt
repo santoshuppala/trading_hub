@@ -1,0 +1,56 @@
+=== STDOUT ===
+
+=== STDERR ===
+2026-04-11 22:13:32,248 [INFO] ======================================================================
+2026-04-11 22:13:32,248 [INFO] TEST 2: Tradier Sandbox Validation
+2026-04-11 22:13:32,248 [INFO] ======================================================================
+2026-04-11 22:13:32,248 [INFO] Token loaded: IBNFaIQC...A9jm
+2026-04-11 22:13:32,248 [INFO] Sandbox URL: https://sandbox.tradier.com/v1
+2026-04-11 22:13:32,249 [INFO] 
+2026-04-11 22:13:32,249 [INFO] 
+--- Test 2a: Sandbox Authentication ---
+2026-04-11 22:13:32,639 [INFO] GET /user/profile → HTTP 200
+2026-04-11 22:13:32,640 [INFO] Profile response: {'profile': {'id': 'id-sb-70t7mmnx', 'name': 'Santosh Uppala', 'account': {'account_number': 'VA92176885', 'classification': 'individual', 'date_created': '2026-04-11T22:35:54.000Z', 'day_trader': False, 'option_level': 6, 'status': 'active', 'type': 'margin', 'last_update_date': '2026-04-11T22:35:54.000Z'}}}
+2026-04-11 22:13:32,640 [INFO] PASS: Authentication successful with sandbox
+2026-04-11 22:13:32,642 [INFO] 
+--- Test 2b: Sandbox Quote Retrieval (AAPL) ---
+2026-04-11 22:13:32,942 [INFO] GET /markets/quotes?symbols=AAPL → HTTP 200
+2026-04-11 22:13:32,943 [INFO] AAPL quote: last=260.48, bid=260.7, ask=261.0
+2026-04-11 22:13:32,943 [INFO]   volume=31291474, change=-0.01
+2026-04-11 22:13:32,943 [INFO] PASS: Quote data retrieved successfully
+2026-04-11 22:13:32,945 [INFO] 
+--- Test 2c: Sandbox Historical Data (AAPL daily) ---
+2026-04-11 22:13:33,371 [INFO] GET /markets/history?symbol=AAPL → HTTP 200
+2026-04-11 22:13:33,371 [INFO] Days returned: 9
+2026-04-11 22:13:33,377 [INFO] DataFrame shape: (9, 6)
+2026-04-11 22:13:33,377 [INFO] Columns: ['date', 'open', 'high', 'low', 'close', 'volume']
+2026-04-11 22:13:33,378 [INFO] Last close: 260.48
+2026-04-11 22:13:33,378 [INFO] PASS: Historical data parsed into DataFrame
+2026-04-11 22:13:33,380 [INFO] 
+--- Test 2d: Sandbox Order Submission (BUY 1 AAPL) ---
+2026-04-11 22:13:33,691 [INFO] Using account_number: VA92176885
+2026-04-11 22:13:33,806 [INFO] POST /accounts/VA92176885/orders → HTTP 200
+2026-04-11 22:13:33,807 [INFO] Order response: id=27869526, status=ok
+2026-04-11 22:13:33,807 [INFO] Full order data: {'id': 27869526, 'status': 'ok', 'partner_id': '3a8bbee1-5184-4ffe-8a0c-294fbad1aee9'}
+2026-04-11 22:13:33,807 [INFO] PASS: Sandbox accepted order and returned order_id
+2026-04-11 22:13:33,808 [INFO] 
+--- Test 2e: TradierDataClient with Patched URL ---
+2026-04-11 22:13:34,454 [INFO] get_quotes(['AAPL']) → 1 results
+2026-04-11 22:13:34,454 [INFO]   AAPL: last=260.48, bid=260.7, ask=261.0
+2026-04-11 22:13:34,454 [INFO] PASS: TradierDataClient works with sandbox URL
+2026-04-11 22:13:34,456 [INFO] 
+======================================================================
+2026-04-11 22:13:34,456 [INFO] RESULTS
+2026-04-11 22:13:34,456 [INFO] ======================================================================
+2026-04-11 22:13:34,456 [INFO]   auth                : PASS
+2026-04-11 22:13:34,456 [INFO]   quotes              : PASS
+2026-04-11 22:13:34,456 [INFO]   history             : PASS
+2026-04-11 22:13:34,456 [INFO]   order               : PASS
+2026-04-11 22:13:34,456 [INFO]   client_patch        : PASS
+2026-04-11 22:13:34,456 [INFO] 
+----------------------------------------------------------------------
+2026-04-11 22:13:34,456 [INFO] IMPROVEMENTS NEEDED
+2026-04-11 22:13:34,456 [INFO] ----------------------------------------------------------------------
+2026-04-11 22:13:34,457 [INFO] 
+Test 2 complete.
+

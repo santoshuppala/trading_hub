@@ -30,13 +30,13 @@ monitor.run() → emit_batch(BAR[])
 | T1 EventBus | `event_bus.py` | Pub/sub backbone; priority queues; backpressure; idempotency; SLA tracking |
 | T1.5 Event Schema | `events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; read-only numpy arrays on BAR DataFrames |
 | T2 DurableEventLog | `event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
-| T3 RiskEngine | `risk_engine.py` | 6 pre-trade checks; position limits; spread filter; cooldown |
+| T3 RiskEngine | `risk_engine.py` | 6 pre-trade checks; blocks on spread fetch failure; price-divergence guard |
 | T4 StrategyEngine | `strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
-| T5 PositionManager | `position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json` |
+| T5 PositionManager | `position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json`; thread-safe fill handler |
 | T6 StateEngine | `state_engine.py` | Maintains read-only portfolio snapshot for UI and heartbeat |
 | T7 ExecutionFeedback | `execution_feedback.py` | Patches stop/target prices after a buy fill |
 | T8 Observability | `observability.py` | EventLogger, HeartbeatEmitter, EODSummary |
-| T9 Monitor | `monitor.py` | Thin orchestrator; data-fetch loop; Alpaca reconciliation on startup |
+| T9 Monitor | `monitor.py` | Thin orchestrator; data-fetch loop; Alpaca reconciliation; crash-alerting run loop |
 
 ### Event Bus (v5.2)
 
@@ -217,7 +217,7 @@ Only one monitor can run at a time. A second start attempt (from UI or CLI) is r
 
 ### Order execution
 
-- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask (via injected `quote_fn`) up to 3 times before abandoning
+- **Buys**: marketable limit order at ask price; polls for fill every 250 ms up to 2 s; cancel-and-retry with fresh ask (via injected `quote_fn`) up to 3 times before abandoning; **0.5% max slippage cap** — abandons retry if ask drifts > 0.5% from original signal price
 - **Sells**: market order for guaranteed exit speed
 - **Slippage model**: 0.01% applied to entry price for accounting; Alpaca is commission-free
 
@@ -309,3 +309,4 @@ Supports single-ticker backtests and year-by-year compounding (reinvest returns 
 - Yahoo Mail app password for email alerts (optional)
 - Redpanda or Kafka broker for durable event log (optional — bot runs without it)
 - macOS/Linux for cron scheduling
+

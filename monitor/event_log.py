@@ -477,11 +477,15 @@ class EventLogConsumer:
 
             consumer.assign(partitions)
 
-            count = 0
+            # Collect all records first so we can sort by stream_seq before
+            # yielding.  Reading from N partitions without sorting would produce
+            # a replay order determined by partition interleaving, not causal
+            # sequence — ORDER_REQ could appear after FILL, corrupting recovery.
+            records: list = []
             while True:
                 msg = consumer.poll(timeout=2.0)
                 if msg is None:
-                    break   # no more messages in the given window
+                    break
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         break
@@ -490,10 +494,26 @@ class EventLogConsumer:
 
                 record = self._decode(msg)
                 if record:
-                    yield record
-                    count += 1
-                    if n is not None and count >= n:
-                        break
+                    records.append(record)
+
+            # Sort by stream_seq (globally monotonic), fallback to ISO timestamp.
+            def _sort_key(r):
+                seq = r.get('stream_seq')
+                if seq is not None:
+                    try:
+                        return (0, int(seq), '')
+                    except (TypeError, ValueError):
+                        pass
+                return (1, 0, r.get('timestamp', ''))
+
+            records.sort(key=_sort_key)
+
+            count = 0
+            for record in records:
+                yield record
+                count += 1
+                if n is not None and count >= n:
+                    break
         finally:
             consumer.close()
 
@@ -622,18 +642,24 @@ class CrashRecovery:
                 order_id   = p.get('order_id', '')
 
                 if side == 'buy' and ticker:
+                    # Use exact stop/target carried in FillPayload if present;
+                    # fall back to entry_price approximations only when missing.
+                    raw_stop   = p.get('stop_price')
+                    raw_target = p.get('target_price')
+                    raw_atr    = p.get('atr_value')
+                    stop_price   = float(raw_stop)   if raw_stop   else fill_price * 0.995
+                    target_price = float(raw_target) if raw_target else fill_price * 1.01
+                    half_target  = (fill_price + target_price) / 2 if raw_target else fill_price * 1.005
                     positions[ticker] = {
                         'entry_price':  fill_price,
                         'entry_time':   rec.get('timestamp', '')[:8],
                         'quantity':     qty,
                         'partial_done': False,
                         'order_id':     order_id,
-                        # stop/target will be patched by ExecutionFeedback
-                        # if SIGNAL events are also replayed, or left as fallback
-                        'stop_price':   fill_price * 0.995,
-                        'target_price': fill_price * 1.01,
-                        'half_target':  fill_price * 1.005,
-                        'atr_value':    None,
+                        'stop_price':   stop_price,
+                        'target_price': target_price,
+                        'half_target':  half_target,
+                        'atr_value':    float(raw_atr) if raw_atr else None,
                     }
                 elif side == 'sell' and ticker:
                     if ticker in positions:

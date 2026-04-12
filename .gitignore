@@ -18,7 +18,13 @@ env/
 *.log
 trade_log.json
 
+# --- Docker / Database ---
+docker/data/
+*.sql.bak
+
 # --- Editor / OS ---
 .DS_Store
 .vscode/
 .idea/
+*.swp
+*.swo

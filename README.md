@@ -123,6 +123,21 @@ trading_hub/
 │   ├── router/               # ProStrategyRouter: PRO_STRATEGY_SIGNAL → RiskAdapter
 │   └── risk/                 # RiskAdapter: tier-aware risk gate → ORDER_REQ
 │
+├── db/                      # Async TimescaleDB event store (NEW)
+│   ├── __init__.py           # Public API: init_db, close_db, get_writer, SessionManager
+│   ├── connection.py         # asyncpg pool singleton (min=2, max=10)
+│   ├── writer.py             # Async batch DBWriter with circuit breaker
+│   ├── subscriber.py         # EventBus → DBWriter bridge (all event types)
+│   ├── reader.py             # Read queries: bars, fills, signals, sessions, replay
+│   ├── feature_store.py      # ML feature extraction + outcome labelling
+│   └── migrations/
+│       ├── run.py            # Idempotent SQL migration runner
+│       └── sql/              # 001–009 ordered migrations
+│
+├── docker/                  # Container orchestration (NEW)
+│   ├── docker-compose.yml    # TimescaleDB 2.26 + Redpanda
+│   └── postgresql.conf       # Tuned PG16 config (SSD, 256MB shared_buffers)
+│
 ├── pop_strategy_engine.py    # T3.5 — BAR subscriber; runs pop pipeline; emits POP_SIGNAL + SIGNAL
 ├── demo_pop_strategies.py    # Offline demo: full pipeline with synthetic data
 │
@@ -500,6 +515,115 @@ On restart, `load_state()` validates the date and restores positions. Then `Real
 
 ---
 
+## Database Layer (TimescaleDB)
+
+All events are persisted asynchronously to TimescaleDB (PostgreSQL 16 + TimescaleDB 2.26+) for replay, analysis, and ML feature extraction.
+
+### Infrastructure
+
+```bash
+# Start TimescaleDB + Redpanda
+cd docker && docker compose up -d
+
+# Run migrations (idempotent — safe to re-run)
+python -m db.migrations.run
+```
+
+Docker Compose provisions two services on a shared `trading_net` bridge:
+- **timescaledb** — `timescale/timescaledb:2.26.0-pg16` on port 5432, custom `postgresql.conf`
+- **redpanda** — `redpandadata/redpanda:v24.1.1` on port 9092 (Kafka-compatible)
+
+### Schema
+
+9 ordered SQL migrations in `db/migrations/sql/`:
+
+| Migration | Content |
+|-----------|---------|
+| `001_init` | TimescaleDB extension, `trading` schema, enum types (`signal_action`, `order_side`, `position_action`) |
+| `002_bar_events` | 1-min OHLCV hypertable (1-day chunks), ticker+ts index |
+| `003_signal_events` | signal, order_req, fill, position hypertables with correlation_id tracking |
+| `004_pop_pro_events` | pop_signal + pro_strategy_signal hypertables with JSONB for features/detectors |
+| `005_risk_heartbeat` | risk_block + heartbeat hypertables |
+| `006_indexes` | Composite covering indexes for feature store, fill-by-reason, action-based queries |
+| `007_compression_retention` | Compression after 7 days, retention 7–365 days per table |
+| `008_views` | 5-min + 1-hour continuous aggregates, daily trade summary, ML feature view |
+| `009_session_log` | Session lifecycle table (start/stop, crash detection, writer metrics) |
+
+### Python modules (`db/`)
+
+| Module | Responsibility |
+|--------|---------------|
+| `connection.py` | asyncpg pool singleton (min=2, max=10, UTC, `trading` schema) |
+| `writer.py` | Async batch writer: queue → batch drain → `executemany()`, circuit breaker (5 failures → 30s open) |
+| `subscriber.py` | EventBus → DBWriter bridge: subscribes at priority=10 (LOW), converts payloads to row dicts |
+| `reader.py` | Read queries: bars, fills, signals, pro signals, risk blocks, daily summary, session log, session replay |
+| `feature_store.py` | ML feature extraction: bar features, signal outcome labels, pro-signal outcomes, detector effectiveness |
+| `migrations/run.py` | Idempotent migration runner with advisory lock and `schema_migrations` tracking |
+
+### Wiring into the monitor
+
+```python
+from db import init_db, close_db, get_writer, DBSubscriber, SessionManager
+
+# At startup:
+pool = await init_db()                      # create asyncpg pool
+writer = get_writer()                       # singleton DBWriter
+await writer.start()                        # start background flush task
+subscriber = DBSubscriber(bus=monitor._bus, writer=writer)
+subscriber.register()                       # wire all EventBus subscriptions
+
+session = SessionManager()
+await session.start(mode="live", broker="alpaca", tickers=TICKERS)
+
+# At shutdown:
+await session.stop(exit_reason="clean", writer=writer)
+await writer.stop()
+await close_db()
+```
+
+### Compression & retention
+
+| Table | Compress after | Drop after |
+|-------|---------------|------------|
+| bar_events | 7 days | 90 days |
+| signal_events | 7 days | 90 days |
+| order_req_events | 7 days | 365 days |
+| fill_events | 7 days | 365 days |
+| position_events | 7 days | 365 days |
+| pop_signal_events | 7 days | 90 days |
+| pro_strategy_signal_events | 7 days | 90 days |
+| risk_block_events | 7 days | 30 days |
+| heartbeat_events | 1 day | 7 days |
+
+### Continuous aggregates
+
+- `bar_5m` — 5-minute OHLCV rollup (refreshed every 5 min)
+- `bar_1h` — 1-hour OHLCV rollup (refreshed every 1 hour)
+
+### ML feature store
+
+The `FeatureStore` class provides:
+- **Bar features** — raw OHLCV + derived: bar_return, bar_range_pct, close_position, vol_ratio_20, price_vs_ma10
+- **Signal outcome labels** — BUY signals joined with subsequent fills (executed flag, outcome_return)
+- **Pro-signal outcomes** — R:R achieved, hit_target_1 flag
+- **Detector effectiveness** — per-strategy/tier execution rates and avg confidence
+
+### Environment variables
+
+```
+# Database (defaults shown — override in .env)
+DATABASE_URL=postgresql://trading:trading_secret@localhost:5432/trading_hub
+
+# DBWriter tuning (optional)
+DB_BATCH_MAX=200
+DB_FLUSH_INTERVAL=0.5
+DB_QUEUE_MAXSIZE=10000
+DB_CIRCUIT_BREAKER_FAILURES=5
+DB_CIRCUIT_BREAKER_RESET=30
+```
+
+---
+
 ## Logging
 
 Both run modes write to `logs/monitor_YYYY-MM-DD.log`:
@@ -571,8 +695,10 @@ Supports single-ticker backtests and year-by-year compounding. Run via the Strea
 ## Requirements
 
 - Python 3.10+
+- Docker (for TimescaleDB + Redpanda)
 - Alpaca account — free paper trading at [alpaca.markets](https://alpaca.markets)
 - Tradier account — free developer sandbox at [tradier.com](https://tradier.com) (recommended for bar data)
 - Yahoo Mail app password for email alerts (optional)
 - Redpanda or Kafka broker for durable event log (optional — bot runs without it)
+- TimescaleDB 2.26+ / PostgreSQL 16 (optional — bot runs without it; use `cd docker && docker compose up -d`)
 - macOS/Linux for cron scheduling

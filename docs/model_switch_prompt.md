@@ -31,6 +31,7 @@ monitor.run() → emit_batch(BAR[])
     └─ HeartbeatEmitter           tick → HEARTBEAT
     └─ EventLogger                * → log line
     └─ DurableEventLog            ORDER_REQ/FILL/POP_SIGNAL → Redpanda
+    └─ DBSubscriber               * → DBWriter → TimescaleDB (async batch persist)
 ```
 
 All inter-layer communication goes through the `EventBus` (`monitor/event_bus.py`).  **No layer calls another layer's methods directly.**
@@ -153,10 +154,19 @@ BAR → PopStrategyEngine._on_bar()
 | T3.5 BAR subscriber + PopExecutor | `pop_strategy_engine.py` |
 | All configuration (incl. pop credentials) | `config.py` (tickers, strategy params, credentials, ALPACA_POPUP_KEY, POP_*) |
 | Architectural decisions | `docs/dev_notes.md` |
+| DB connection pool | `db/connection.py` |
+| Async batch writer + SessionManager | `db/writer.py` |
+| EventBus → DB bridge | `db/subscriber.py` |
+| DB read queries + replay | `db/reader.py` |
+| ML feature store | `db/feature_store.py` |
+| SQL migrations (001–009) | `db/migrations/sql/*.sql` |
+| Migration runner | `db/migrations/run.py` |
+| Docker orchestration | `docker/docker-compose.yml` |
+| PostgreSQL tuning | `docker/postgresql.conf` |
 
 ---
 
-## Current state of the codebase (as of 2026-04-11)
+## Current state of the codebase (as of 2026-04-12)
 
 ### What works and is production-hardened
 
@@ -184,6 +194,12 @@ BAR → PopStrategyEngine._on_bar()
 - SignalAnalyzer LRU indicator cache (500 entries, FIFO eviction)
 - `run_monitor.py` wired to instantiate `PopStrategyEngine` with pop credentials before `monitor.start()`
 - `config.py` added: `ALPACA_POPUP_KEY`, `ALPACA_PUPUP_SECRET_KEY`, `POP_PAPER_TRADING`, `POP_MAX_POSITIONS`, `POP_TRADE_BUDGET`, `POP_ORDER_COOLDOWN`
+- `db/` package: async TimescaleDB event store — 9 SQL migrations, asyncpg pool, batch DBWriter with circuit breaker, DBSubscriber (EventBus → DB bridge), DBReader (replay + analysis), FeatureStore (ML features + outcome labels), SessionManager (session lifecycle)
+- `docker/` — Docker Compose for TimescaleDB 2.26 + Redpanda, tuned postgresql.conf
+- `db/migrations/run.py` — idempotent migration runner with advisory lock + schema_migrations tracking
+- Continuous aggregates: `bar_5m`, `bar_1h` — downsampled OHLCV views
+- Compression policies (7-day) + retention policies (7–365 days per table)
+- ML feature views: `ml_bar_features`, `daily_trade_summary`, `strategy_signal_rates`, `pro_strategy_performance`
 
 ### What is not yet done / known limitations
 
@@ -235,6 +251,26 @@ self._bus.emit(
 object.__setattr__(self, 'side', Side(self.side))   # coerce str → enum
 ```
 
+### Wiring DB persistence
+
+```python
+from db import init_db, close_db, get_writer, DBSubscriber, SessionManager
+
+# Startup:
+pool = await init_db()
+writer = get_writer()
+await writer.start()
+subscriber = DBSubscriber(bus=monitor._bus, writer=writer)
+subscriber.register()
+session = SessionManager()
+await session.start(mode="live", broker="alpaca", tickers=TICKERS)
+
+# Shutdown:
+await session.stop(exit_reason="clean", writer=writer)
+await writer.stop()
+await close_db()
+```
+
 ---
 
 ## Things to avoid
@@ -272,10 +308,9 @@ streamlit run app.py
 
 ```
 branch:  tradier_platform
-ahead of main by: ~14 commits
-uncommitted changes: yes (README, dev_notes, pop_screener/*, pop_strategy_engine.py,
-                         demo_pop_strategies.py, config.py, run_monitor.py,
-                         test/logs/*, test/run_all_tests.py, test/test_*.py)
+ahead of main by: ~15 commits
+uncommitted changes: yes (db/*, docker/*, README, dev_notes, model_switch_prompt,
+                         requirements.txt, .gitignore)
 ```
 
 Commit all before merging to main.
@@ -297,4 +332,15 @@ POP_PAPER_TRADING=true
 POP_MAX_POSITIONS=3
 POP_TRADE_BUDGET=500
 POP_ORDER_COOLDOWN=300
+```
+
+### Database env vars (`.env`)
+
+```
+DATABASE_URL=postgresql://trading:trading_secret@localhost:5432/trading_hub
+DB_BATCH_MAX=200
+DB_FLUSH_INTERVAL=0.5
+DB_QUEUE_MAXSIZE=10000
+DB_CIRCUIT_BREAKER_FAILURES=5
+DB_CIRCUIT_BREAKER_RESET=30
 ```

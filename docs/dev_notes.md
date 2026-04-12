@@ -24,6 +24,7 @@
 16. [PopExecutor — Dedicated Alpaca Execution Account](#16-popexecutor--dedicated-alpaca-execution-account)
 17. [run_monitor.py — PopStrategyEngine Wiring](#17-run_monitorpy--popstrategyengine-wiring)
 18. [Pro-Setup Multi-Tier Strategy System](#18-pro-setup-multi-tier-strategy-system)
+19. [TimescaleDB Event Store — Database Layer](#19-timescaledb-event-store--database-layer)
 
 ---
 
@@ -1329,4 +1330,91 @@ PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))
 PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))
 PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))
 ```
+
+---
+
+## 19. TimescaleDB Event Store — Database Layer
+
+### Problem
+
+All trading events were ephemeral — logged to files and Redpanda, but not queryable for structured replay, ML feature extraction, or historical analysis. We needed:
+
+1. **Structured persistence** — every EventBus event stored in typed, indexed tables
+2. **Deterministic replay** — replay an entire session's events in exact order
+3. **ML feature store** — derived features and outcome labels queryable via SQL
+4. **High-throughput ingestion** — thousands of inserts/sec without blocking the trading path
+5. **Compression + retention** — automatic storage management for time-series data
+
+### Design decisions
+
+#### Why TimescaleDB over plain PostgreSQL
+
+TimescaleDB adds hypertables (automatic time-based partitioning), continuous aggregates, compression policies, and retention policies — all critical for time-series trading data. The alternative was manual partitioning, which is error-prone and requires custom maintenance jobs.
+
+#### Why asyncpg over psycopg3
+
+asyncpg is ~3× faster for bulk inserts (binary protocol, no Python-side encoding overhead) and integrates naturally with the existing asyncio event loop. psycopg3 is included in requirements as a fallback for migration scripts and admin tooling.
+
+#### Schema: one table per EventType
+
+Each EventType gets its own hypertable. This avoids wide/sparse tables and allows per-table compression segmentby and retention policies. The tradeoff is more tables to manage, but TimescaleDB's policies handle this automatically.
+
+#### Enum types in PostgreSQL vs text
+
+`signal_action`, `order_side`, `position_action` are PostgreSQL enum types. This saves 4–8 bytes per row vs text and provides constraint validation at the DB level. The tradeoff: adding a new enum value requires an `ALTER TYPE` migration.
+
+#### JSONB columns for features/detectors
+
+`pop_signal_events.features_json` and `pro_strategy_signal_events.detector_signals` use JSONB because their shape varies per strategy. A GIN index supports containment queries (`@>`) for ML pipelines. The rest of the schema avoids JSONB — narrow typed columns are preferred.
+
+#### DBWriter: async queue + batch drain
+
+Events are pushed to an `asyncio.Queue` from the EventBus worker threads (sync → async bridge via `call_soon_threadsafe`). A background task drains the queue every 500ms in batches of up to 200 rows, grouped by table, using `executemany()`. This decouples ingestion latency from the trading hot path.
+
+#### Circuit breaker
+
+After 5 consecutive DB failures, the writer suspends writes for 30 seconds. This prevents a DB outage from causing unbounded queue growth or blocking the trading pipeline. Rows arriving during the open period are counted in `rows_dropped`.
+
+#### Session lifecycle tracking
+
+`session_log` is a regular table (not a hypertable — low volume, needs UPDATE). Every monitor start inserts a row; shutdown updates it with stop_ts, metrics, and exit reason. A session with `stop_ts IS NULL` indicates a crash — queryable for crash detection and replay.
+
+#### Migration runner: advisory lock + tracking table
+
+Migrations are idempotent SQL files executed in filename order. `trading.schema_migrations` tracks what's been applied. An advisory lock (`pg_advisory_lock(8675309)`) prevents concurrent runners from colliding during deployment.
+
+### PostgreSQL tuning choices (docker/postgresql.conf)
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| `shared_buffers` | 256MB | ~25% of typical Docker allocation |
+| `effective_cache_size` | 768MB | OS page cache estimate |
+| `work_mem` | 16MB | Enough for ML aggregate queries |
+| `wal_level` | replica | Supports streaming replication if needed |
+| `max_wal_size` | 1GB | Handles burst inserts without excessive checkpoints |
+| `random_page_cost` | 1.1 | SSD-optimised planner |
+| `log_min_duration_statement` | 1000ms | Log slow queries only |
+
+### Compression + retention policy
+
+- **Compress after 7 days** — all hypertables segmented by ticker/symbol, ordered by ts DESC
+- **Retention varies by importance**: bar/signal data: 90 days; fills/orders/positions: 365 days (audit trail); heartbeats: 7 days
+- Continuous aggregates (`bar_5m`, `bar_1h`) provide downsampled views for analysis without touching raw data
+
+### Files added/modified
+
+| File | Change |
+|------|--------|
+| `db/__init__.py` | NEW — public API: init_db, close_db, get_writer, SessionManager, DBSubscriber, DBReader, FeatureStore |
+| `db/connection.py` | NEW — asyncpg pool lifecycle |
+| `db/writer.py` | NEW — async batch DBWriter with circuit breaker + SessionManager |
+| `db/subscriber.py` | NEW — EventBus → DBWriter bridge for all 9 event types |
+| `db/reader.py` | NEW — read queries for replay, analysis, session history |
+| `db/feature_store.py` | NEW — ML feature extraction and outcome labelling |
+| `db/migrations/run.py` | NEW — idempotent SQL migration runner |
+| `db/migrations/sql/001–009` | NEW — 9 ordered SQL migrations |
+| `docker/docker-compose.yml` | NEW — TimescaleDB 2.26 + Redpanda orchestration |
+| `docker/postgresql.conf` | NEW — tuned PG16 config |
+| `requirements.txt` | UPDATED — added asyncpg, psycopg |
+| `README.md` | UPDATED — database layer documentation |
 

@@ -59,7 +59,7 @@ Default async config:
 
 | EventType | Queue size | Overflow | Workers |
 |-----------|-----------|----------|---------|
-| BAR | 500 | DROP_OLDEST | 4 |
+| BAR | 200 | DROP_OLDEST | 4 |
 | ORDER_REQ, FILL | 100 | BLOCK | 1 (strict ordering) |
 | HEARTBEAT | 10 | DROP_OLDEST | 1 |
 
@@ -301,32 +301,6 @@ Supports single-ticker backtests and year-by-year compounding (reinvest returns 
 
 ---
 
-## Test Suite
-
-Run the full 10-test validation suite:
-
-```bash
-python test/run_all_tests.py
-# Report written to: test/logs/test_report.md
-```
-
-| Test | Coverage | Status |
-|------|----------|--------|
-| T1 Synthetic Feed | 200 tickers × 100 bars via ASYNC EventBus at 10ms intervals | ✅ |
-| T2 Tradier Sandbox | Auth + quotes + history + order submission via sandbox.tradier.com | ✅ |
-| T3 Redpanda Consistency | Serialisation round-trip + (optional) live Redpanda replay ordering | ✅ |
-| T4 Market Open Latency | 200 BAR burst; P95 < 50ms; 0 drops | ⚠️ P95 ≈ 55ms on dev Mac |
-| T5 Network Warm-up | Parallel RVOL fetch 200 tickers in < 60s | ✅ |
-| T6 Full Pipeline | BAR→SIGNAL→ORDER_REQ→FILL→POSITION end-to-end; max-positions gate; EOD close | ✅ |
-| T7 Risk Boundaries | All 6 pre-trade checks at exact boundaries; partial-sell qty=1; concurrent fills | ✅ |
-| T8 Signal Edge Cases | NaN/zero-volatility/insufficient bars; RVOL time gate; SignalPayload invariants; 1000-frame stress | ✅ |
-| T9 EventBus Advanced | Circuit-breaker; DLQ; TTL expiry; priority ordering; coalescing; retry; dedup; stream_seq | ✅ |
-| T10 State Persistence | Corrupt JSON backup; concurrent saves; StateEngine; HeartbeatEmitter | ✅ |
-
-> T4 passes on production Linux servers; the P95 slightly exceeds 50ms on a dev MacBook due to Python GIL + OS scheduling variance.
-
----
-
 ## Requirements
 
 - Python 3.10+
@@ -335,3 +309,4 @@ python test/run_all_tests.py
 - Yahoo Mail app password for email alerts (optional)
 - Redpanda or Kafka broker for durable event log (optional — bot runs without it)
 - macOS/Linux for cron scheduling
+

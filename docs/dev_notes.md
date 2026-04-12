@@ -17,6 +17,13 @@
 9. [Files Changed Summary](#9-files-changed-summary)
 10. [Key Design Decisions](#10-key-design-decisions)
 11. [Weekend Sandbox Validation — 5 Tests](#11-weekend-sandbox-validation--5-tests)
+12. [Multi-Strategy Pop-Stock Architecture](#12-multi-strategy-pop-stock-architecture)
+13. [Signal Metadata Propagation — CrashRecovery Fix](#13-signal-metadata-propagation--crashrecovery-fix)
+14. [Signal Indicator LRU Cache](#14-signal-indicator-lru-cache)
+15. [BAR Queue Depth + HTTP Pool Sizing](#15-bar-queue-depth--http-pool-sizing)
+16. [PopExecutor — Dedicated Alpaca Execution Account](#16-popexecutor--dedicated-alpaca-execution-account)
+17. [run_monitor.py — PopStrategyEngine Wiring](#17-run_monitorpy--popstrategyengine-wiring)
+18. [Pro-Setup Multi-Tier Strategy System](#18-pro-setup-multi-tier-strategy-system)
 
 ---
 
@@ -896,3 +903,430 @@ Fix: `TradierDataClient.__init__` mounts `HTTPAdapter(pool_connections=20, pool_
 | T8 Signals | ✅ PASS | 4.2s | 12/12 subtests, 1000-frame stress |
 | T9 EventBus | ✅ PASS | 2.8s | 12/12 subtests |
 | T10 State | ✅ PASS | 1.7s | 9/9 subtests |
+
+---
+
+## 12. Multi-Strategy Pop-Stock Architecture
+
+**Session:** 2026-04-11 (branch `tradier_platform`)
+
+### Motivation
+
+The existing system runs a single VWAP Reclaim strategy on a ~165-ticker watchlist.  Real intraday opportunities cluster around catalysts (news, social momentum, earnings gaps, halt-resumes) that require different entry mechanics.  The goal was to add parallel strategy coverage without touching any existing layer.
+
+### Design decisions
+
+**1. T3.5 layer, not a modification of T4**
+
+A new `PopStrategyEngine` subscribes to `BAR` at `priority=1` (same level as the existing `StrategyEngine`).  Both engines run on every bar tick.  No existing code was changed.  The pop engine is opt-in — one constructor call wires it up:
+
+```python
+pop_engine = PopStrategyEngine(bus=bus)
+```
+
+**2. POP_SIGNAL + PopExecutor (dedicated account) — no SIGNAL translation**
+
+The pop pipeline emits `POP_SIGNAL` (durable=True) for every entry signal, then calls `PopExecutor.execute_entry()` directly for long entries.
+
+`PopExecutor` owns its own `TradingClient` built from separate Alpaca credentials (`APCA_POPUP_KEY` / `APCA_PUPUP_SECRET_KEY`).  It submits marketable limit orders directly to the pop Alpaca account and emits a `FILL` event on the shared bus when the order is confirmed.  `PositionManager` sees the `FILL` and tracks the position normally.
+
+The main `AlpacaBroker` subscribes to `ORDER_REQ` events on the bus.  Because `PopExecutor` never emits `ORDER_REQ`, there is no risk of the main broker also executing pop orders — the two execution paths are fully isolated at the account level.
+
+Short entries (PARABOLIC_REVERSAL) emit `POP_SIGNAL` only — `PopExecutor` skips execution for `side != 'buy'` until short-selling support is added.
+
+If pop credentials are absent or `POP_PAPER_TRADING=true`, `PopExecutor` logs simulated fills at the signal price and emits `FILL` without touching any real account.
+
+**3. Deterministic, rule-based only**
+
+Every stage — screening, classification, signal generation — is pure functions with no ML, no randomness, no global state.  The same BAR inputs always produce the same output.  This makes the pipeline trivially testable and debuggable.
+
+**4. Pluggable ingestion adapters**
+
+Mock implementations ship in `pop_screener/ingestion.py`.  Swapping in a real API requires implementing one method (`get_news`, `get_social`, or `get_market_slice`) and injecting the new instance.  No other code changes.
+
+**5. All thresholds in one file**
+
+`pop_screener/config.py` contains every numeric threshold used anywhere in the pop subsystem.  60+ constants, all named, all with inline comments explaining the unit and rationale.
+
+### New EventType: POP_SIGNAL
+
+Added to `EventType` enum in `event_bus.py`:
+
+```python
+POP_SIGNAL = auto()
+```
+
+Config: `maxsize=50, policy=DROP_OLDEST, n_workers=2` — same profile as `SIGNAL`.
+Priority: `MEDIUM` — same as `SIGNAL`.
+Payload: `PopSignalPayload` (frozen dataclass in `monitor/events.py`) — validates stop < entry, targets ordered, ATR > 0, confidence ∈ [0, 1].
+
+### New files (18 total)
+
+```
+pop_screener/config.py
+pop_screener/models.py             — 10 dataclasses + 4 enums
+pop_screener/ingestion.py          — 4 mock adapters
+pop_screener/features.py           — FeatureEngineer (ATR, RSI, EMA, trend cleanliness)
+pop_screener/screener.py           — PopScreener (6 rules, priority-ordered)
+pop_screener/classifier.py         — StrategyClassifier (6 deterministic mappings)
+pop_screener/strategy_router.py    — StrategyRouter (primary → secondary fallback)
+pop_screener/strategies/vwap_reclaim_engine.py
+pop_screener/strategies/orb_engine.py
+pop_screener/strategies/halt_resume_engine.py
+pop_screener/strategies/parabolic_reversal_engine.py
+pop_screener/strategies/ema_trend_engine.py
+pop_screener/strategies/bopb_engine.py
+pop_strategy_engine.py             — T3.5 BAR subscriber + event emission
+demo_pop_strategies.py             — offline demo, 0 errors, no API keys needed
+```
+
+### Modified files (2)
+
+| File | Change |
+|------|--------|
+| `monitor/event_bus.py` | Added `POP_SIGNAL` to `EventType`, `_DEFAULT_ASYNC_CONFIG`, `_DEFAULT_PRIORITY`, `_PAYLOAD_TYPES` |
+| `monitor/events.py` | Added `PopSignalPayload` frozen dataclass; added `Dict`, `Tuple`, `Any` to typing imports |
+
+### Screener rule priority (highest → lowest)
+
+1. `HIGH_IMPACT_NEWS` — checked first; strongest catalyst
+2. `EARNINGS` — gap + volume + sentiment proxy
+3. `LOW_FLOAT` — float < 20M + RVOL + gap
+4. `MODERATE_NEWS` — sentiment_delta + headline_velocity + small gap
+5. `SENTIMENT_POP` — social_velocity + bullish_skew
+6. `UNUSUAL_VOLUME` — RVOL + price_momentum
+
+First matching rule wins; a symbol is not double-counted.
+
+### Classifier VWAP compatibility scoring
+
+`_vwap_compat_score()` produces a [0, 1] score from three components:
+
+| Component | Weight | Formula |
+|-----------|--------|---------|
+| VWAP distance | 35% | linear decay: 0 → perfect, 3% away → 0 |
+| Trend cleanliness | 35% | `trend_cleanliness_score` from features |
+| RVOL in-band [1.5–5×] | 30% | ramp up to threshold, flat in band, decay above |
+
+Low-float pops set `vwap_compatibility_score = 0.0` explicitly — VWAP_RECLAIM is disallowed for low-float names because erratic price action makes VWAP signals unreliable.
+
+### Trend cleanliness score
+
+`_compute_trend_cleanliness()` in `features.py` produces a [0, 1] composite:
+
+| Component | Weight | Measurement |
+|-----------|--------|------------|
+| Higher-highs fraction | 35% | consecutive bar pairs with higher high |
+| Higher-lows fraction | 35% | consecutive bar pairs with higher low |
+| Trend/noise ratio | 15% | |close[-1] − close[-N]| / (N × ATR), capped at 1 |
+| EMA20 proximity | 15% | inverted distance from close to EMA20, 2% tolerance = perfect |
+
+### Demo output (2026-04-11, 20-symbol synthetic universe)
+
+```
+Screened 20 symbols → 11 pop candidates  (9 skipped)
+
+Strategy assignments:
+  EMA_TREND_CONTINUATION   ████████  (9)
+  VWAP_RECLAIM             ██        (2)
+
+POP_SIGNAL events validated : 1
+SIGNAL(BUY) events validated : 1
+Errors                       : 0  ✓
+```
+
+---
+
+## 13. Signal Metadata Propagation — CrashRecovery Fix
+
+**Session:** 2026-04-11
+
+### Problem
+
+`CrashRecovery.rebuild_positions()` in `event_log.py` reconstructed positions after a restart using hardcoded approximations:
+
+```python
+'stop_price':   fill_price * 0.995,
+'target_price': fill_price * 1.01,
+'half_target':  fill_price * 1.005,
+'atr_value':    None,
+```
+
+These drifted arbitrarily from the actual signal levels, causing incorrect stop management after crash recovery.
+
+### Fix
+
+`stop_price`, `target_price`, and `atr_value` now flow through the full chain:
+
+```
+SignalPayload → RiskEngine → OrderRequestPayload → AlpacaBroker/PaperBroker → FillPayload → CrashRecovery
+```
+
+Fields added:
+- `OrderRequestPayload`: `stop_price`, `target_price`, `atr_value` (all `Optional[float]`, validated positive)
+- `FillPayload`: same three optional fields
+- `RiskEngine._handle_buy()`: forwards from `SignalPayload` when emitting `ORDER_REQ`
+- `AlpacaBroker._execute_buy()` + `PaperBroker._execute_buy()`: forwards from `OrderRequestPayload` when emitting `FILL`
+- `CrashRecovery.rebuild_positions()`: uses exact values when present; falls back to approximations only for Redpanda events from before this patch
+
+### Result
+
+Crash recovery now reconstructs exact stop/target/ATR without any price-based approximations, as long as the fill event was logged after this patch was deployed.
+
+---
+
+## 14. Signal Indicator LRU Cache
+
+**Session:** 2026-04-11
+
+### Problem
+
+`SignalAnalyzer._compute_indicators()` in `signals.py` recomputed VWAP, RSI, and ATR on every call, even when called multiple times with the same DataFrame object within one tick.  With 200 tickers and 4 workers, this meant up to 800 full indicator recalculations per minute.
+
+### Fix
+
+Added a bounded LRU cache keyed on `(ticker, id(df), rsi_period, atr_period)`:
+
+```python
+_MAX_CACHE = 500   # class variable
+
+# In _compute_indicators():
+_cache_key = (ticker, id(data), rsi_period, atr_period)
+_cached = self._indicator_cache.get(_cache_key)
+if _cached is not None:
+    return _cached  # all indicator scalars
+```
+
+`id(df)` is unique per DataFrame object.  A new bar slice creates a new object → cache miss → recomputation.  Cache is bounded at 500 entries with FIFO eviction (pop the oldest key via `next(iter(...))`).
+
+### Rationale for 500 entry limit
+
+At 200 tickers × 1 cache entry per ticker per bar cycle = 200 entries per cycle.  500 allows ~2.5 cycles of overlap with no eviction pressure under normal load.  Eviction is O(1) via `OrderedDict`-equivalent insertion order.
+
+---
+
+## 15. BAR Queue Depth + HTTP Pool Sizing
+
+**Session:** 2026-04-11
+
+### BAR queue depth: 200 → 500
+
+**Problem:** With 200-ticker universes and 4 BAR workers (50 tickers/worker), burst periods (e.g. at 9:30 ET when all bars arrive simultaneously) could overflow the 200-entry queue, triggering DROP_OLDEST events and losing bars.
+
+**Fix:** `maxsize=500` in `_DEFAULT_ASYNC_CONFIG[EventType.BAR]`.  With 4 partitions this gives 125 slots per partition — enough to absorb a full 200-ticker burst with headroom.  Memory cost: ~6 kB per slot (DataFrame reference) × 500 = negligible.
+
+### HTTP connection pool: default → `_MAX_WORKERS`
+
+**Problem:** `requests.Session` defaults to `pool_maxsize=10`.  `TradierDataClient.fetch_batch_bars()` launches `_MAX_WORKERS` threads in parallel; with more than 10 workers the session discarded connections on every request, causing "Connection pool is full, discarding connection" warnings and increased latency.
+
+**Fix:**
+
+```python
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=_MAX_WORKERS,
+    pool_maxsize=_MAX_WORKERS,
+)
+self._session.mount('https://', adapter)
+```
+
+Called in `TradierDataClient.__init__()`.  Connection reuse under parallel load is now guaranteed.
+
+---
+
+## 16. PopExecutor — Dedicated Alpaca Execution Account
+
+**Session:** 2026-04-12 (branch `tradier_platform`)
+
+### Problem
+
+The initial pop-strategy design translated each pop `EntrySignal` into a `SIGNAL(action=BUY)` event, routing execution through the existing `RiskEngine → AlpacaBroker` chain.  This created two issues:
+
+1. **Shared capital.** Pop trades and VWAP Reclaim trades would compete for the same Alpaca account balance, making per-strategy P&L accounting impossible.
+2. **Double-execution risk.** If a second `AlpacaBroker` instance were ever subscribed to `ORDER_REQ`, both brokers would execute every order.
+
+### Solution: PopExecutor
+
+`pop_strategy_engine.py` was redesigned with a dedicated execution class:
+
+```python
+class PopExecutor:
+    FILL_TIMEOUT_SEC = 2.0
+    FILL_POLL_SEC    = 0.25
+    MAX_RETRIES      = 3
+    MAX_SLIPPAGE_PCT = 0.005
+```
+
+Key properties:
+- Owns its own `TradingClient` built from `APCA_POPUP_KEY` / `APCA_PUPUP_SECRET_KEY` — a separate Alpaca account or sub-account.
+- Has an independent risk gate: max pop positions, per-ticker cooldown, duplicate position guard.
+- Submits marketable limit orders directly (no `ORDER_REQ` event emitted).
+- On fill confirmation, emits `FILL(durable=True)` on the shared bus with `reason=f"pop:{strategy_type}"`.
+- `PositionManager` picks up the `FILL` and tracks the pop position in the normal position lifecycle.
+
+### Config additions (`config.py`)
+
+```python
+ALPACA_POPUP_KEY        = os.getenv('APCA_POPUP_KEY')
+ALPACA_PUPUP_SECRET_KEY = os.getenv('APCA_PUPUP_SECRET_KEY')
+POP_PAPER_TRADING       = os.getenv('POP_PAPER_TRADING', 'true').lower() == 'true'
+POP_MAX_POSITIONS       = int(os.getenv('POP_MAX_POSITIONS', 3))
+POP_TRADE_BUDGET        = int(os.getenv('POP_TRADE_BUDGET', 500))
+POP_ORDER_COOLDOWN      = int(os.getenv('POP_ORDER_COOLDOWN', 300))
+```
+
+### Graceful degradation
+
+If either key is missing or `POP_PAPER_TRADING=true`:
+- `_build_alpaca_client()` returns `None`.
+- `PopStrategyEngine.__init__` logs a warning and sets `pop_paper=True`.
+- `PopExecutor._paper_fill()` runs: logs the simulated fill, emits `FILL` at signal price, no real order placed.
+
+### Invariant preserved
+
+`PopExecutor` never emits `ORDER_REQ`.  The main `AlpacaBroker` subscribes to `ORDER_REQ` only.  The two execution paths are isolated: pop trades always go through the pop Alpaca account; VWAP Reclaim trades always go through the main account.
+
+---
+
+## 17. run_monitor.py — PopStrategyEngine Wiring
+
+**Session:** 2026-04-12 (branch `tradier_platform`)
+
+### Change
+
+`PopStrategyEngine` is now instantiated in `run_monitor.py` after `RealTimeMonitor` is constructed but **before** `monitor.start()` is called, satisfying the bus invariant that all subscriptions must be registered before dispatcher threads begin.
+
+```python
+from pop_strategy_engine import PopStrategyEngine
+pop_engine = PopStrategyEngine(
+    bus=monitor._bus,
+    pop_alpaca_key=ALPACA_POPUP_KEY,
+    pop_alpaca_secret=ALPACA_PUPUP_SECRET_KEY,
+    pop_paper=POP_PAPER_TRADING,
+    pop_max_positions=POP_MAX_POSITIONS,
+    pop_trade_budget=float(POP_TRADE_BUDGET),
+    pop_order_cooldown=POP_ORDER_COOLDOWN,
+    alert_email=ALERT_EMAIL,
+)
+```
+
+The import is deferred (inside `main()`) to avoid circular imports and to keep the top-level import block clean.
+
+### Config imports added to run_monitor.py
+
+```python
+from config import (
+    ...
+    ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
+    POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
+)
+```
+
+---
+
+## 18. Pro-Setup Multi-Tier Strategy System
+
+**Session:** 2026-04-12 (branch `tradier_platform`)
+
+### Motivation
+
+The existing system has two strategies: VWAP Reclaim (T4) and Pop-Stock (T3.5).  Both are catalyst-driven and share similar entry mechanics.  To broaden coverage across different intraday setups (trend, range, volatility, order-flow), 11 new rule-based setups were added as a fully additive module (`pro_setups/`) that does not touch any existing code path.
+
+### Design decisions
+
+**1. Fully additive — zero modification to existing layers**
+
+`ProSetupEngine` subscribes to `BAR` at `priority=2` (existing `StrategyEngine` at `priority=1`).  The only changes to existing files are:
+- `monitor/event_bus.py`: `PRO_STRATEGY_SIGNAL` EventType + async config + priority + payload type
+- `monitor/events.py`: `ProStrategySignalPayload` frozen dataclass
+- `config.py`: three `PRO_*` constants
+- `run_monitor.py`: `ProSetupEngine` instantiation
+
+**2. Three-tier stop/exit structure**
+
+| Tier | SL | Partial | Full | Trail |
+|------|-----|---------|------|-------|
+| 1 | 0.3–0.4 ATR | 1R | 2R | Higher lows |
+| 2 | 0.8–1.0 ATR | 1.5R | 3R | EMA20/VWAP |
+| 3 | 1.5–2.0 ATR | 3R | 6–8R | Structure |
+
+**3. Execution via shared AlpacaBroker (ORDER_REQ path)**
+
+`RiskAdapter` emits `ORDER_REQ` (durable) after its own risk checks.  The existing `AlpacaBroker` (subscribed to `ORDER_REQ`) executes the order — no new broker client or credentials needed.  Uses `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` (main account).
+
+This differs from `PopExecutor` which uses separate pop credentials.
+
+**4. Independent risk gate (RiskAdapter)**
+
+The existing `RiskEngine` is NOT used for pro setups (its RVOL ≥ 2.0 and RSI 50–70 checks are VWAP-Reclaim-specific and would incorrectly block Tier 3 momentum setups).  `RiskAdapter` does its own checks: max positions, cooldown, duplicate position, R:R floor, ATR validity, and risk-based position sizing (2% budget per trade).
+
+**5. Deterministic pipeline**
+
+All 5 stages (detector → classifier → strategy → risk → emit) are pure functions with no ML, no randomness, no global state.  The same BAR always produces the same output.
+
+### New EventType: PRO_STRATEGY_SIGNAL
+
+```python
+PRO_STRATEGY_SIGNAL = auto()
+# Config: maxsize=100, DROP_OLDEST, n_workers=2, priority=MEDIUM
+```
+
+Payload: `ProStrategySignalPayload` — ticker, strategy_name, tier, direction, entry/stop/target levels, ATR, RVOL, RSI, VWAP, confidence, detector_signals (JSON).
+
+### File structure (38 new files)
+
+```
+pro_setups/
+├── __init__.py
+├── engine.py                   # ProSetupEngine — main orchestrator
+├── detectors/
+│   ├── base.py                 # DetectorSignal dataclass + BaseDetector ABC
+│   ├── _compute.py             # shared: VWAP, ATR, RSI, EMA, BB, Fib, pivots
+│   ├── trend_detector.py       # EMA9/20/50 alignment + HH+HL structure
+│   ├── vwap_detector.py        # above/below VWAP, reclaim pattern
+│   ├── sr_detector.py          # pivot-based S/R + flip detection
+│   ├── orb_detector.py         # 15-min opening range breakout
+│   ├── inside_bar_detector.py  # harami pattern + trend context
+│   ├── gap_detector.py         # gap-up/down + unfilled + continuation
+│   ├── flag_detector.py        # pole + tight channel + breakout
+│   ├── liquidity_detector.py   # sweep of swing low/high + reversal
+│   ├── volatility_detector.py  # BB squeeze + directional breakout
+│   ├── fib_detector.py         # 38.2%/61.8% Fib levels + proximity
+│   └── momentum_detector.py    # 3× volume + 1.5 ATR 3-bar expansion
+├── classifiers/
+│   └── strategy_classifier.py  # Tier 3→2→1 priority rule chain
+├── strategies/
+│   ├── base.py                 # BaseProStrategy ABC; tier constants
+│   ├── tier1/trend_pullback.py
+│   ├── tier1/vwap_reclaim.py
+│   ├── tier1/sr_flip.py
+│   ├── tier2/orb.py
+│   ├── tier2/inside_bar.py
+│   ├── tier2/gap_and_go.py
+│   ├── tier2/flag_pennant.py
+│   ├── tier3/liquidity_sweep.py
+│   ├── tier3/bollinger_squeeze.py
+│   ├── tier3/fib_confluence.py
+│   └── tier3/momentum_ignition.py
+├── router/
+│   └── strategy_router.py      # PRO_STRATEGY_SIGNAL → RiskAdapter
+└── risk/
+    └── risk_adapter.py         # Risk gate + position sizing + ORDER_REQ emit
+```
+
+### Enhanced logging
+
+Every fired signal produces two structured log lines:
+
+1. **ProSetupEngine** (when signal is emitted): strategy, tier, direction, all price levels, R:R, ATR, RVOL, RSI, confidence, fired detectors, elapsed ms.
+2. **RiskAdapter** (when ORDER_REQ is emitted): direction, entry, stop, targets, qty, R:R, dollar risk, confidence, ATR.
+
+Blocked signals also log with reason: `BLOCKED: max_positions reached`, `BLOCKED: cooldown 143s remaining`, `BLOCKED: R:R=1.20 < min 3.50`, etc.
+
+### config.py additions
+
+```python
+PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))
+PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))
+PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))
+```
+

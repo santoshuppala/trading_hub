@@ -1,0 +1,196 @@
+"""
+pop_screener/stocktwits_social.py — StockTwits Social Sentiment adapter.
+
+Production replacement for the mock SocialSentimentSource.
+Uses the StockTwits API v2 (FREE — no API key required for public endpoints).
+
+API docs: https://api.stocktwits.com/developers/docs/api
+
+Endpoint: GET https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json
+    - No authentication needed for public streams
+    - Rate limit: 200 requests/hour (unauthenticated)
+    - Returns latest 30 messages per call
+    - Each message has sentiment: {basic: {sentiment: 'Bullish'|'Bearish'|null}}
+
+Usage
+-----
+    from pop_screener.stocktwits_social import StockTwitsSocialSource
+
+    source = StockTwitsSocialSource()  # no key needed
+    social = source.get_social('AAPL', window_hours=1.0)
+
+Rate limit strategy
+-------------------
+    200 req/hr = ~3.3 req/min. With 200 tickers checked every minute,
+    we MUST cache aggressively. Cache TTL = 5 minutes per symbol.
+    At 200 tickers / 5-min cycle = 40 unique requests/5 min = 8/min = 480/hr.
+    Still over limit. Solution: rotate through tickers — only fetch the
+    ones with recent BAR activity (typically 20-50 active at any time).
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Dict, Optional, Tuple
+
+import requests
+
+from pop_screener.models import SocialData
+
+log = logging.getLogger(__name__)
+
+_CACHE_TTL = 300  # 5 minutes (aggressive caching for rate limits)
+
+
+class StockTwitsSocialSource:
+    """
+    Production social sentiment adapter using StockTwits public API.
+
+    Implements the same interface as the mock SocialSentimentSource:
+        get_social(symbol: str, window_hours: float) -> SocialData
+    """
+
+    _BASE_URL = 'https://api.stocktwits.com/api/2/streams/symbol'
+
+    def __init__(
+        self,
+        access_token: Optional[str] = None,
+        timeout: float = 5.0,
+    ):
+        """
+        Parameters
+        ----------
+        access_token : optional StockTwits OAuth token (increases rate limit to 400/hr)
+        timeout : HTTP request timeout in seconds
+        """
+        self._access_token = access_token
+        self._timeout = timeout
+        self._session = requests.Session()
+        self._session.headers.update({
+            'Accept': 'application/json',
+            'User-Agent': 'TradingHub/1.0',
+        })
+        # Cache: {symbol: (monotonic_time, SocialData)}
+        self._cache: Dict[str, Tuple[float, SocialData]] = {}
+        # Rate limit tracking
+        self._last_request_time = 0.0
+        self._min_interval = 0.3  # 300ms between requests (safe for 200/hr)
+
+    def get_social(self, symbol: str, window_hours: float = 1.0) -> SocialData:
+        """
+        Fetch social sentiment for *symbol*.
+
+        Returns SocialData with mention counts and bullish/bearish percentages.
+        On API failure, returns neutral SocialData (never raises).
+        """
+        # Cache check
+        cached = self._cache.get(symbol)
+        if cached and (time.monotonic() - cached[0]) < _CACHE_TTL:
+            return cached[1]
+
+        try:
+            result = self._fetch(symbol)
+            self._cache[symbol] = (time.monotonic(), result)
+            return result
+        except Exception as exc:
+            log.warning("[StockTwits] API error for %s: %s", symbol, exc)
+            # Return neutral data on failure
+            return SocialData(
+                symbol=symbol,
+                mention_count=0,
+                mention_velocity=0.0,
+                bullish_pct=0.50,
+                bearish_pct=0.50,
+            )
+
+    def _fetch(self, symbol: str) -> SocialData:
+        """Call StockTwits API and parse response."""
+        # Rate limiting
+        elapsed = time.monotonic() - self._last_request_time
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+
+        url = f"{self._BASE_URL}/{symbol}.json"
+        params = {}
+        if self._access_token:
+            params['access_token'] = self._access_token
+
+        self._last_request_time = time.monotonic()
+        resp = self._session.get(url, params=params, timeout=self._timeout)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Parse messages
+        messages = data.get('messages', [])
+        total = len(messages)
+        if total == 0:
+            return SocialData(
+                symbol=symbol,
+                mention_count=0,
+                mention_velocity=0.0,
+                bullish_pct=0.50,
+                bearish_pct=0.50,
+            )
+
+        bullish = 0
+        bearish = 0
+        with_sentiment = 0
+
+        for msg in messages:
+            entities = msg.get('entities', {})
+            sentiment = entities.get('sentiment')
+            if not sentiment or not isinstance(sentiment, dict):
+                continue
+
+            # StockTwits format: {'basic': 'Bullish'} or {'basic': 'Bearish'}
+            sent_label = sentiment.get('basic', '')
+
+            if sent_label == 'Bullish':
+                bullish += 1
+                with_sentiment += 1
+            elif sent_label == 'Bearish':
+                bearish += 1
+                with_sentiment += 1
+
+        # Calculate percentages from messages WITH sentiment tags
+        if with_sentiment > 0:
+            bullish_pct = round(bullish / with_sentiment, 4)
+            bearish_pct = round(bearish / with_sentiment, 4)
+        else:
+            bullish_pct = 0.50
+            bearish_pct = 0.50
+
+        # StockTwits returns latest 30 messages — estimate velocity
+        # by looking at the time span of returned messages
+        if len(messages) >= 2:
+            try:
+                newest = _parse_ts(messages[0].get('created_at', ''))
+                oldest = _parse_ts(messages[-1].get('created_at', ''))
+                span_hours = max((newest - oldest).total_seconds() / 3600, 0.01)
+                mention_velocity = round(total / span_hours, 1)
+            except Exception:
+                mention_velocity = float(total)
+        else:
+            mention_velocity = float(total)
+
+        return SocialData(
+            symbol=symbol,
+            mention_count=total,
+            mention_velocity=mention_velocity,
+            bullish_pct=bullish_pct,
+            bearish_pct=bearish_pct,
+        )
+
+
+def _parse_ts(ts_str: str) -> datetime:
+    """Parse StockTwits timestamp format: '2026-04-12T10:30:00Z'."""
+    for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S%z'):
+        try:
+            dt = datetime.strptime(ts_str, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return datetime.now(timezone.utc)

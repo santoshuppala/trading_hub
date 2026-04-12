@@ -120,8 +120,10 @@ class FeatureEngineer:
 
         # VWAP distance
         current_vwap = market.vwap_series[-1] if market.vwap_series else last_price
-        vwap_distance = ((last_price - current_vwap) / current_vwap
-                         if current_vwap > 0 else 0.0)
+        if current_vwap > 0:
+            vwap_distance = (last_price - current_vwap) / current_vwap
+        else:
+            vwap_distance = None  # signal missing VWAP — classifiers should handle None
 
         # Trend cleanliness score
         trend_cleanliness_score = _compute_trend_cleanliness(
@@ -146,6 +148,7 @@ class FeatureEngineer:
             atr_value=round(atr_value, 4),
             last_price=round(last_price, 4),
             current_vwap=round(current_vwap, 4),
+            earnings_flag=market.earnings_flag,
         )
 
 

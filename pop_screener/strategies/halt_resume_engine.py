@@ -134,7 +134,7 @@ class HaltResumeEngine:
         self, bars: List[OHLCVBar], avg_vol: float
     ) -> Optional[int]:
         """Return index of the most recent halt-like bar, or None."""
-        for i in range(len(bars) - 1, 0, -1):
+        for i in range(len(bars) - 1, -1, -1):  # include bar[0] (opening halts)
             b = bars[i]
             if b.open > 0:
                 bar_ret = abs(b.close / b.open - 1.0)

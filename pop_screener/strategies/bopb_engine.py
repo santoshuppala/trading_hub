@@ -64,12 +64,17 @@ class BOPBEngine:
         exits:   List[ExitSignal]  = []
 
         lookback = cfg.BOPB_LOOKBACK_BARS
+        # Extend lookback up to 3× default if data is available, to catch
+        # resistance levels outside the fixed window
+        max_lookback = min(lookback * 3, len(bars) - 3)
+        effective_lookback = max(lookback, max_lookback)
+
         # Need breakout history + at least one pullback bar + confirmation
         if len(bars) < lookback + 3:
             return entries, exits
 
         avg_vol     = statistics.mean(b.volume for b in bars)
-        prior_high  = max(b.high for b in bars[:lookback])
+        prior_high  = max(b.high for b in bars[:effective_lookback])
 
         # Find the most recent breakout bar
         breakout_idx = self._find_breakout(bars, prior_high, avg_vol, lookback)

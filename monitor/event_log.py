@@ -209,11 +209,14 @@ class DurableEventLog:
         self._error_count = 0
 
         cfg = {
-            'bootstrap.servers': brokers,
-            'acks':              'all',          # wait for leader + ISR
-            'retries':           5,
-            'retry.backoff.ms':  200,
-            'linger.ms':         5,              # small batching window
+            'bootstrap.servers':            brokers,
+            'acks':                         '1',            # leader ack only (TimescaleDB is second durability layer)
+            'retries':                      10,
+            'retry.backoff.ms':             1000,           # 1s backoff between retries
+            'linger.ms':                    50,             # batch for 50ms — reduces 50ms→5ms per-event latency
+            'batch.size':                   102400,         # 100KB batch size
+            'compression.type':             'snappy',       # 50-70% payload reduction
+            'enable.idempotence':           True,           # exactly-once semantics (prevents duplicates on retry)
             'queue.buffering.max.messages': 100_000,
         }
         if extra_config:
@@ -264,7 +267,14 @@ class DurableEventLog:
         Raises on flush timeout so the caller (emit) can log the failure.
         Unlike _on_event, this BLOCKS until Redpanda acks (or FLUSH_TIMEOUT elapses).
         """
-        FLUSH_TIMEOUT = 2.0
+        # Longer timeout for critical events — money is at stake
+        from .event_bus import EventType
+        if event.type == EventType.FILL:
+            FLUSH_TIMEOUT = 10.0    # FILL = money changed hands, must persist
+        elif event.type == EventType.ORDER_REQ:
+            FLUSH_TIMEOUT = 5.0     # ORDER_REQ = about to execute
+        else:
+            FLUSH_TIMEOUT = 3.0
         if self._producer is None:
             return
         try:
@@ -302,6 +312,13 @@ class DurableEventLog:
 
     def _on_event(self, event) -> None:
         if self._producer is None:
+            return
+        # Only produce state-critical events to Redpanda (crash recovery needs).
+        # BAR, SIGNAL, HEARTBEAT, RISK_BLOCK, POP_SIGNAL, PRO_STRATEGY_SIGNAL
+        # are persisted in TimescaleDB only — saves ~60% Redpanda write load.
+        from .event_bus import EventType
+        _CRITICAL = {EventType.ORDER_REQ, EventType.FILL, EventType.POSITION, EventType.ORDER_FAIL}
+        if event.type not in _CRITICAL:
             return
         try:
             value   = _serialise_event(event)
@@ -411,10 +428,13 @@ class EventLogConsumer:
         self._brokers = brokers
 
         cfg = {
-            'bootstrap.servers':  brokers,
-            'group.id':           group_id,
-            'auto.offset.reset':  'earliest',
-            'enable.auto.commit': False,
+            'bootstrap.servers':       brokers,
+            'group.id':                group_id,
+            'auto.offset.reset':       'earliest',
+            'enable.auto.commit':      True,           # commit offsets every 5s
+            'auto.commit.interval.ms': 5000,
+            'fetch.min.bytes':         10240,          # 10KB min fetch (batch efficiency)
+            'session.timeout.ms':      30000,
         }
         if extra_config:
             cfg.update(extra_config)

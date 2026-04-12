@@ -69,8 +69,8 @@ log = logging.getLogger(__name__)
 SLIPPAGE_PCT   = 0.0001   # 0.01% — slippage allowance added to ask for sizing
 MAX_SPREAD_PCT = 0.002    # 0.2%  — max bid/ask spread; wider → skip entry
 MIN_RVOL       = 2.0      # minimum relative volume for momentum confirmation
-RSI_LOW        = 50.0     # RSI must be >= RSI_LOW (bullish territory)
-RSI_HIGH       = 70.0     # RSI must be <= RSI_HIGH (not yet overbought)
+RSI_LOW        = 40.0     # RSI must be >= RSI_LOW (allow recovery trades)
+RSI_HIGH       = 75.0     # RSI must be <= RSI_HIGH (allow early momentum)
 
 
 class RiskEngine:
@@ -123,76 +123,91 @@ class RiskEngine:
     def _handle_buy(self, p: SignalPayload, event: Event) -> None:
         ticker = p.ticker
 
-        # 1. Max positions
-        if len(self._positions) >= self._max_positions:
+        # 0. Cross-layer dedup — reject if another layer already holds this ticker
+        from .position_registry import registry
+        if not registry.try_acquire(ticker, layer="vwap"):
             self._block(ticker, p.action,
-                        f"max positions reached ({self._max_positions})", event)
+                        f"held by another strategy layer ({registry.held_by(ticker)})", event)
             return
 
-        # 2. Cooldown
-        elapsed = time.time() - self._last_order_time.get(ticker, 0.0)
-        if elapsed < self._order_cooldown:
-            remaining = int(self._order_cooldown - elapsed)
-            self._block(ticker, p.action,
-                        f"cooldown active ({remaining}s remaining)", event)
-            return
+        # All checks after acquire must release on failure to prevent registry leak.
+        # Use _approved flag: only True if ORDER_REQ is emitted.
+        _approved = False
+        try:
+            # 1. Max positions
+            if len(self._positions) >= self._max_positions:
+                self._block(ticker, p.action,
+                            f"max positions reached ({self._max_positions})", event)
+                return
 
-        # 3. Reclaimed today
-        if ticker in self._reclaimed_today:
-            self._block(ticker, p.action,
-                        "already reclaimed today", event)
-            return
+            # 2. Cooldown
+            elapsed = time.time() - self._last_order_time.get(ticker, 0.0)
+            if elapsed < self._order_cooldown:
+                remaining = int(self._order_cooldown - elapsed)
+                self._block(ticker, p.action,
+                            f"cooldown active ({remaining}s remaining)", event)
+                return
 
-        # 4. RVOL
-        if p.rvol < MIN_RVOL:
-            self._block(ticker, p.action,
-                        f"RVOL too low ({p.rvol:.2f} < {MIN_RVOL})", event)
-            return
+            # 3. Reclaimed today
+            if ticker in self._reclaimed_today:
+                self._block(ticker, p.action,
+                            "already reclaimed today", event)
+                return
 
-        # 5. RSI range
-        if not (RSI_LOW <= p.rsi_value <= RSI_HIGH):
-            self._block(ticker, p.action,
-                        f"RSI out of bullish band ({p.rsi_value:.1f}, "
-                        f"need {RSI_LOW}–{RSI_HIGH})", event)
-            return
+            # 4. RVOL
+            if p.rvol < MIN_RVOL:
+                self._block(ticker, p.action,
+                            f"RVOL too low ({p.rvol:.2f} < {MIN_RVOL})", event)
+                return
 
-        # 6. Spread — fetch fresh Level-1 quote
-        spread_pct, ask_price = self._get_spread(ticker, p.ask_price)
-        if ask_price is None:
-            self._block(ticker, p.action,
-                        "live quote unavailable — cannot verify spread", event)
-            return
-        if spread_pct > MAX_SPREAD_PCT:
-            self._block(ticker, p.action,
-                        f"spread too wide ({spread_pct:.3%} > {MAX_SPREAD_PCT:.3%})",
-                        event)
-            return
+            # 5. RSI range
+            if not (RSI_LOW <= p.rsi_value <= RSI_HIGH):
+                self._block(ticker, p.action,
+                            f"RSI out of bullish band ({p.rsi_value:.1f}, "
+                            f"need {RSI_LOW}–{RSI_HIGH})", event)
+                return
 
-        # ── All checks passed — size and submit ──────────────────────────────
-        effective_entry = ask_price * (1 + SLIPPAGE_PCT)
-        qty = max(1, int(self._trade_budget / effective_entry))
+            # 6. Spread — fetch fresh Level-1 quote
+            spread_pct, ask_price = self._get_spread(ticker, p.ask_price)
+            if ask_price is None:
+                self._block(ticker, p.action,
+                            "live quote unavailable — cannot verify spread", event)
+                return
+            if spread_pct > MAX_SPREAD_PCT:
+                self._block(ticker, p.action,
+                            f"spread too wide ({spread_pct:.3%} > {MAX_SPREAD_PCT:.3%})",
+                            event)
+                return
 
-        log.info(
-            f"[RiskEngine] BUY approved: {ticker} "
-            f"qty={qty} ask=${ask_price:.2f} entry=${effective_entry:.2f} "
-            f"rvol={p.rvol:.1f}x rsi={p.rsi_value:.1f} spread={spread_pct:.3%}"
-        )
+            # ── All checks passed — size and submit ──────────────────────────
+            effective_entry = ask_price * (1 + SLIPPAGE_PCT)
+            qty = max(1, int(self._trade_budget / effective_entry))
 
-        self._bus.emit(Event(
-            type=EventType.ORDER_REQ,
-            payload=OrderRequestPayload(
-                ticker=ticker,
-                side='buy',
-                qty=qty,
-                price=effective_entry,
-                reason='VWAP reclaim',
-                needs_ask_refresh=p.needs_ask_refresh,
-                stop_price=p.stop_price,
-                target_price=p.target_price,
-                atr_value=p.atr_value,
-            ),
-            correlation_id=event.event_id,
-        ))
+            log.info(
+                f"[RiskEngine] BUY approved: {ticker} "
+                f"qty={qty} ask=${ask_price:.2f} entry=${effective_entry:.2f} "
+                f"rvol={p.rvol:.1f}x rsi={p.rsi_value:.1f} spread={spread_pct:.3%}"
+            )
+
+            self._bus.emit(Event(
+                type=EventType.ORDER_REQ,
+                payload=OrderRequestPayload(
+                    ticker=ticker,
+                    side='buy',
+                    qty=qty,
+                    price=effective_entry,
+                    reason='VWAP reclaim',
+                    needs_ask_refresh=p.needs_ask_refresh,
+                    stop_price=p.stop_price,
+                    target_price=p.target_price,
+                    atr_value=p.atr_value,
+                ),
+                correlation_id=event.event_id,
+            ))
+            _approved = True
+        finally:
+            if not _approved:
+                registry.release(ticker)
 
     # ── Sell pass-through ────────────────────────────────────────────────────
 

@@ -192,7 +192,10 @@ class RealTimeMonitor:
         self._sync_broker_positions(trading_client)
 
         # ── Event Bus ─────────────────────────────────────────────────────
-        self._bus = EventBus()
+        # durable_fail_fast=True ensures ORDER_REQ/FILL are NOT delivered to
+        # handlers if the Redpanda before-emit hook fails — prevents untracked
+        # order execution that would be invisible to CrashRecovery.
+        self._bus = EventBus(durable_fail_fast=True)
 
         # ── Engines (subscription order = handler priority) ────────────────
         #   1. EventLogger   — passive; subscribes last so it sees everything

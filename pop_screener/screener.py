@@ -113,24 +113,15 @@ class PopScreener:
         EARNINGS: earnings-driven gap move.
 
         Conditions (ALL must be true):
-          - earnings_flag == True  (carried in MarketDataSlice, reflected via
-            features.gap_size non-zero and external context; we proxy via gap_size
-            magnitude here since EngineeredFeatures doesn't carry the boolean
-            directly — real adapters should inject it)
+          - earnings_flag == True  (now propagated from MarketDataSlice through
+            EngineeredFeatures)
           - abs(gap_size) > GAP_SIZE_EARNINGS_MIN
-
-        Note: EngineeredFeatures does not include earnings_flag directly.  The
-        MarketDataSlice.earnings_flag is consumed in features.py but not forwarded
-        to EngineeredFeatures because it's a boolean label, not a continuous score.
-        The screener therefore relies on the feature-engineering layer to elevate
-        gap_size when earnings_flag is True (future enhancement: add earnings_flag
-        to EngineeredFeatures and check it here explicitly).
+          - rvol > 2.0 (unusual volume confirms the move)
         """
-        # For now: large gap with strong sentiment is the proxy for earnings pop
         if (
-            abs(f.gap_size) > cfg.GAP_SIZE_EARNINGS_MIN
-            and f.sentiment_delta > 0.10   # any positive sentiment shift
-            and f.rvol > 2.0               # unusual volume confirms the move
+            f.earnings_flag
+            and abs(f.gap_size) > cfg.GAP_SIZE_EARNINGS_MIN
+            and f.rvol > 2.0
         ):
             return PopCandidate(
                 symbol=f.symbol,

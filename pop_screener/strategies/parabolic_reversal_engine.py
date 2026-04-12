@@ -78,8 +78,11 @@ class ParabolicReversalEngine:
             bar_range = b.high - b.low
             if bar_range <= 0:
                 continue
-            closes_near_high = (b.high - b.close) / bar_range < 0.25
-            if bar_range > cfg.EXTENDED_RANGE_MULT * atr and closes_near_high:
+            # Exhaustion = candle closes near its LOW (failed rally / bearish rejection)
+            # A rally that is petering out produces candles with upper wicks and
+            # closes in the bottom 25% of the bar range.
+            closes_near_low = (b.close - b.low) / bar_range < 0.25
+            if bar_range > cfg.EXTENDED_RANGE_MULT * atr and closes_near_low:
                 n_extended += 1
 
         if n_extended < cfg.N_EXTENDED_BARS:

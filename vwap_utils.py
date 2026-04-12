@@ -84,22 +84,35 @@ def detect_vwap_breakdown(closes, vwaps, rsi):
     """
     VWAP breakdown exit detector.
 
-    Requires genuine weakness — not a single noisy bar crossing below VWAP.
-    Current close must be below VWAP, confirmed by either:
-      (a) previous close also below VWAP  — 2-bar confirmation
-      (b) RSI < 50                        — momentum already weak
+    Requires genuine weakness — not just a single noisy bar crossing below VWAP.
+    Current close must be below VWAP, confirmed by EITHER:
+      (a) 3 consecutive bars below VWAP  — strong structural breakdown
+      (b) 2 consecutive bars + RSI < 45  — momentum confirmation
 
     Parameters
     ----------
-    closes, vwaps : list-like, oldest first, length >= 2
+    closes, vwaps : list-like, oldest first, length >= 3
     rsi           : float — current RSI value
 
     Returns
     -------
     bool
     """
-    if len(closes) < 2 or len(vwaps) < 2:
+    if len(closes) < 3 or len(vwaps) < 3:
         return False
-    price_below_vwap = closes[-1] < vwaps[-1]
-    prev_below_vwap  = closes[-2] < vwaps[-2]
-    return price_below_vwap and (prev_below_vwap or rsi < 50)
+    cur_below  = closes[-1] < vwaps[-1]
+    prev_below = closes[-2] < vwaps[-2]
+    prev2_below = closes[-3] < vwaps[-3]
+
+    if not cur_below:
+        return False
+
+    # 3-bar confirmation: strong structural breakdown
+    if prev_below and prev2_below:
+        return True
+
+    # 2-bar + weak momentum: RSI confirms selling pressure
+    if prev_below and rsi < 45:
+        return True
+
+    return False

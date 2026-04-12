@@ -6,14 +6,14 @@ logic.  No ML, no randomness — same inputs always produce the same assignment.
 
 Classification logic per pop_reason
 -------------------------------------
-  MODERATE_NEWS   → primary=VWAP_RECLAIM; fallback EMA_TREND_CONTINUATION
+  MODERATE_NEWS    → primary=VWAP_RECLAIM (if compat>=0.60); else EMA_TREND
   HIGH_IMPACT_NEWS → primary=ORB; secondary adds HALT or PARABOLIC if extreme
-  SENTIMENT_POP   → primary=VWAP_RECLAIM or EMA_TREND_CONTINUATION; fallback BOPB
-  UNUSUAL_VOLUME  → primary=VWAP_RECLAIM or EMA_TREND_CONTINUATION or BOPB
-  LOW_FLOAT       → primary=HALT_RESUME_BREAKOUT or PARABOLIC_REVERSAL
-                     VWAP_RECLAIM explicitly disallowed (vwap_compat=0)
-  EARNINGS        → primary=VWAP_RECLAIM (small gap) or ORB (large gap)
-                     secondary EMA_TREND if trend is clean
+  SENTIMENT_POP    → primary=VWAP_RECLAIM (if compat>=0.60); else EMA_TREND; fallback BOPB
+  UNUSUAL_VOLUME   → primary=VWAP_RECLAIM (if compat>=0.60 + clean); else EMA_TREND or BOPB
+  LOW_FLOAT        → primary=HALT_RESUME_BREAKOUT or PARABOLIC_REVERSAL
+  EARNINGS         → primary=VWAP_RECLAIM (small gap) or ORB (large gap)
+
+Note: VWAP_RECLAIM delegates to the T4 SignalAnalyzer (monitor/signals.py) via adapter.
 """
 from __future__ import annotations
 
@@ -63,32 +63,28 @@ class StrategyClassifier:
 
     def _classify_moderate_news(self, c: PopCandidate) -> StrategyAssignment:
         """
-        Moderate news → VWAP_RECLAIM if VWAP compatible; else EMA_TREND.
-
-        VWAP compatibility is high when:
-          - vwap_distance is small (price near VWAP)
-          - trend is clean
-          - RVOL is in the institutional-participation band (1.5–5×)
+        Moderate news → VWAP_RECLAIM (delegates to T4) when VWAP-compatible;
+        else EMA_TREND fallback.
         """
         f = c.features
         vwap_compat = _vwap_compat_score(f)
         clean       = f.trend_cleanliness_score
 
-        if vwap_compat >= 0.50 and clean >= cfg.TREND_CLEAN_VWAP_MIN:
+        if vwap_compat >= 0.60 and clean >= cfg.TREND_CLEAN_VWAP_MIN:
             primary     = StrategyType.VWAP_RECLAIM
             secondaries = [StrategyType.EMA_TREND_CONTINUATION]
             confidence  = _blend(vwap_compat, clean, f.rvol / 5.0)
             notes = (
                 f"Moderate news pop; VWAP compat={vwap_compat:.2f}, "
-                f"trend cleanliness={clean:.2f} → VWAP_RECLAIM preferred"
+                f"trend={clean:.2f} → VWAP_RECLAIM (T4 adapter)"
             )
         else:
             primary     = StrategyType.EMA_TREND_CONTINUATION
             secondaries = [StrategyType.BREAKOUT_PULLBACK]
-            vwap_compat = min(vwap_compat, 0.40)   # cap compat when VWAP not preferred
+            vwap_compat = min(vwap_compat, 0.40)
             confidence  = _blend(clean, f.rvol / 5.0, 0.5)
             notes = (
-                f"Moderate news pop; VWAP compat={vwap_compat:.2f} or trend not clean "
+                f"Moderate news pop; VWAP compat low ({vwap_compat:.2f}) or trend not clean "
                 f"({clean:.2f}) → EMA_TREND_CONTINUATION"
             )
 
@@ -155,19 +151,19 @@ class StrategyClassifier:
             clean >= cfg.TREND_CLEAN_EMA_MIN
             and abs(f.vwap_distance) < cfg.VWAP_DISTANCE_EMA_MAX
         ):
-            if vwap_compat >= 0.50:
+            if vwap_compat >= 0.60:
                 primary     = StrategyType.VWAP_RECLAIM
                 secondaries = [StrategyType.EMA_TREND_CONTINUATION]
                 notes = (
                     f"Sentiment pop; VWAP compat={vwap_compat:.2f}, "
-                    f"clean trend → VWAP_RECLAIM"
+                    f"clean trend → VWAP_RECLAIM (T4 adapter)"
                 )
             else:
                 primary     = StrategyType.EMA_TREND_CONTINUATION
                 secondaries = [StrategyType.BREAKOUT_PULLBACK]
                 notes = (
-                    f"Sentiment pop; clean trend but low VWAP compat → "
-                    f"EMA_TREND_CONTINUATION"
+                    f"Sentiment pop; clean trend but low VWAP compat "
+                    f"→ EMA_TREND_CONTINUATION"
                 )
         else:
             primary     = StrategyType.EMA_TREND_CONTINUATION
@@ -201,12 +197,12 @@ class StrategyClassifier:
         vwap_compat = _vwap_compat_score(f)
         clean       = f.trend_cleanliness_score
 
-        if clean >= cfg.TREND_CLEAN_VWAP_MIN and vwap_compat >= 0.50:
+        if clean >= cfg.TREND_CLEAN_VWAP_MIN and vwap_compat >= 0.60:
             primary     = StrategyType.VWAP_RECLAIM
             secondaries = [StrategyType.EMA_TREND_CONTINUATION]
             notes = (
                 f"Unusual volume ({f.rvol:.1f}×); clean trend + VWAP respected "
-                f"→ VWAP_RECLAIM"
+                f"→ VWAP_RECLAIM (T4 adapter)"
             )
         elif clean >= cfg.TREND_CLEAN_EMA_MIN:
             primary     = StrategyType.EMA_TREND_CONTINUATION
@@ -241,8 +237,6 @@ class StrategyClassifier:
     def _classify_low_float(self, c: PopCandidate) -> StrategyAssignment:
         """
         Low-float pop → HALT_RESUME_BREAKOUT primary; PARABOLIC_REVERSAL secondary.
-        VWAP_RECLAIM explicitly disallowed — low-float stocks have erratic VWAP
-        behaviour that makes VWAP signals unreliable.
         """
         f = c.features
 
@@ -290,7 +284,7 @@ class StrategyClassifier:
             primary = StrategyType.VWAP_RECLAIM
             notes = (
                 f"Earnings pop; gap={f.gap_size:.1%} < "
-                f"{cfg.GAP_SIZE_EARNINGS_VWAP_MAX:.0%} → VWAP_RECLAIM"
+                f"{cfg.GAP_SIZE_EARNINGS_VWAP_MAX:.0%} → VWAP_RECLAIM (T4 adapter)"
             )
         else:
             primary = StrategyType.ORB

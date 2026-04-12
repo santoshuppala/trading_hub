@@ -59,6 +59,7 @@ STRATEGY_PARAMS = {
 
 # ── Risk / order settings ──────────────────────────────────────────────────────
 MAX_POSITIONS  = 5
+GLOBAL_MAX_POSITIONS = int(os.getenv('GLOBAL_MAX_POSITIONS', 8))  # aggregate limit across ALL layers
 ORDER_COOLDOWN = 300   # seconds between orders on same ticker
 TRADE_BUDGET   = int(os.getenv('TRADE_BUDGET', 1000))  # dollars allocated per trade
 OPEN_COST      = 0.0   # commission-free (Alpaca); slippage handled in OrderManager
@@ -90,6 +91,16 @@ POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds 
 PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))    # max concurrent pro positions
 PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))   # dollars allocated per pro trade
 PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))  # seconds cooldown per ticker
+
+# ── External data APIs ────────────────────────────────────────────────────────
+BENZINGA_API_KEY    = os.getenv('BENZINGA_API_KEY') or os.getenv('BENZENGA_API_KEY', '')
+STOCKTWITS_TOKEN    = os.getenv('STOCKTWITS_TOKEN', '')  # optional — public API works without token
+
+# ── Database (TimescaleDB) ────────────────────────────────────────────────────
+# Set DB_ENABLED=false to run without the database (all events still flow normally,
+# just not persisted to TimescaleDB).
+DB_ENABLED     = os.getenv('DB_ENABLED', 'true').lower() == 'true'
+DATABASE_URL   = os.getenv('DATABASE_URL', 'postgresql://trading:trading_secret@localhost:5432/trading_hub')
 
 # ── Data source ────────────────────────────────────────────────────────────────
 # 'tradier' — Tradier REST API (recommended; commission-free data, no SDK)

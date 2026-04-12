@@ -73,22 +73,34 @@ log = logging.getLogger(__name__)
 SIGNAL_TTL_SEC = 120.0   # discard a cached buy signal after 2 minutes
 
 
+_PATCH_RETRY_MAX = 5       # max retries for deferred patches
+_PATCH_RETRY_SEC = 0.5     # seconds between retries
+
+
 class ExecutionFeedback:
     """
     Patches freshly-opened positions with strategy-computed stop/target/ATR.
 
     Thread-safety: handlers run on the event bus thread (same thread as all
     other handlers in synchronous mode).  No extra lock is needed.
+
+    Deferred patching: if the FILL arrives before PositionManager has created
+    the position dict entry, the patch is queued in ``_deferred`` and retried
+    on subsequent FILL, POSITION, or BAR events (up to PATCH_RETRY_MAX times).
     """
 
     def __init__(self, bus: EventBus, positions: dict):
         self._positions = positions
         # {ticker: (SignalPayload, monotonic_timestamp)}
         self._pending: Dict[str, Tuple[SignalPayload, float]] = {}
+        # {ticker: (SignalPayload, retry_count)} — patches waiting for position to exist
+        self._deferred: Dict[str, Tuple[SignalPayload, int]] = {}
 
         bus.subscribe(EventType.SIGNAL,     self._on_signal)
         bus.subscribe(EventType.FILL,       self._on_fill)
         bus.subscribe(EventType.ORDER_FAIL, self._on_order_fail)
+        bus.subscribe(EventType.POSITION,   self._on_position)
+        bus.subscribe(EventType.BAR,        self._flush_deferred)
 
     # ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -120,25 +132,13 @@ class ExecutionFeedback:
             return
 
         sig, _ = entry
-        pos = self._positions.get(ticker)
-        if pos is None:
-            log.warning(
-                f"[ExecFeedback] Fill for {ticker} but position not yet in dict "
-                f"(PositionManager may not have processed the event yet)."
+        if not self._try_patch(ticker, sig):
+            # Position not yet created — defer for retry on next POSITION/BAR event
+            self._deferred[ticker] = (sig, 0)
+            log.info(
+                f"[ExecFeedback] Deferred patch for {ticker} "
+                f"(position not yet in dict — will retry on POSITION event)"
             )
-            return
-
-        # Patch the four strategy-derived fields
-        pos['stop_price']   = sig.stop_price
-        pos['target_price'] = sig.target_price
-        pos['half_target']  = sig.half_target
-        pos['atr_value']    = sig.atr_value
-
-        log.info(
-            f"[ExecFeedback] Patched {ticker}: "
-            f"stop=${sig.stop_price:.2f} target=${sig.target_price:.2f} "
-            f"half=${sig.half_target:.2f} atr={sig.atr_value:.4f}"
-        )
 
     def _on_order_fail(self, event: Event) -> None:
         p: OrderFailPayload = event.payload
@@ -158,8 +158,73 @@ class ExecutionFeedback:
             log.debug(f"[ExecFeedback] Evicted stale pending signal for {ticker}.")
             del self._pending[ticker]
 
+    # ── Deferred patch helpers ───────────────────────────────────────────────
+
+    def _try_patch(self, ticker: str, sig: SignalPayload) -> bool:
+        """Apply strategy stop/target/ATR to position dict. Returns True if successful.
+
+        Guards against patching a DIFFERENT position that was opened after the
+        original closed (same ticker, different trade).  Compares signal price
+        against position entry price — if they diverge by more than 2%, the
+        deferred patch is stale and is dropped.
+        """
+        pos = self._positions.get(ticker)
+        if pos is None:
+            return False
+
+        # Identity check: reject if position entry price diverges from signal price
+        entry = pos.get('entry_price', 0)
+        signal_price = sig.current_price
+        if entry > 0 and signal_price > 0:
+            divergence = abs(entry - signal_price) / signal_price
+            if divergence > 0.02:
+                log.warning(
+                    f"[ExecFeedback] Dropping stale deferred patch for {ticker}: "
+                    f"position entry=${entry:.2f} vs signal price=${signal_price:.2f} "
+                    f"(divergence {divergence:.1%} > 2%%)"
+                )
+                return True   # return True to remove from deferred queue
+
+        pos['stop_price']   = sig.stop_price
+        pos['target_price'] = sig.target_price
+        pos['half_target']  = sig.half_target
+        pos['atr_value']    = sig.atr_value
+        log.info(
+            f"[ExecFeedback] Patched {ticker}: "
+            f"stop=${sig.stop_price:.2f} target=${sig.target_price:.2f} "
+            f"half=${sig.half_target:.2f} atr={sig.atr_value:.4f}"
+        )
+        return True
+
+    def _on_position(self, event: Event) -> None:
+        """Retry deferred patches when a POSITION event arrives (position now exists)."""
+        self._flush_deferred(event)
+
+    def _flush_deferred(self, event: Event = None) -> None:
+        """Attempt to apply all deferred patches. Drop after max retries."""
+        if not self._deferred:
+            return
+        resolved = []
+        for ticker, (sig, retries) in self._deferred.items():
+            if self._try_patch(ticker, sig):
+                resolved.append(ticker)
+            elif retries >= _PATCH_RETRY_MAX:
+                log.error(
+                    f"[ExecFeedback] Gave up patching {ticker} after {retries} retries — "
+                    f"position will use placeholder stops!"
+                )
+                resolved.append(ticker)
+            else:
+                self._deferred[ticker] = (sig, retries + 1)
+        for ticker in resolved:
+            del self._deferred[ticker]
+
     # ── Debug helper ──────────────────────────────────────────────────────────
 
     def pending_tickers(self) -> list:
         """Return list of tickers with cached buy signals awaiting fill."""
         return list(self._pending.keys())
+
+    def deferred_tickers(self) -> list:
+        """Return list of tickers with deferred patches awaiting position creation."""
+        return list(self._deferred.keys())

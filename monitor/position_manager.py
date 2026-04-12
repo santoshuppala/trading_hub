@@ -197,7 +197,8 @@ class PositionManager:
         if remaining > 0 and reason == 'partial_sell':
             pos['quantity']     = remaining
             pos['partial_done'] = True
-            pos['stop_price']   = entry_price   # move stop to breakeven
+            # Move stop to breakeven only if it's currently below entry (don't lower a trailing stop)
+            pos['stop_price']   = max(pos.get('stop_price', 0), entry_price)
 
             self._trade_log.append(trade)
             send_alert(
@@ -238,6 +239,10 @@ class PositionManager:
         del self._positions[ticker]
         import time as _time
         self._last_order_time[ticker] = _time.time()
+
+        # Release cross-layer position lock
+        from .position_registry import registry
+        registry.release(ticker)
 
         self._trade_log.append(trade)
         send_alert(

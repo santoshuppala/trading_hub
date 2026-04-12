@@ -163,6 +163,8 @@ class AlpacaBroker(BaseBroker):
                 self._bus.emit(Event(EventType.FILL, FillPayload(
                     ticker=p.ticker, side='buy', qty=filled_qty,
                     fill_price=avg_price, order_id=order_id, reason=p.reason,
+                    stop_price=p.stop_price, target_price=p.target_price,
+                    atr_value=p.atr_value,
                 )))
                 return
 
@@ -264,6 +266,8 @@ class PaperBroker(BaseBroker):
         self._bus.emit(Event(EventType.FILL, FillPayload(
             ticker=p.ticker, side='buy', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
+            stop_price=p.stop_price, target_price=p.target_price,
+            atr_value=p.atr_value,
         )))
 
     def _execute_sell(self, p: OrderRequestPayload) -> None:

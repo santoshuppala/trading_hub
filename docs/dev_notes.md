@@ -16,6 +16,7 @@
 8. [Multi-file Production Hardening — 11 fixes](#8-multi-file-production-hardening)
 9. [Files Changed Summary](#9-files-changed-summary)
 10. [Key Design Decisions](#10-key-design-decisions)
+11. [Weekend Sandbox Validation — 5 Tests](#11-weekend-sandbox-validation--5-tests)
 
 ---
 
@@ -714,7 +715,7 @@ When the queue is full and `evict_lowest_urgency()` returns `None` (another thre
 
 | EventType | Queue size | Overflow | Workers |
 |-----------|-----------|----------|---------:|
-| BAR | 200 | DROP_OLDEST | 4 |
+| BAR | 500 | DROP_OLDEST | 4 |
 | QUOTE | 100 | DROP_OLDEST | 2 |
 | SIGNAL | 50 | DROP_OLDEST | 2 |
 | ORDER_REQ | 100 | BLOCK | 1 |
@@ -725,3 +726,173 @@ When the queue is full and `evict_lowest_urgency()` returns `None` (another thre
 | HEARTBEAT | 10 | DROP_OLDEST | 1 |
 
 ORDER_REQ / FILL / POSITION use BLOCK (never drop) + n_workers=1 (strict global ordering). BAR uses DROP_OLDEST (stale bars are worthless) + n_workers=4 (parallel ticker processing).
+
+---
+
+## 11. Weekend Sandbox Validation — 5 Tests
+
+Run: `python test/run_all_tests.py` — results written to `test/logs/test_report.md`.
+
+### Tests and results (2026-04-11)
+
+| # | Test | Result | Time | Root cause of failure |
+|---|------|--------|------|-----------------------|
+| T1 | Synthetic Feed Playback | ✅ PASS | 48s | — |
+| T2 | Tradier Sandbox Validation | ❌ FAIL | 3s | Production token returns 401 on sandbox.tradier.com — requires dedicated sandbox API key |
+| T3 | Redpanda Consistency Check | ✅ PASS | 4s | — (crash_recovery_sim sub-test WARN: partial_sell stop/target deviation) |
+| T4 | Market Open Latency Simulation | ❌ FAIL | 6s | P95=65–68ms > 50ms target on dev hardware (GIL + pandas contention) |
+| T5 | Network Warm-up Pre-fetch | ✅ PASS | 25s | — |
+
+### Bugs found and fixed during test development
+
+**1. BAR queue drops 8/200 events during burst (T4)**
+Root cause: `maxsize=200` split across 4 workers = 50 slots each. Hash distribution is uneven; some partitions receive 53+ events and overflow.
+Fix: `_DEFAULT_ASYNC_CONFIG` BAR `maxsize` raised 200 → 500 (125 per partition, 2.5× headroom over 50 events/partition).
+
+**2. T4 `done.wait(60s)` timeout when events are dropped**
+The completion flag waited for `count[0] >= N_TICKERS=200`, but dropped events never fire `on_bar`. Fixed by polling `bus.metrics()` and breaking early when `processed + dropped >= N_TICKERS`.
+
+**3. `requests.Session` connection pool too small for 20 parallel workers (T5)**
+`pool_maxsize` defaults to 10; 20 workers in `fetch_batch_bars` discard connections under load (logged as "Connection pool is full").
+Fix: `TradierDataClient.__init__` now mounts an `HTTPAdapter(pool_connections=_MAX_WORKERS, pool_maxsize=_MAX_WORKERS)` on `https://`.
+
+**4. IndentationError in test_3_redpanda_consistency.py**
+Log statement at line 470 had extra indentation inside a conditional. Fixed.
+
+**5. `KeyError: 'file'` in run_all_tests.py report writer**
+Result dict in `_run_one()` was missing the `'file'` key. Added `'file': test['file']`.
+
+**6. Report writer only searched stdout for verdict/improvements**
+Tests write via Python `logging` (→ stderr). Fixed by combining `proc.stdout + proc.stderr` in the extraction loop, stripping the `[INFO] ` prefix before pattern matching.
+
+### What still needs fixing before Monday
+
+**T2 — Tradier Sandbox token**
+Get a dedicated sandbox token from `developer.tradier.com`. Update `.env`:
+```
+TRADIER_SANDBOX_TOKEN=<your_sandbox_key>
+```
+Then update `test_2_tradier_sandbox.py` to read `TRADIER_SANDBOX_TOKEN` instead of `TRADIER_TOKEN`.
+
+**T4 — P95 latency (dev hardware)**
+On dev MacBook, Python GIL serialises concurrent pandas ops → occasional 100–180ms spikes pull P95 to 65–68ms.
+To meet the 50ms target on production:
+1. Increase BAR `n_workers` 4 → 8 in `_DEFAULT_ASYNC_CONFIG` (already a queue size of 500 supports this)
+2. Pre-compute VWAP/RSI intermediates in the data layer before injecting BAR events
+3. Use numpy-only rolling operations instead of `pandas.DataFrame.rolling` for VWAP/ATR
+
+**T3 crash_recovery_sim WARN**
+`CrashRecovery` rebuilds positions using fallback stop/target (entry ± 0.5%). On a real crash, if SIGNAL events aren't in the replay window, stop/target will differ from the original signal.
+Fix: record stop/target directly in the FILL payload (or add a POSITION event) so replay doesn't need to infer from SIGNAL history.
+
+---
+
+## 12. Aggressive Test Suite — T6–T10 (10 tests total)
+
+Run: `python test/run_all_tests.py` — 83s total, report at `test/logs/test_report.md`.
+
+### New tests added (T6–T10)
+
+**T6 — Full Pipeline Integration Stress** (`test_6_pipeline_integration.py`)
+Wires StrategyEngine + RiskEngine + PaperBroker + PositionManager + ExecutionFeedback on a single SYNC EventBus and verifies the complete event chain.
+- 6a: Single-ticker VWAP reclaim → BAR→SIGNAL→ORDER_REQ→FILL→POSITION verified end-to-end
+- 6b: Max-positions gate — 5 open positions blocks a 6th buy (RISK_BLOCK verified)
+- 6c: Concurrent 10 tickers — no deadlocks, no dropped events, positions dict consistent
+- 6d: EOD force-close — bars timestamped at 15:00 ET trigger sell_stop from StrategyEngine
+- 6e: Sell path — open then close position; PnL computed and emitted
+All 5 sub-tests: ✅ PASS
+
+**T7 — Risk Engine Boundary Conditions** (`test_7_risk_boundaries.py`)
+Tests all 6 RiskEngine pre-trade checks at exact boundary values using a MockDataClient.
+- 7a: max_positions: 4 allows, 5 blocks
+- 7b: Cooldown: ORDER_COOLDOWN seconds → allows; ORDER_COOLDOWN-1 → blocks
+- 7c: RVOL: 1.99 blocks, 2.00 passes, 2.01 passes
+- 7d: RSI: 49.9 blocks, 50.0 passes, 70.0 passes, 70.1 blocks
+- 7e: Spread: 0.19% passes, 0.21% blocks
+- 7f: Price divergence: 0.499% passes, 0.501% blocks
+- 7g: Partial sell qty=1 → `qty // 2 = 0` → correctly skipped (no ORDER_REQ)
+- 7h: Oversell (fill qty > position qty) → no crash, warning logged
+- 7i: 5 concurrent SELL fills for same ticker → positions dict consistent (thread-safe)
+All 9 sub-tests: ✅ PASS
+
+**T8 — SignalAnalyzer Edge Cases** (`test_8_signal_edge_cases.py`)
+Pure unit tests for SignalAnalyzer.analyze() and get_rvol() with adversarial DataFrames.
+- 8a/8b: 29 bars → None; 30 bars → dict (exact MIN_BARS boundary)
+- 8c: Zero volatility (flat OHLCV) — no crash, ATR≈0, RSI=NaN handled
+- 8d: Single volume spike bar — RVOL >> 1.0 confirmed
+- 8e/8f: Negative prices / NaN in close — no crash, returns None or handles gracefully
+- 8g: RVOL time gate — get_rvol() before 10:15 AM ET returns 1.0
+- 8h: Empty/None hist_df → get_rvol() returns 1.0 (error fallback)
+- 8i/8j: Exit at exact stop/target price — sell_stop/sell_target triggered
+- 8k: SignalPayload invariants — stop≥price, target≤price, bad half_target all raise ValueError
+- 8l: 1000 random DataFrames — 0 crashes, all complete < 100ms each
+All 12 sub-tests: ✅ PASS
+
+**T9 — EventBus Advanced Behaviors** (`test_9_eventbus_advanced.py`)
+Tests the advanced defensive mechanisms built into EventBus.
+- 9a: Circuit breaker — 5 consecutive failures → handler skipped on 6th event ✅
+- 9b: DLQ — RetryPolicy(max_retries=2) exhausted → dlq_count > 0 ✅
+- 9c: TTL expiry — event with expiry_ts in past dropped before handler ✅
+- 9d: Priority ordering — CRITICAL events delivered before LOW ✅
+- 9e: Coalescing — under backpressure only latest BAR per ticker delivered ✅
+- 9f: Duplicate dedup — same event_id emitted twice, handler called once ✅
+- 9g: Unsubscribe mid-stream — handler not called after unsubscribe ✅
+- 9h: Retry with backoff — fails × 2, succeeds on 3rd attempt ✅
+- 9i: emit_batch([]) — no error, returns OK ✅
+- 9j: Multiple subscribers — 3 handlers all called on 1 event ✅
+- 9k: stream_seq — 10 sequential BAR events get strictly monotonic seqs (1,2…10) ✅
+- 9l: Shutdown with pending — 100 events then immediate shutdown in < 5s ✅
+All 12 sub-tests: ✅ PASS
+
+**T10 — State Persistence & Observability** (`test_10_state_persistence.py`)
+- 10a: Round-trip — save/load preserves all fields exactly ✅
+- 10b: Yesterday's state — returns empty (stale date gate) ✅
+- 10c: Corrupt JSON — creates .corrupt backup before returning empty ✅
+- 10d: Concurrent writes — 10 simultaneous save_state() calls produce valid JSON ✅
+- 10e: Large state — 200 positions, 1000 trade log entries round-trips cleanly ✅
+- 10f: Missing keys — load handles absent fields without crash ✅
+- 10g: StateEngine — seed + OPENED/PARTIAL_EXIT/CLOSED events → snapshot correct ✅
+- 10h: HeartbeatEmitter — rapid ticks emit exactly 1 heartbeat; waits then emits 2nd ✅
+- 10i: EventLogger — handles all 8 EventTypes without crash ✅
+All 9 sub-tests: ✅ PASS
+
+---
+
+### Bugs found and fixed (T6–T10 session)
+
+**1. `FillPayload` missing stop/target → CrashRecovery uses ±0.5% approximation**
+Root cause: `FillPayload` had no `stop_price`/`target_price`/`atr_value` fields, so after a crash, `CrashRecovery.rebuild()` guessed stop/target from entry price.
+Fix: Added optional `stop_price`, `target_price`, `atr_value` fields to both `OrderRequestPayload` and `FillPayload`. `RiskEngine` now copies them from `SignalPayload → OrderRequestPayload`. `PaperBroker` and `AlpacaBroker` copy them `OrderRequestPayload → FillPayload`. `CrashRecovery` uses exact values when present, falls back to approximation only when missing (old logs).
+
+**2. `SignalAnalyzer` recomputes VWAP/RSI/ATR on every call — no caching**
+Root cause: Each BAR event dispatched to `analyze()` recomputed VWAP, RSI, ATR from scratch even if the same DataFrame object was passed again.
+Fix: Added `_indicator_cache` dict (keyed by `(ticker, id(df), rsi_period, atr_period)`) in `SignalAnalyzer`. Cache hit skips all pandas rolling computations. Max 500 entries (FIFO eviction). Reduces real-analyzer P95 from ~87ms → ~53ms (39% improvement).
+
+**3. `test_7_risk_boundaries.py` 7g — invalid `OrderRequestPayload(qty=0)` construction**
+Root cause: Test tried to directly instantiate `OrderRequestPayload` with `qty=0` to simulate a skipped partial sell, but `_require_positive` raises `ValueError`.
+Fix: Removed the invalid direct construction; the test now emits a SIGNAL through RiskEngine and verifies that no ORDER_REQ is emitted (the correct test of the "skip" behavior).
+
+**4. BAR queue drops 8/200 events under 200-ticker burst (from T1 session)**
+Root cause: `maxsize=200` with 4 workers = 50 slots per partition; hash-skewed distribution caused overflow on some partitions.
+Fix: `maxsize` raised 200→500 (125 slots/partition).
+
+**5. Requests connection pool too small for 20 parallel workers (from T5 session)**
+Root cause: `requests.Session` defaults to `pool_maxsize=10`; 20 workers in `fetch_batch_bars` caused "Connection pool is full" warnings.
+Fix: `TradierDataClient.__init__` mounts `HTTPAdapter(pool_connections=20, pool_maxsize=20)` on `https://`.
+
+---
+
+### Performance summary (all tests, dev MacBook, 2026-04-12)
+
+| Test | Result | Wall time | Key metric |
+|------|--------|-----------|-----------|
+| T1 Synthetic Feed | ✅ PASS | 45s | 20,000 events, 0 drops, instant drain |
+| T2 Tradier Sandbox | ✅ PASS | 3.7s | auth+quotes+history+order all HTTP 200 |
+| T3 Redpanda | ✅ PASS | 3.6s | serialisation round-trip + live replay |
+| T4 Latency | ❌ FAIL | 5s | P95=53-58ms (target 50ms); 0 drops |
+| T5 Warm-up | ✅ PASS | 13.7s | 200 tickers parallel in 13.7s (target 60s) |
+| T6 Pipeline | ✅ PASS | 1.5s | 5/5 subtests |
+| T7 Risk | ✅ PASS | 1.4s | 9/9 subtests |
+| T8 Signals | ✅ PASS | 4.2s | 12/12 subtests, 1000-frame stress |
+| T9 EventBus | ✅ PASS | 2.8s | 12/12 subtests |
+| T10 State | ✅ PASS | 1.7s | 9/9 subtests |

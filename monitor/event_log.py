@@ -642,18 +642,24 @@ class CrashRecovery:
                 order_id   = p.get('order_id', '')
 
                 if side == 'buy' and ticker:
+                    # Use exact stop/target carried in FillPayload if present;
+                    # fall back to entry_price approximations only when missing.
+                    raw_stop   = p.get('stop_price')
+                    raw_target = p.get('target_price')
+                    raw_atr    = p.get('atr_value')
+                    stop_price   = float(raw_stop)   if raw_stop   else fill_price * 0.995
+                    target_price = float(raw_target) if raw_target else fill_price * 1.01
+                    half_target  = (fill_price + target_price) / 2 if raw_target else fill_price * 1.005
                     positions[ticker] = {
                         'entry_price':  fill_price,
                         'entry_time':   rec.get('timestamp', '')[:8],
                         'quantity':     qty,
                         'partial_done': False,
                         'order_id':     order_id,
-                        # stop/target will be patched by ExecutionFeedback
-                        # if SIGNAL events are also replayed, or left as fallback
-                        'stop_price':   fill_price * 0.995,
-                        'target_price': fill_price * 1.01,
-                        'half_target':  fill_price * 1.005,
-                        'atr_value':    None,
+                        'stop_price':   stop_price,
+                        'target_price': target_price,
+                        'half_target':  half_target,
+                        'atr_value':    float(raw_atr) if raw_atr else None,
                     }
                 elif side == 'sell' and ticker:
                     if ticker in positions:

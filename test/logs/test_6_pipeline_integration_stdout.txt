@@ -1,0 +1,101 @@
+=== STDOUT ===
+2026-04-11 22:13:57,916 INFO     test_6: === 6a: Single ticker VWAP reclaim ===
+2026-04-11 22:13:57,916 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:13:57,916 DEBUG    monitor.event_bus: Subscribed StrategyEngine._on_bar → BAR priority=0
+2026-04-11 22:13:57,916 DEBUG    monitor.event_bus: Subscribed RiskEngine._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,916 DEBUG    monitor.event_bus: Subscribed BaseBroker._on_order_request → ORDER_REQ priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed PositionManager._on_fill → FILL priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_fill → FILL priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_order_fail → ORDER_FAIL priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed EventCollector._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed EventCollector._on_order_req → ORDER_REQ priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed EventCollector._on_fill → FILL priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed EventCollector._on_position → POSITION priority=0
+2026-04-11 22:13:57,917 DEBUG    monitor.event_bus: Subscribed EventCollector._on_risk_block → RISK_BLOCK priority=0
+2026-04-11 22:13:57,926 INFO     test_6:   signals=0 order_reqs=0 fills=0 positions=0 risk_blocks=0
+2026-04-11 22:13:57,927 WARNING  test_6:   WARN: No BUY fill — signal conditions not met with synthetic data (acceptable)
+2026-04-11 22:13:57,927 INFO     test_6: === 6b: Max positions gate ===
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed StrategyEngine._on_bar → BAR priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed RiskEngine._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed BaseBroker._on_order_request → ORDER_REQ priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed PositionManager._on_fill → FILL priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_fill → FILL priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_order_fail → ORDER_FAIL priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed EventCollector._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,927 DEBUG    monitor.event_bus: Subscribed EventCollector._on_order_req → ORDER_REQ priority=0
+2026-04-11 22:13:57,928 DEBUG    monitor.event_bus: Subscribed EventCollector._on_fill → FILL priority=0
+2026-04-11 22:13:57,928 DEBUG    monitor.event_bus: Subscribed EventCollector._on_position → POSITION priority=0
+2026-04-11 22:13:57,928 DEBUG    monitor.event_bus: Subscribed EventCollector._on_risk_block → RISK_BLOCK priority=0
+2026-04-11 22:13:57,928 INFO     monitor.risk_engine: [RiskEngine] BUY approved: TEST5 qty=9 ask=$100.00 entry=$100.01 rvol=3.0x rsi=60.0 spread=0.100%
+2026-04-11 22:13:57,928 INFO     monitor.brokers: [PAPER] BUY     9 TEST5  @ $100.01  (VWAP reclaim)
+2026-04-11 22:13:57,928 INFO     monitor.alerts: ALERT: POSITION opened: TEST5 9 shares @ $100.01 (order 7f1d49b8-0f6e-4122-adc6-004d4ceda0fc) reason=VWAP reclaim
+2026-04-11 22:13:57,928 INFO     monitor.position_manager: [PositionManager] Opened TEST5: qty=9 entry=$100.01 order=7f1d49b8-0f6e-4122-adc6-004d4ceda0fc
+2026-04-11 22:13:57,929 DEBUG    monitor.state: State saved: 5 open position(s), 0 trade(s).
+2026-04-11 22:13:57,929 DEBUG    monitor.execution_feedback: [ExecFeedback] No pending signal for TEST5 fill — skipping patch.
+2026-04-11 22:13:57,929 DEBUG    monitor.execution_feedback: [ExecFeedback] Cached buy signal for TEST5 stop=$99.00 target=$102.00
+2026-04-11 22:13:57,929 INFO     test_6:   5th position accepted: TEST5
+2026-04-11 22:13:57,930 INFO     monitor.risk_engine: [RiskEngine] BLOCK TEST6: max positions reached (5)
+2026-04-11 22:13:57,930 DEBUG    monitor.execution_feedback: [ExecFeedback] Cached buy signal for TEST6 stop=$99.00 target=$102.00
+2026-04-11 22:13:57,930 INFO     test_6:   PASS: 6th signal blocked — reason: max positions reached (5)
+2026-04-11 22:13:57,930 INFO     test_6: === 6c: Concurrent 10 tickers ===
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed StrategyEngine._on_bar → BAR priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed RiskEngine._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed BaseBroker._on_order_request → ORDER_REQ priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed PositionManager._on_fill → FILL priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_fill → FILL priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_order_fail → ORDER_FAIL priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed EventCollector._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,930 DEBUG    monitor.event_bus: Subscribed EventCollector._on_order_req → ORDER_REQ priority=0
+2026-04-11 22:13:57,931 DEBUG    monitor.event_bus: Subscribed EventCollector._on_fill → FILL priority=0
+2026-04-11 22:13:57,931 DEBUG    monitor.event_bus: Subscribed EventCollector._on_position → POSITION priority=0
+2026-04-11 22:13:57,931 DEBUG    monitor.event_bus: Subscribed EventCollector._on_risk_block → RISK_BLOCK priority=0
+2026-04-11 22:13:57,952 INFO     test_6:   PASS: Concurrent 10 tickers — no errors, 0 positions opened
+2026-04-11 22:13:57,952 INFO     test_6: === 6d: EOD force-close ===
+2026-04-11 22:13:57,952 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed StrategyEngine._on_bar → BAR priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed RiskEngine._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed BaseBroker._on_order_request → ORDER_REQ priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed PositionManager._on_fill → FILL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_fill → FILL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_order_fail → ORDER_FAIL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed EventCollector._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed EventCollector._on_order_req → ORDER_REQ priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed EventCollector._on_fill → FILL priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed EventCollector._on_position → POSITION priority=0
+2026-04-11 22:13:57,953 DEBUG    monitor.event_bus: Subscribed EventCollector._on_risk_block → RISK_BLOCK priority=0
+2026-04-11 22:13:57,956 WARNING  test_6:   WARN: EOD signal not triggered — strategy engine may rely on wall clock; acceptable
+2026-04-11 22:13:57,956 INFO     test_6: === 6e: Sell path ===
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: [EventBus] SYNC mode.
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed StrategyEngine._on_bar → BAR priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed RiskEngine._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed BaseBroker._on_order_request → ORDER_REQ priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed PositionManager._on_fill → FILL priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_fill → FILL priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed ExecutionFeedback._on_order_fail → ORDER_FAIL priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed EventCollector._on_signal → SIGNAL priority=0
+2026-04-11 22:13:57,956 DEBUG    monitor.event_bus: Subscribed EventCollector._on_order_req → ORDER_REQ priority=0
+2026-04-11 22:13:57,957 DEBUG    monitor.event_bus: Subscribed EventCollector._on_fill → FILL priority=0
+2026-04-11 22:13:57,957 DEBUG    monitor.event_bus: Subscribed EventCollector._on_position → POSITION priority=0
+2026-04-11 22:13:57,957 DEBUG    monitor.event_bus: Subscribed EventCollector._on_risk_block → RISK_BLOCK priority=0
+2026-04-11 22:13:57,957 INFO     monitor.risk_engine: [RiskEngine] SELL pass-through: SELL_TEST qty=5 reason=sell_stop
+2026-04-11 22:13:57,957 INFO     monitor.brokers: [PAPER] SELL    5 SELL_TEST @ $98.50  (sell_stop)
+2026-04-11 22:13:57,957 INFO     monitor.alerts: ALERT: POSITION closed (sell_stop): SELL_TEST 5 shares @ $98.50 PnL $-7.50
+2026-04-11 22:13:57,957 INFO     monitor.position_manager: [PositionManager] Closed SELL_TEST: qty=5 exit=$98.50 pnl=$-7.50 reason=sell_stop
+2026-04-11 22:13:57,958 DEBUG    monitor.state: State saved: 0 open position(s), 1 trade(s).
+2026-04-11 22:13:57,958 INFO     test_6:   PASS: Sell path verified. PnL=-7.50
+2026-04-11 22:13:57,958 INFO     test_6: === Results ===
+2026-04-11 22:13:57,958 INFO     test_6:   6a: PASS
+2026-04-11 22:13:57,958 INFO     test_6:   6b: PASS
+2026-04-11 22:13:57,958 INFO     test_6:   6c: PASS
+2026-04-11 22:13:57,959 INFO     test_6:   6d: PASS
+2026-04-11 22:13:57,959 INFO     test_6:   6e: PASS
+
+=== STDERR ===
+

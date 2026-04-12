@@ -368,6 +368,10 @@ class OrderRequestPayload:
     price:             float  # ask for buys; last price for sells
     reason:            str    # human-readable entry/exit reason
     needs_ask_refresh: bool = False
+    # Signal metadata forwarded so FillPayload can carry it for CrashRecovery
+    stop_price:        Optional[float] = None
+    target_price:      Optional[float] = None
+    atr_value:         Optional[float] = None
 
     def __post_init__(self):
         _require_ticker(self.ticker)
@@ -377,6 +381,12 @@ class OrderRequestPayload:
         _require_positive('price', self.price)
         if not self.reason:
             raise ValueError("reason must be a non-empty string")
+        if self.stop_price is not None:
+            _require_positive('stop_price', self.stop_price)
+        if self.target_price is not None:
+            _require_positive('target_price', self.target_price)
+        if self.atr_value is not None:
+            _require_positive('atr_value', self.atr_value)
 
 
 # ── FILL ─────────────────────────────────────────────────────────────────────
@@ -389,12 +399,17 @@ class FillPayload:
     Producer  : AlpacaBroker / PaperBroker
     Consumers : Position Manager (open/close positions), State Engine, Observability
     """
-    ticker:     str
-    side:       Side   # 'buy' | 'sell'
-    qty:        int    # shares actually filled > 0
-    fill_price: float  # average fill price > 0
-    order_id:   str    # broker order ID
-    reason:     str    # why the order was placed
+    ticker:      str
+    side:        Side   # 'buy' | 'sell'
+    qty:         int    # shares actually filled > 0
+    fill_price:  float  # average fill price > 0
+    order_id:    str    # broker order ID
+    reason:      str    # why the order was placed
+    # Optional signal metadata carried forward so CrashRecovery can reconstruct
+    # exact stop/target without falling back to entry_price ± ATR approximations.
+    stop_price:  Optional[float] = None
+    target_price: Optional[float] = None
+    atr_value:   Optional[float] = None
 
     def __post_init__(self):
         _require_ticker(self.ticker)
@@ -406,6 +421,12 @@ class FillPayload:
             raise ValueError("order_id must be a non-empty string")
         if not self.reason:
             raise ValueError("reason must be a non-empty string")
+        if self.stop_price is not None:
+            _require_positive('stop_price', self.stop_price)
+        if self.target_price is not None:
+            _require_positive('target_price', self.target_price)
+        if self.atr_value is not None:
+            _require_positive('atr_value', self.atr_value)
 
 
 # ── ORDER_FAIL ────────────────────────────────────────────────────────────────

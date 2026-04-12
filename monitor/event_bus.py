@@ -286,8 +286,10 @@ class EventType(Enum):
 
 # Populate config dicts now that EventType exists
 _DEFAULT_ASYNC_CONFIG.update({
-    # High-frequency market data — n_workers=4 for parallel ticker processing
-    EventType.BAR:   {'maxsize': 200, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 4, 'coalesce': True},
+    # High-frequency market data — maxsize=500 gives 125 slots/partition (no drops on 200-ticker burst)
+    # n_workers=4: GIL means more workers increase context-switch overhead; pre-compute indicators
+    # in the data layer to cut handler time below 50ms P95.
+    EventType.BAR:   {'maxsize': 500, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 4, 'coalesce': True},
     EventType.QUOTE: {'maxsize': 100, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2, 'coalesce': True},
     # Signals — latest supersedes stale
     EventType.SIGNAL:     {'maxsize':  50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},

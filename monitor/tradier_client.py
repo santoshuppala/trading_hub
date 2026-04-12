@@ -25,6 +25,13 @@ class TradierDataClient(BaseDataClient):
     def __init__(self, token):
         self._token = token
         self._session = requests.Session()
+        # Raise connection pool size to match _MAX_WORKERS so parallel
+        # fetch_batch_bars threads don't discard connections under load.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=_MAX_WORKERS,
+            pool_maxsize=_MAX_WORKERS,
+        )
+        self._session.mount('https://', adapter)
         self._session.headers.update({
             'Authorization': f'Bearer {token}',
             'Accept': 'application/json',

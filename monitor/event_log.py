@@ -656,13 +656,13 @@ class CrashRecovery:
 
             if et == 'FILL':
                 ticker     = p.get('ticker', '')
-                side       = p.get('side', '')
+                side       = p.get('side', '').upper()  # Normalize to uppercase (handle both old 'buy'/'sell' and new 'BUY'/'SELL')
                 qty        = int(p.get('qty', 0))
                 fill_price = float(p.get('fill_price', 0))
                 reason     = p.get('reason', '')
                 order_id   = p.get('order_id', '')
 
-                if side == 'buy' and ticker:
+                if side == 'BUY' and ticker:
                     # Use exact stop/target carried in FillPayload if present;
                     # fall back to entry_price approximations only when missing.
                     raw_stop   = p.get('stop_price')
@@ -682,7 +682,7 @@ class CrashRecovery:
                         'half_target':  half_target,
                         'atr_value':    float(raw_atr) if raw_atr else None,
                     }
-                elif side == 'sell' and ticker:
+                elif side == 'SELL' and ticker:
                     if ticker in positions:
                         pos = positions[ticker]
                         sold_qty = qty

@@ -87,7 +87,7 @@ class PositionManager:
     def _on_fill(self, event: Event) -> None:
         p: FillPayload = event.payload
         with self._lock:
-            if p.side == 'buy':
+            if p.side == 'BUY':
                 self._open_position(p, event)
             else:
                 self._close_position(p, event)

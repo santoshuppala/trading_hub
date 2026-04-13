@@ -24,6 +24,9 @@ TICKERS = [
     'COIN','HOOD','MSTR','RIOT','CLSK','MARA','HUT',
     # High-growth / speculative
     'PLTR','RBLX','ROKU','TWLO','BILL','SMAR',
+    # High-volatility / pop candidates
+    'SMCI','ARM','CRWD','PANW','ZS','MNDY','CELH','RIVN','LCID','IONQ',
+    'AI','BIGB','CAVA','DUOL','GRAB','SE','BABA','JD','PDD','KWEB',
     # Financials
     'JPM','BAC','WFC','GS','MS','C','AXP','SCHW','BLK','KKR','APO','BX','ICE','CME',
     # Energy
@@ -47,7 +50,7 @@ TICKERS = [
 TICKERS = list(dict.fromkeys(TICKERS))
 
 # ── Strategy ───────────────────────────────────────────────────────────────────
-STRATEGY       = 'confirmed_crossover'
+STRATEGY       = 'vwap_reclaim'
 STRATEGY_PARAMS = {
     'rsi_period':     14,
     'atr_period':     14,

@@ -317,57 +317,15 @@ def main():
         log.error("PRE-MARKET CHECK: CRITICAL FAILURES DETECTED — review above")
     log.info("=" * 60)
 
-    # ── Signal instrumentation (log every event to CSV for analysis) ───────────
-    signal_log_path = os.path.join(log_dir, f"signals_{datetime.now().strftime('%Y-%m-%d')}.csv")
-    _signal_log_file = open(signal_log_path, 'a')
-    _signal_log_started = os.path.getsize(signal_log_path) == 0 if os.path.exists(signal_log_path) else True
-
-    if _signal_log_started:
-        _signal_log_file.write(
-            "timestamp,event_type,ticker,action,price,stop,target,qty,"
-            "reason,atr,rsi,rvol,confidence,strategy,tier,stream_seq\n"
-        )
-        _signal_log_file.flush()
-
-    from monitor.event_bus import EventType, Event
-
-    def _instrument_event(event: Event) -> None:
-        """Log every trading-relevant event to CSV for post-session analysis."""
-        try:
-            p = event.payload
-            now_str = datetime.now(ET).strftime('%H:%M:%S.%f')[:-3]
-            et = event.type.name
-            ticker = getattr(p, 'ticker', getattr(p, 'symbol', ''))
-            action = getattr(p, 'action', getattr(p, 'side', ''))
-            price = getattr(p, 'current_price', getattr(p, 'fill_price',
-                    getattr(p, 'entry_price', getattr(p, 'price', ''))))
-            stop = getattr(p, 'stop_price', '')
-            target = getattr(p, 'target_price', getattr(p, 'target_2', ''))
-            qty = getattr(p, 'qty', '')
-            reason = getattr(p, 'reason', getattr(p, 'pop_reason', ''))
-            atr = getattr(p, 'atr_value', '')
-            rsi = getattr(p, 'rsi_value', '')
-            rvol = getattr(p, 'rvol', '')
-            conf = getattr(p, 'confidence', getattr(p, 'strategy_confidence', ''))
-            strat = getattr(p, 'strategy_name', getattr(p, 'strategy_type', ''))
-            tier = getattr(p, 'tier', '')
-            seq = event.stream_seq or ''
-
-            _signal_log_file.write(
-                f"{now_str},{et},{ticker},{action},{price},{stop},{target},{qty},"
-                f"{reason},{atr},{rsi},{rvol},{conf},{strat},{tier},{seq}\n"
-            )
-            _signal_log_file.flush()
-        except Exception:
-            pass  # instrumentation must never crash the pipeline
-
-    # Subscribe to all trading-relevant events at lowest priority (runs last)
-    for et in [EventType.SIGNAL, EventType.ORDER_REQ, EventType.FILL,
-               EventType.ORDER_FAIL, EventType.POSITION, EventType.RISK_BLOCK,
-               EventType.POP_SIGNAL, EventType.PRO_STRATEGY_SIGNAL]:
-        monitor._bus.subscribe(et, _instrument_event, priority=99)
-
-    log.info(f"Signal instrumentation active → {signal_log_path}")
+    # ── Activity Logger (every event → TimescaleDB for analysis) ────────────
+    activity_logger = None
+    if DB_ENABLED_RUNTIME and db_writer:
+        from db.activity_logger import ActivityLogger
+        activity_logger = ActivityLogger(bus=monitor._bus, writer=db_writer)
+        activity_logger.register()
+        log.info("ActivityLogger active → all signals/fills/blocks logged to TimescaleDB")
+    else:
+        log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
 
     monitor.start()
     log.info("Monitor running. Will stop at 3:15 PM ET.")
@@ -399,6 +357,16 @@ def main():
                     f"trades={len(trades)} wins={wins} losses={losses}"
                 )
                 log.error("HALTING ALL TRADING — force-closing open positions")
+                # Log kill switch activation to DB
+                if activity_logger:
+                    activity_logger.log_kill_switch(
+                        daily_pnl=total_pnl,
+                        threshold=MAX_DAILY_LOSS,
+                        trades_count=len(trades),
+                        wins=wins,
+                        losses=losses,
+                        positions_closed=list(positions.keys()),
+                    )
                 # Force-close all open positions via market sell
                 for ticker_name in list(positions.keys()):
                     pos = positions[ticker_name]
@@ -425,12 +393,33 @@ def main():
                 f"trades today: {len(trades)} ({wins}W/{losses}L) | "
                 f"PnL: ${total_pnl:+.2f} | kill_switch: ${MAX_DAILY_LOSS:+.2f}"
             )
-            # DB + Redpanda health check
+            # DB health + activity logging
             if DB_ENABLED_RUNTIME and db_writer:
                 log.info(
                     f"[heartbeat] DB: written={db_writer.rows_written} "
                     f"dropped={db_writer.rows_dropped} batches={db_writer.batches_flushed}"
                 )
+                if activity_logger:
+                    try:
+                        metrics = monitor._bus.metrics()
+                        activity_logger.log_health(
+                            tickers_scanned=len(tickers),
+                            open_positions=len(positions),
+                            trades_today=len(trades),
+                            wins_today=wins,
+                            losses_today=losses,
+                            daily_pnl=total_pnl,
+                            system_pressure=metrics.system_pressure,
+                            db_rows_written=db_writer.rows_written,
+                            db_rows_dropped=db_writer.rows_dropped,
+                            db_batches_flushed=db_writer.batches_flushed,
+                            registry_count=registry.count(),
+                            kill_switch_active=trading_halted,
+                            queue_depths=metrics.queue_depths,
+                            handler_avg_ms=metrics.handler_avg_ms,
+                        )
+                    except Exception:
+                        pass  # health logging must never crash the monitor
             # Hourly summary
             if now.minute == 0 and trades:
                 log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}")
@@ -440,13 +429,6 @@ def main():
     finally:
         if not trading_halted:
             monitor.stop()
-
-        # Close signal instrumentation log
-        try:
-            _signal_log_file.close()
-            log.info(f"Signal log saved: {signal_log_path}")
-        except Exception:
-            pass
 
         # ── Shutdown DB layer gracefully ─────────────────────────────────────
         if DB_ENABLED_RUNTIME and db_loop is not None:

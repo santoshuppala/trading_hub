@@ -225,9 +225,15 @@ class DBSubscriber:
     def _on_pro_strategy_signal(self, event: Event) -> None:
         try:
             p: ProStrategySignalPayload = event.payload
-            det = None
+            det = '{}'
             if hasattr(p, "detector_signals") and p.detector_signals:
-                det = json.loads(p.detector_signals) if isinstance(p.detector_signals, str) else p.detector_signals
+                # detector_signals must be a JSON string, not a dict
+                if isinstance(p.detector_signals, str):
+                    det = p.detector_signals
+                elif isinstance(p.detector_signals, dict):
+                    det = json.dumps(p.detector_signals)
+                else:
+                    det = '{}'
             row = {
                 "ts":               _NOW(),
                 "ticker":           p.ticker,

@@ -58,13 +58,7 @@ CREATE TABLE IF NOT EXISTS event_store (
     -- Indexing
     CONSTRAINT event_store_pkey PRIMARY KEY (event_id),
     UNIQUE(aggregate_type, aggregate_id, event_sequence)  -- Ensure ordering
-) PARTITION BY RANGE (event_time);
-
--- Create daily partitions for better performance
-SELECT create_hypertable('event_store', 'event_time',
-    if_not_exists => TRUE,
-    chunk_time_interval => INTERVAL '1 day'
-) ON CONFLICT DO NOTHING;
+);
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_event_store_event_time

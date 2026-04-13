@@ -26,6 +26,7 @@
 18. [Pro-Setup Multi-Tier Strategy System](#18-pro-setup-multi-tier-strategy-system)
 19. [TimescaleDB Event Store — Database Layer](#19-timescaledb-event-store--database-layer)
 20. [Strategy Audit, Production Readiness & DB Optimization](#20-strategy-audit-production-readiness--db-optimization)
+21. [T3.7 Options Engine — 13-Strategy Subsystem](#21-t37-options-engine--13-strategy-subsystem)
 
 ---
 
@@ -1481,4 +1482,278 @@ Removed duplicate T3.5 and T3.6 VWAP implementations. Created thin adapters that
 | New tests | `test_11` through `test_18` |
 | New docs | `strategy_audit_report.md`, `production_readiness_report.md`, `analysis_queries.md` |
 | Updated | `run_monitor.py`, `config.py`, `README.md`, `dev_notes.md`, `model_switch_prompt.md`, `requirements.txt`, `.gitignore` |
+
+---
+
+## 21. T3.7 Options Engine — 13-Strategy Subsystem
+
+### Architecture Overview
+
+T3.7 OptionsEngine is a self-contained options trading subsystem that mirrors the pattern established by T3.5 (PopStrategyEngine) and T3.6 (ProSetupEngine). It uses a **separate Alpaca account** (`APCA_OPTIONS_KEY` / `APCA_OPTIONS_SECRET`) with an independent **$10,000 budget** ($500 per trade, 5 concurrent positions). Implements all 13 option strategies except Covered Calls and Cash-Secured Puts.
+
+**Key design principle**: No interference with equity layers (T3, T3.5, T3.6, T4). Uses `GlobalPositionRegistry` with `layer='options'` to prevent same-underlying conflicts. Emits `OPTIONS_SIGNAL` (NOT `ORDER_REQ`) — completely isolated from the equity order channel.
+
+### File Structure (14 new files + 4 modified)
+
+#### New files (`options/` package)
+
+| File | Responsibility |
+|------|-----------------|
+| `options/__init__.py` | Package docs |
+| `options/engine.py` | T3.7 OptionsEngine: SIGNAL/BAR subscriber + orchestrator (600 lines) |
+| `options/selector.py` | OptionStrategySelector: signal/bar conditions → strategy type |
+| `options/chain.py` | AlpacaOptionChainClient: Alpaca options data API |
+| `options/risk.py` | OptionsRiskGate: independent $10K budget gate |
+| `options/broker.py` | AlpacaOptionsBroker: 1-leg + multi-leg order execution |
+| `options/strategies/base.py` | BaseOptionsStrategy, OptionLeg, OptionsTradeSpec dataclasses |
+| `options/strategies/directional.py` | LongCall, LongPut |
+| `options/strategies/vertical.py` | BullCallSpread, BearPutSpread, BullPutSpread, BearCallSpread |
+| `options/strategies/volatility.py` | LongStraddle, LongStrangle |
+| `options/strategies/neutral.py` | IronCondor, IronButterfly |
+| `options/strategies/time_based.py` | CalendarSpread, DiagonalSpread |
+| `options/strategies/complex.py` | ButterflySpread |
+| `options/strategies/__init__.py` | STRATEGY_REGISTRY dict (13 entries) |
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `monitor/event_bus.py` | Added `OPTIONS_SIGNAL` EventType (maxsize=50, DROP_OLDEST, n_workers=1, MEDIUM priority) |
+| `monitor/events.py` | Added `OptionStrategyType` enum (13 values) + `OptionsSignalPayload` frozen dataclass with validation |
+| `config.py` | Added 9 `OPTIONS_*` config variables (credentials, budget, DTE bounds) |
+| `run_monitor.py` | Instantiate OptionsEngine after PopStrategyEngine; add preflight Check 7 for Alpaca Options connectivity |
+
+### Strategy Selection Logic
+
+**SIGNAL-driven (directional entry/exit):**
+
+```
+BUY signal:
+  RVOL >= 3.0          → Long Call (aggressive, high IV expected)
+  1.5 <= RVOL < 3.0:
+    IV < 0.35          → Bull Call Spread (moderate vol, low IV)
+    IV >= 0.35         → Bull Put Spread (moderate vol, high IV → sell premium)
+  RVOL < 1.5           → skip
+
+SELL signal (stop/target/RSI/VWAP):
+  RVOL >= 3.0          → Long Put (aggressive, high IV expected)
+  1.5 <= RVOL < 3.0:
+    IV < 0.35          → Bear Put Spread (moderate vol, low IV)
+    IV >= 0.35         → Bear Call Spread (moderate vol, high IV → sell premium)
+  RVOL < 1.5           → skip
+```
+
+**BAR-driven (neutral/volatility scan):**
+
+```
+High volatility (ATR/price > 4%):
+  → Long Straddle (buy ATM call + put, bet on move)
+
+Medium volatility (2% < ATR/price <= 4%):
+  → Long Strangle (buy OTM call/put, cheaper than straddle)
+
+Neutral bias (RSI 40–60) + High IV (> 35%):
+  → Iron Condor (sell OTM wings, buy further OTM protection)
+
+Very tight neutral (RSI 45–55) + Very High IV (> 40%):
+  → Iron Butterfly (4-leg, ATM body + OTM wings)
+
+Calendar conditions (no existing position + near IV > far IV):
+  → Calendar Spread (sell near-term, buy far-term same strike)
+
+Calendar + OTM short viable:
+  → Diagonal Spread (buy LEAPS, sell near-term OTM)
+
+Low IV + RSI ~50 + no straddle coverage:
+  → Butterfly Spread (defined risk, debit trade)
+
+All conditions fail:
+  → skip (no trade)
+```
+
+### Pipeline Flow
+
+```
+SIGNAL or BAR event (from StrategyEngine or live ticks)
+  ↓
+OptionsEngine._on_signal() or _on_bar()
+  ├─ early exit guards: action in allowed set, chain available
+  ├─ _estimate_iv(): fetch 1 ATM contract, return IV (fallback 0.25)
+  ├─ _selector.select_from_signal() or select_from_bar()
+  │  → strategy_type (or None)
+  │
+  ├─ _execute_strategy()
+  │  ├─ _risk.check()        → max_positions, cooldown, budget, layer dedup
+  │  ├─ chain.get_chain()    → list of contracts (min_dte–max_dte)
+  │  ├─ strategy.build()     → OptionsTradeSpec (legs, pricing)
+  │  ├─ _emit_options_signal() → (durable=True → Redpanda for audit)
+  │  ├─ _risk.acquire()      → lock capital + registry
+  │  └─ _broker.execute()    → AlpacaOptionsBroker
+  │     ├─ _execute_single_leg()   (LimitOrderRequest)
+  │     └─ _execute_multi_leg()    (OptionMultiLegOrderRequest)
+  │
+  └─ on broker failure: _risk.release() to free capital
+```
+
+### Risk Gate Enforcement
+
+OptionsRiskGate is **independent** of RiskEngine. Three checks prevent over-commitment:
+
+1. **Position count**: `len(open_positions) < max_positions` (default 5)
+2. **Cooldown**: `now - last_order[ticker] >= order_cooldown` (default 300 s)
+3. **Budget**:
+   - Per-trade max: `trade_spec.max_risk <= trade_budget` (default $500)
+   - Total budget: `deployed_capital + trade_spec.max_risk <= total_budget` (default $10K)
+4. **Cross-layer registry**: `registry.try_acquire(ticker, layer='options')` — blocks options if equity trade active on same underlying
+
+**Acquire/Release pattern** (thread-safe):
+
+```python
+# Before execution:
+risk.check(ticker, max_risk=500.0)  # → None (pass) or str (reason to skip)
+
+# After OPTIONS_SIGNAL emitted, before broker.execute():
+risk.acquire(ticker, cost=350.0)    # lock $350 capital + registry entry
+
+# On broker execution failure:
+risk.release(ticker)                # unlock capital + registry
+```
+
+### Event Payloads
+
+**OPTIONS_SIGNAL** (emitted after strategy build, before execution):
+
+```python
+@dataclass(frozen=True)
+class OptionsSignalPayload:
+    ticker:           str              # e.g. 'AAPL'
+    strategy_type:    str              # e.g. 'long_call' (from OptionStrategyType enum)
+    underlying_price: float            # spot price at signal time
+    expiry_date:      str              # 'YYYY-MM-DD'
+    net_debit:        float            # positive=cost, negative=credit
+    max_risk:         float            # max dollar loss (always > 0)
+    max_reward:       float            # max dollar gain (always > 0)
+    atr_value:        float            # from StrategyEngine signal
+    rvol:             float            # relative volatility
+    rsi_value:        float            # RSI at signal time
+    legs_json:        str              # JSON-serialized [{symbol, side, qty, ratio, limit_price}]
+    source:           str              # 'signal' or 'bar_scan'
+```
+
+### Key Design Decisions
+
+**1. No ORDER_REQ reuse**
+Options multi-leg orders have variable leg counts (1–4 legs). `OrderRequestPayload` models single-side orders. Rather than force-fitting, `AlpacaOptionsBroker.execute()` is called directly from `OptionsEngine`, bypassing equity order channel entirely. Keeps `ORDER_REQ` clean for equity trades.
+
+**2. Position isolation**
+Options positions are tracked separately from equity positions:
+- Equity: `RealTimeMonitor.positions` (dict)
+- Options: `OptionsEngine._positions` (dict with entry_time, cost metadata)
+- Cross-layer: `GlobalPositionRegistry` with `layer='options'` prevents conflicts
+
+**3. IV estimation fallback**
+`_estimate_iv()` fetches the ATM call contract to read `iv` field. Returns `0.25` (neutral) on any error. Strategy selection is conservative at neutral IV — routes to debit spreads (max loss = debit paid) rather than credit spreads (max loss = width − credit, harder to quantify pre-execution).
+
+**4. Strategy builder pattern**
+Each strategy class (LongCall, BullCallSpread, etc.) implements `build(ticker, underlying_price, chain_client, min_dte, max_dte, delta_directional, delta_spread) → OptionsTradeSpec | None`.
+
+Builders return `None` if chain lookup fails or no suitable contracts exist (graceful degradation). `OptionsEngine` logs but doesn't block on `None`.
+
+**5. DTE bounds**
+- `min_dte`, `max_dte` for regular options (default 20–45 days) — sweet spot for liquidity + decay acceleration
+- `leaps_dte` for LEAPS strategies (default 365 days) — used by DiagonalSpread only
+
+**6. Delta selection**
+- Directional options (Long Call/Put): δ ~0.35 (in-the-money bias, high theta decay risk acceptable)
+- Spread shorts: δ ~0.35 (maximum premium capture)
+- Spread longs: δ ~0.20 (lower cost, larger move required to be profitable)
+- ATM strategies: strike closest to spot
+
+### Wiring in run_monitor.py
+
+```python
+from options.engine import OptionsEngine
+from config import (
+    ALPACA_OPTIONS_KEY, ALPACA_OPTIONS_SECRET,
+    OPTIONS_PAPER_TRADING, OPTIONS_MAX_POSITIONS, OPTIONS_TRADE_BUDGET,
+    OPTIONS_TOTAL_BUDGET, OPTIONS_ORDER_COOLDOWN,
+    OPTIONS_MIN_DTE, OPTIONS_MAX_DTE, OPTIONS_LEAPS_DTE,
+)
+
+# After PopStrategyEngine instantiation:
+options_engine = OptionsEngine(
+    bus=monitor._bus,
+    options_key=ALPACA_OPTIONS_KEY,
+    options_secret=ALPACA_OPTIONS_SECRET,
+    paper=OPTIONS_PAPER_TRADING,
+    max_positions=OPTIONS_MAX_POSITIONS,
+    trade_budget=float(OPTIONS_TRADE_BUDGET),
+    total_budget=float(OPTIONS_TOTAL_BUDGET),
+    order_cooldown=OPTIONS_ORDER_COOLDOWN,
+    min_dte=OPTIONS_MIN_DTE,
+    max_dte=OPTIONS_MAX_DTE,
+    leaps_dte=OPTIONS_LEAPS_DTE,
+    alert_email=ALERT_EMAIL,
+)
+```
+
+Preflight Check 7:
+
+```python
+if ALPACA_OPTIONS_KEY and ALPACA_OPTIONS_SECRET:
+    try:
+        base = 'https://paper-api.alpaca.markets' if OPTIONS_PAPER_TRADING else 'https://api.alpaca.markets'
+        r = requests.get(f'{base}/v2/account',
+                        headers={'APCA-API-KEY-ID': ALPACA_OPTIONS_KEY,
+                                 'APCA-API-SECRET-KEY': ALPACA_OPTIONS_SECRET}, timeout=5)
+        if r.status_code == 200:
+            bp = r.json().get('buying_power', '?')
+            log.info(f"  [OK] Alpaca Options: connected | buying_power=${bp}")
+        else:
+            log.warning(f"  [WARN] Alpaca Options: status {r.status_code}")
+    except Exception as e:
+        log.warning(f"  [WARN] Alpaca Options: {e}")
+else:
+    log.info("  [SKIP] Alpaca Options: APCA_OPTIONS_KEY not set")
+```
+
+### Configuration (.env)
+
+```
+# Options engine dedicated Alpaca account
+APCA_OPTIONS_KEY=PKxxxxxxxxxxxxxxxx
+APCA_OPTIONS_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPTIONS_PAPER_TRADING=true              # true=paper, false=live
+OPTIONS_MAX_POSITIONS=5                 # concurrent open positions
+OPTIONS_TRADE_BUDGET=500                # per-trade max debit/risk
+OPTIONS_TOTAL_BUDGET=10000              # $10K account ceiling
+OPTIONS_ORDER_COOLDOWN=300              # seconds between same-ticker trades
+OPTIONS_MIN_DTE=20                      # days to expiry (lower)
+OPTIONS_MAX_DTE=45                      # days to expiry (upper)
+OPTIONS_LEAPS_DTE=365                   # LEAPS threshold (Diagonal strategy)
+```
+
+### Strategy Breakdown
+
+| Strategy | Type | Legs | Entry | Max risk | Use case |
+|----------|------|------|-------|----------|----------|
+| LongCall | Directional | 1 | Buy δ0.35 call | premium × 100 | BUY signal + high RVOL |
+| LongPut | Directional | 1 | Buy δ0.35 put | premium × 100 | SELL signal + high RVOL |
+| BullCallSpread | Vertical (debit) | 2 | Buy δ0.35 call, sell δ0.20 call | debit × 100 | BUY + medium RVOL, low IV |
+| BearPutSpread | Vertical (debit) | 2 | Buy δ0.35 put, sell δ0.20 put | debit × 100 | SELL + medium RVOL, low IV |
+| BullPutSpread | Vertical (credit) | 2 | Sell δ0.35 put, buy δ0.20 put | (width - credit) × 100 | BUY + medium RVOL, high IV |
+| BearCallSpread | Vertical (credit) | 2 | Sell δ0.35 call, buy δ0.20 call | (width - credit) × 100 | SELL + medium RVOL, high IV |
+| LongStraddle | Volatility | 2 | Buy ATM call + put | (call + put) × 100 | BAR: high volatility (ATR > 4%) |
+| LongStrangle | Volatility | 2 | Buy OTM call/put | (call + put) × 100 | BAR: medium volatility (2–4%) |
+| IronCondor | Neutral | 4 | Sell OTM call/put + buy wings | (width - credit) × 100 | BAR: neutral RSI (40–60) + high IV |
+| IronButterfly | Neutral | 4 | Sell ATM call/put + buy OTM wings | (width - credit) × 100 | BAR: tight neutral (RSI 45–55) + very high IV |
+| CalendarSpread | Time-based | 2 | Sell near-term, buy far-term (same strike) | debit × 100 | BAR: near IV > far IV, no position |
+| DiagonalSpread | Time-based | 2 | Buy LEAPS δ0.70 call, sell near OTM δ0.30 | LEAPS debit × 100 | BAR: calendar conditions + short coverage |
+| ButterflySpread | Complex | 3 | Buy ITM, sell 2 ATM, buy OTM (equal wings) | debit × 100 | BAR: low IV + RSI ~50, no straddle |
+
+### Files Changed Summary
+
+Created: 14 new files (options/ package + strategies/)
+Modified: 4 files (event_bus, events, config, run_monitor)
+Impact: Zero breaking changes; fully isolated from equity layers
 

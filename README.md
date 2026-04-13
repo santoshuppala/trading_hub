@@ -12,17 +12,19 @@ The system is organised as a 10-layer event pipeline. Each layer subscribes to o
 
 ```
 monitor.run() → emit_batch(BAR[])
-    └─ ProSetupEngine     BAR  → PRO_STRATEGY_SIGNAL → ORDER_REQ (11 setups, 3 tiers) [T3.6 — new]
+    └─ ProSetupEngine     BAR  → PRO_STRATEGY_SIGNAL → ORDER_REQ (11 setups, 3 tiers) [T3.6]
     └─ PopStrategyEngine  BAR  → POP_SIGNAL (durable) + direct fill via PopExecutor [T3.5]
     └─ StrategyEngine     BAR  → SIGNAL (buy / sell_* / partial_sell / hold)        [T4]
+    └─ OptionsEngine      SIGNAL/BAR → OPTIONS_SIGNAL (13 strategies, $10K budget)  [T3.7 — NEW]
     └─ RiskEngine         SIGNAL → ORDER_REQ | RISK_BLOCK                           [T3]
     └─ Broker             ORDER_REQ → FILL | ORDER_FAIL
+    └─ OptionsBroker      OPTIONS_SIGNAL → multi-leg FILL (via AlpacaOptionsBroker)
     └─ ExecutionFeedback  FILL(buy) → patches stop/target on position record
     └─ PositionManager    FILL → POSITION (opened / partial_exit / closed)
     └─ StateEngine        POSITION → read-only UI snapshot
     └─ HeartbeatEmitter   tick() → HEARTBEAT every 60 s
     └─ EventLogger        * → structured log line for every event
-    └─ DurableEventLog    ORDER_REQ/FILL/POP_SIGNAL → Redpanda (ACKed before handlers run)
+    └─ DurableEventLog    ORDER_REQ/FILL/POP_SIGNAL/OPTIONS_SIGNAL → Redpanda
 ```
 
 ### Monitor layers
@@ -30,11 +32,12 @@ monitor.run() → emit_batch(BAR[])
 | Layer | File | Responsibility |
 |-------|------|----------------|
 | T1 EventBus | `monitor/event_bus.py` | Pub/sub backbone; priority queues; causal partitioning; backpressure; idempotency; SLA tracking |
-| T1.5 Event Schema | `monitor/events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; PopSignalPayload; read-only numpy arrays on BAR DataFrames |
+| T1.5 Event Schema | `monitor/events.py` | Frozen, validated dataclasses; typed enums; PositionSnapshot; PopSignalPayload; OptionsSignalPayload; read-only numpy arrays on BAR DataFrames |
 | T2 DurableEventLog | `monitor/event_log.py` | Redpanda producer; write-then-deliver ordering via before-emit hook |
 | T3 RiskEngine | `monitor/risk_engine.py` | 6 pre-trade checks; blocks on spread fetch failure; price-divergence guard |
-| T3.6 ProSetupEngine | `pro_setups/engine.py` | 11 pro setups across 3 tiers; 11 detectors + classifier + router + RiskAdapter → ORDER_REQ → AlpacaBroker |
 | T3.5 PopStrategyEngine | `pop_strategy_engine.py` | Pop-stock screener → classifier → router → POP_SIGNAL + direct execution via PopExecutor (dedicated Alpaca account) |
+| T3.6 ProSetupEngine | `pro_setups/engine.py` | 11 pro setups across 3 tiers; 11 detectors + classifier + router + RiskAdapter → ORDER_REQ → AlpacaBroker |
+| T3.7 OptionsEngine | `options/engine.py` | 13 option strategies; SIGNAL/BAR → OPTIONS_SIGNAL; independent risk gate ($10K budget); dedicated Alpaca options account |
 | T4 StrategyEngine | `monitor/strategy_engine.py` | VWAP Reclaim entry signals; 5 exit conditions |
 | T5 PositionManager | `monitor/position_manager.py` | Opens/closes positions; computes PnL; persists `bot_state.json`; thread-safe fill handler |
 | T6 StateEngine | `monitor/state_engine.py` | Maintains read-only portfolio snapshot for UI and heartbeat |
@@ -63,8 +66,8 @@ Default async config:
 
 | EventType | Queue size | Overflow | Workers | Notes |
 |-----------|-----------|----------|---------|-------|
-| BAR | 500 | DROP_OLDEST | 4 | 125 slots/partition; no drops on 200-ticker burst |
-| SIGNAL, POP_SIGNAL | 50 | DROP_OLDEST | 2 | Latest supersedes stale |
+| BAR | 500 | DROP_OLDEST | 8 | 125 slots/partition; no drops on 200-ticker burst |
+| SIGNAL, POP_SIGNAL, OPTIONS_SIGNAL | 50 | DROP_OLDEST | 1-2 | Latest supersedes stale |
 | ORDER_REQ, FILL | 100 | BLOCK | 1 | Strict ordering; never dropped |
 | HEARTBEAT | 10 | DROP_OLDEST | 1 | |
 
@@ -111,7 +114,7 @@ trading_hub/
 │       ├── ema_trend_engine.py         # Pullback-to-EMA in a confirmed uptrend
 │       └── bopb_engine.py              # Breakout → pullback → confirmation entry
 │
-├── pro_setups/               # 11-setup pro strategy subsystem (NEW)
+├── pro_setups/               # 11-setup pro strategy subsystem
 │   ├── engine.py             # T3.6 — ProSetupEngine: BAR → 11 detectors → PRO_STRATEGY_SIGNAL
 │   ├── detectors/            # 11 detectors: Trend, VWAP, SR, ORB, InsideBar, Gap, Flag,
 │   │                         #               Liquidity, Volatility(BB), Fib, Momentum
@@ -122,6 +125,21 @@ trading_hub/
 │   │   └── tier3/            # liquidity_sweep, bollinger_squeeze, fib_confluence, momentum_ignition
 │   ├── router/               # ProStrategyRouter: PRO_STRATEGY_SIGNAL → RiskAdapter
 │   └── risk/                 # RiskAdapter: tier-aware risk gate → ORDER_REQ
+│
+├── options/                  # Options engine subsystem (T3.7) — NEW
+│   ├── engine.py             # T3.7 — OptionsEngine: SIGNAL/BAR → OPTIONS_SIGNAL
+│   ├── selector.py           # OptionStrategySelector: signal/bar conditions → strategy type
+│   ├── chain.py              # AlpacaOptionChainClient: Alpaca options data API
+│   ├── risk.py               # OptionsRiskGate: independent $10K budget gate
+│   ├── broker.py             # AlpacaOptionsBroker: multi-leg order execution
+│   └── strategies/           # 13 strategy builders
+│       ├── base.py           # BaseOptionsStrategy, OptionLeg, OptionsTradeSpec
+│       ├── directional.py    # LongCall, LongPut
+│       ├── vertical.py       # BullCallSpread, BearPutSpread, BullPutSpread, BearCallSpread
+│       ├── volatility.py     # LongStraddle, LongStrangle
+│       ├── neutral.py        # IronCondor, IronButterfly
+│       ├── time_based.py     # CalendarSpread, DiagonalSpread
+│       └── complex.py        # ButterflySpread
 │
 ├── db/                      # Async TimescaleDB event store (NEW)
 │   ├── __init__.py           # Public API: init_db, close_db, get_writer, SessionManager
@@ -226,6 +244,17 @@ POP_PAPER_TRADING=true          # set false for live pop execution
 POP_MAX_POSITIONS=3
 POP_TRADE_BUDGET=500
 POP_ORDER_COOLDOWN=300
+
+# Options engine dedicated Alpaca account (T3.7, $10K budget)
+APCA_OPTIONS_KEY=PKxxxxxxxxxxxxxxxx
+APCA_OPTIONS_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPTIONS_PAPER_TRADING=true      # set false for live options trading
+OPTIONS_MAX_POSITIONS=5
+OPTIONS_TRADE_BUDGET=500        # per trade
+OPTIONS_TOTAL_BUDGET=10000      # $10K account ceiling
+OPTIONS_ORDER_COOLDOWN=300
+OPTIONS_MIN_DTE=20              # days to expiry
+OPTIONS_MAX_DTE=45
 
 # Redpanda / Kafka (optional — for durable event log)
 REDPANDA_BROKERS=127.0.0.1:9092
@@ -468,6 +497,141 @@ Already wired in `run_monitor.py`. Configure via `.env`:
 PRO_MAX_POSITIONS=3
 PRO_TRADE_BUDGET=1000
 PRO_ORDER_COOLDOWN=300
+```
+
+---
+
+### Strategy 4: Options Engine (new, T3.7)
+
+Dedicated options trading subsystem with 13 strategies across 6 categories. Uses a separate Alpaca options account with independent $10,000 budget ($500 per trade, 5 concurrent positions max). Triggered by both directional SIGNAL events (from StrategyEngine) and independent neutral/volatility scans (from BAR events).
+
+#### 13 Option Strategies
+
+**Directional (2):**
+- **Long Call** — bullish bet on underlying; delta ~0.35; max risk = premium × 100
+- **Long Put** — bearish bet on underlying; delta ~0.35; max risk = premium × 100
+
+**Vertical Debit Spreads (2):**
+- **Bull Call Spread** — bullish; buy call (Δ0.35) + sell call (Δ0.20); max risk = net debit × 100
+- **Bear Put Spread** — bearish; buy put (Δ0.35) + sell put (Δ0.20); max risk = net debit × 100
+
+**Vertical Credit Spreads (2):**
+- **Bull Put Spread** — bullish; sell put (Δ0.35) + buy put (Δ0.20); max risk = (width − credit) × 100
+- **Bear Call Spread** — bearish; sell call (Δ0.35) + buy call (Δ0.20); max risk = (width − credit) × 100
+
+**Volatility (2):**
+- **Long Straddle** — volatility bet; buy ATM call + ATM put (same strike); max risk = (call + put) × 100
+- **Long Strangle** — volatility bet; buy OTM call (+3%) + OTM put (−3%); max risk = (call + put) × 100
+
+**Neutral (2):**
+- **Iron Condor** — 4-leg; sell OTM call + put, buy further OTM wings; max risk = (width − credit) × 100
+- **Iron Butterfly** — 4-leg; sell ATM call + put, buy OTM wings; max risk = (width − credit) × 100
+
+**Time-Based & Complex (3):**
+- **Calendar Spread** — sell near-term call, buy far-term call (same strike); benefits from theta decay
+- **Diagonal Spread** — buy LEAPS call (Δ0.70), sell near-term OTM call (Δ0.30); long gamma + theta
+- **Butterfly Spread** — buy 1 ITM + 1 OTM, sell 2 ATM (equal wings); max risk = net debit × 100
+
+**Excluded:** Covered Calls, Cash-Secured Puts (per requirements).
+
+#### Strategy Selection Logic
+
+**SIGNAL-driven (directional):**
+
+| Condition | Strategy |
+|-----------|----------|
+| `action == 'buy'` + `rvol >= 3.0` | Long Call |
+| `action == 'buy'` + `1.5 <= rvol < 3.0` + `iv < 0.35` | Bull Call Spread |
+| `action == 'buy'` + `1.5 <= rvol < 3.0` + `iv >= 0.35` | Bull Put Spread |
+| `action == 'buy'` + `rvol < 1.5` | Skip (insufficient volatility) |
+| `action in {sell_stop, sell_target, sell_rsi, sell_vwap}` + `rvol >= 3.0` | Long Put |
+| `action in {sell_*}` + `1.5 <= rvol < 3.0` + `iv < 0.35` | Bear Put Spread |
+| `action in {sell_*}` + `1.5 <= rvol < 3.0` + `iv >= 0.35` | Bear Call Spread |
+
+**BAR-driven (neutral/volatility scan):**
+
+| Condition | Strategy |
+|-----------|----------|
+| `atr/price > 0.04` | Long Straddle (high volatility) |
+| `0.02 < atr/price <= 0.04` | Long Strangle (medium volatility) |
+| `40 <= rsi <= 60` + `iv > 0.35` | Iron Condor (neutral + high IV) |
+| `45 <= rsi <= 55` + `iv > 0.40` | Iron Butterfly (tight neutral + very high IV) |
+| `calendar_conditions + near_iv > far_iv` + `no_existing_position` | Calendar Spread (theta play) |
+| `calendar_conditions + otm_short_viable` | Diagonal Spread (leaps + short) |
+| `low_iv + rsi ~50 + no_straddle` | Butterfly Spread (debit + defined risk) |
+
+#### Pipeline flow
+
+```
+SIGNAL or BAR event
+  └─ OptionsEngine (T3.7)
+       ├─ estimate_iv()         → fetch 1 ATM contract from chain
+       ├─ select_from_signal()  → strategy type (or None)
+       │  or select_from_bar()
+       ├─ risk.check()          → max_positions, cooldown, budget, layer dedup
+       ├─ chain.get_chain()     → all contracts for ticker (min_dte–max_dte)
+       ├─ strategy.build()      → OptionsTradeSpec (legs, pricing, max_risk)
+       ├─ emit OPTIONS_SIGNAL   (durable → Redpanda)
+       ├─ risk.acquire()        → lock capital + registry
+       └─ broker.execute()      → submit 1-leg or multi-leg order
+            ├─ 1-leg: LimitOrderRequest(asset_class='us_option')
+            └─ 2-4 legs: OptionMultiLegOrderRequest (Alpaca mleg order)
+```
+
+#### Budget enforcement
+
+- **Total budget**: $10,000 (account ceiling)
+- **Per-trade limit**: $500 max debit/risk per trade
+- **Max concurrent positions**: 5 across all strategies
+- **Cooldown**: 5 minutes between trades on same ticker (prevents rapid re-entry)
+- **Cross-layer dedup**: registry.try_acquire(ticker, layer='options') prevents options + equity trades on same underlying
+
+#### Activating the options engine
+
+`OptionsEngine` is wired in `run_monitor.py` automatically after `ProSetupEngine`:
+
+```python
+from options.engine import OptionsEngine
+from config import (
+    ALPACA_OPTIONS_KEY, ALPACA_OPTIONS_SECRET,
+    OPTIONS_PAPER_TRADING, OPTIONS_MAX_POSITIONS, OPTIONS_TRADE_BUDGET,
+    OPTIONS_TOTAL_BUDGET, OPTIONS_ORDER_COOLDOWN,
+    OPTIONS_MIN_DTE, OPTIONS_MAX_DTE, OPTIONS_LEAPS_DTE,
+)
+
+options_engine = OptionsEngine(
+    bus=monitor._bus,
+    options_key=ALPACA_OPTIONS_KEY,           # APCA_OPTIONS_KEY env var
+    options_secret=ALPACA_OPTIONS_SECRET,     # APCA_OPTIONS_SECRET env var
+    paper=OPTIONS_PAPER_TRADING,              # default True
+    max_positions=OPTIONS_MAX_POSITIONS,      # default 5
+    trade_budget=float(OPTIONS_TRADE_BUDGET), # default $500
+    total_budget=float(OPTIONS_TOTAL_BUDGET), # default $10,000
+    order_cooldown=OPTIONS_ORDER_COOLDOWN,    # default 300 s
+    min_dte=OPTIONS_MIN_DTE,                  # default 20 days
+    max_dte=OPTIONS_MAX_DTE,                  # default 45 days
+    alert_email=ALERT_EMAIL,
+)
+```
+
+The `AlpacaOptionsBroker` inside uses its own `TradingClient` (separate Alpaca options account), submits orders directly via Alpaca's `/v2/orders` endpoint with `order_class='mleg'` for spreads, and emits no `ORDER_REQ` events — keeping the equity order channel clean.
+
+If `APCA_OPTIONS_KEY` / `APCA_OPTIONS_SECRET` are absent or `OPTIONS_PAPER_TRADING=true`, `AlpacaOptionsBroker` logs warnings and runs in paper mode (simulated fills at mid-price, no real orders).
+
+#### Configure via `.env`
+
+```
+# Options engine dedicated Alpaca account (T3.7, $10K budget)
+APCA_OPTIONS_KEY=PKxxxxxxxxxxxxxxxx
+APCA_OPTIONS_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPTIONS_PAPER_TRADING=true      # set false for live options trading
+OPTIONS_MAX_POSITIONS=5         # concurrent open positions
+OPTIONS_TRADE_BUDGET=500        # per trade max debit/risk
+OPTIONS_TOTAL_BUDGET=10000      # $10K account ceiling
+OPTIONS_ORDER_COOLDOWN=300      # seconds between trades on same ticker
+OPTIONS_MIN_DTE=20              # days to expiry (lower bound)
+OPTIONS_MAX_DTE=45              # days to expiry (upper bound)
+OPTIONS_LEAPS_DTE=365           # days to expiry (LEAPS threshold)
 ```
 
 ---

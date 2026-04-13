@@ -23,14 +23,16 @@ monitor.run() → emit_batch(BAR[])
     └─ ProSetupEngine     (T3.6)  BAR → 11 detectors → PRO_STRATEGY_SIGNAL → ORDER_REQ
     └─ PopStrategyEngine  (T3.5)  BAR → POP_SIGNAL (durable) + PopExecutor → FILL
     └─ StrategyEngine     (T4)    BAR → SIGNAL
+    └─ OptionsEngine      (T3.7)  SIGNAL/BAR → OPTIONS_SIGNAL (13 strategies, $10K budget)
     └─ RiskEngine         (T3)    SIGNAL → ORDER_REQ | RISK_BLOCK
     └─ Broker                     ORDER_REQ → FILL | ORDER_FAIL
+    └─ OptionsBroker              OPTIONS_SIGNAL → multi-leg FILL (via AlpacaOptionsBroker)
     └─ ExecutionFeedback          FILL(buy) → patches stop/target
     └─ PositionManager            FILL → POSITION
     └─ StateEngine                POSITION → read-only snapshot
     └─ HeartbeatEmitter           tick → HEARTBEAT
     └─ EventLogger                * → log line
-    └─ DurableEventLog            ORDER_REQ/FILL/POP_SIGNAL → Redpanda
+    └─ DurableEventLog            ORDER_REQ/FILL/POP_SIGNAL/OPTIONS_SIGNAL → Redpanda
     └─ DBSubscriber               * → DBWriter → TimescaleDB (async batch persist)
 ```
 
@@ -42,7 +44,7 @@ All inter-layer communication goes through the `EventBus` (`monitor/event_bus.py
 
 - **Version:** v5.2
 - **File:** `monitor/event_bus.py`
-- **EventType enum** (all values): `BAR, QUOTE, SIGNAL, ORDER_REQ, FILL, ORDER_FAIL, POSITION, RISK_BLOCK, HEARTBEAT, POP_SIGNAL, PRO_STRATEGY_SIGNAL`
+- **EventType enum** (all values): `BAR, QUOTE, SIGNAL, ORDER_REQ, FILL, ORDER_FAIL, POSITION, RISK_BLOCK, HEARTBEAT, POP_SIGNAL, PRO_STRATEGY_SIGNAL, OPTIONS_SIGNAL`
 - **Partitioning:** ticker-based hash (md5, stable across restarts).  Same ticker → same worker across ALL EventTypes.  This guarantees `BAR→SIGNAL→ORDER→FILL` for one ticker never races across workers.
 - **Backpressure:** `DROP_OLDEST` for market data; `BLOCK` for order/fill path.
 - **Durable delivery:** `emit(durable=True)` runs all `before_emit_hooks` (Redpanda produce+flush) synchronously before any handler is called.
@@ -65,6 +67,7 @@ All payloads are **frozen dataclasses** in `monitor/events.py`.  Every field is 
 | FILL | `FillPayload` | `ticker, side, qty, fill_price, order_id, reason, stop_price?, target_price?, atr_value?` |
 | POP_SIGNAL | `PopSignalPayload` | `symbol, strategy_type (str), entry_price, stop_price, target_1, target_2, pop_reason (str), atr_value, rvol, vwap_distance, strategy_confidence, features_json` |
 | PRO_STRATEGY_SIGNAL | `ProStrategySignalPayload` | `ticker, strategy_name, tier (1/2/3), direction ('long'/'short'), entry_price, stop_price, target_1, target_2, atr_value, rvol, rsi_value, vwap, confidence, detector_signals (JSON)` |
+| OPTIONS_SIGNAL | `OptionsSignalPayload` | `ticker, strategy_type (OptionStrategyType enum), underlying_price, expiry_date, net_debit, max_risk, max_reward, atr_value, rvol, rsi_value, legs_json (serialized), source ('signal'/'bar_scan')` |
 | POSITION | `PositionPayload` | `ticker, action (PositionAction), position (PositionSnapshot?), pnl?` |
 | RISK_BLOCK | `RiskBlockPayload` | `ticker, reason, signal_action` |
 
@@ -151,8 +154,14 @@ BAR → PopStrategyEngine._on_bar()
 | Pro strategy classifier | `pro_setups/classifiers/strategy_classifier.py` |
 | 11 strategy modules | `pro_setups/strategies/tier{1,2,3}/*.py` |
 | Pro risk adapter | `pro_setups/risk/risk_adapter.py` |
+| Options engine (T3.7) | `options/engine.py` |
+| Options strategy selector | `options/selector.py` |
+| Options chain client | `options/chain.py` |
+| Options risk gate | `options/risk.py` |
+| Options broker | `options/broker.py` |
+| Options strategies (13) | `options/strategies/{base,directional,vertical,volatility,neutral,time_based,complex}.py` |
 | T3.5 BAR subscriber + PopExecutor | `pop_strategy_engine.py` |
-| All configuration (incl. pop credentials) | `config.py` (tickers, strategy params, credentials, ALPACA_POPUP_KEY, POP_*) |
+| All configuration (incl. pop/options credentials) | `config.py` (tickers, strategy params, credentials, ALPACA_POPUP_KEY, POP_*, ALPACA_OPTIONS_KEY, OPTIONS_*) |
 | Architectural decisions | `docs/dev_notes.md` |
 | DB connection pool | `db/connection.py` |
 | Async batch writer + SessionManager | `db/writer.py` |
@@ -188,6 +197,21 @@ BAR → PopStrategyEngine._on_bar()
 - 18-test suite (T1-T18): 36 functions, 195 assertions; 17/18 pass (T4 latency marginal)
 
 ### What was added in the most recent session (2026-04-12)
+
+**T3.7 Options Engine — new subsystem (14 files created, 4 files modified):**
+- Self-contained options trading with 13 strategies (Long Call/Put, Bull/Bear spreads, Straddle/Strangle, Iron Condor/Butterfly, Calendar/Diagonal, Butterfly)
+- Separate Alpaca options account (`APCA_OPTIONS_KEY` / `APCA_OPTIONS_SECRET`)
+- Independent $10,000 budget ($500/trade, 5 concurrent positions, 5-min cooldown)
+- SIGNAL-driven directional selection (BUY/SELL based on RVOL/IV thresholds)
+- BAR-driven neutral/volatility scan (ATR/RSI/IV conditions)
+- OptionsRiskGate: independent of RiskEngine, cross-layer dedup via GlobalPositionRegistry
+- AlpacaOptionsBroker: 1-leg + multi-leg (combo) order execution
+- OptionStrategySelector: deterministic mapping from conditions → strategy type
+- AlpacaOptionChainClient: Alpaca options data API (contract lookup, delta/IV extraction)
+- Files: `options/{engine,selector,chain,risk,broker,strategies/{base,directional,vertical,volatility,neutral,time_based,complex}}.py`
+- Event: new `OPTIONS_SIGNAL` EventType with OptionsSignalPayload (ticker, strategy_type, legs_json, net_debit, max_risk, source)
+- Wired in `run_monitor.py` after PopStrategyEngine; preflight Check 7 validates Alpaca Options connectivity
+- Configuration: 9 new OPTIONS_* env vars (budget, DTE bounds, cooldown, paper mode)
 
 **Strategy audit (24 bugs found and fixed, C+ → A):**
 - P0: Parabolic exhaustion detection, ORB stop logic, cross-layer dedup (GlobalPositionRegistry), deferred FILL→position patching
@@ -354,6 +378,21 @@ POP_PAPER_TRADING=true
 POP_MAX_POSITIONS=3
 POP_TRADE_BUDGET=500
 POP_ORDER_COOLDOWN=300
+```
+
+### Options engine env vars (`.env`)
+
+```
+APCA_OPTIONS_KEY=PKxxxxxxxxxxxxxxxx
+APCA_OPTIONS_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPTIONS_PAPER_TRADING=true      # set false for live options trading
+OPTIONS_MAX_POSITIONS=5         # concurrent open positions
+OPTIONS_TRADE_BUDGET=500        # per trade max debit/risk
+OPTIONS_TOTAL_BUDGET=10000      # $10K account ceiling
+OPTIONS_ORDER_COOLDOWN=300      # seconds between trades on same ticker
+OPTIONS_MIN_DTE=20              # days to expiry (lower bound)
+OPTIONS_MAX_DTE=45              # days to expiry (upper bound)
+OPTIONS_LEAPS_DTE=365           # days to expiry (LEAPS threshold)
 ```
 
 ### Database env vars (`.env`)

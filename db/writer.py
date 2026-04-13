@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 # ── Tunables ──────────────────────────────────────────────────────────────────
 _BATCH_MAX      = int(os.getenv("DB_BATCH_MAX",              "200"))
 _FLUSH_INTERVAL = float(os.getenv("DB_FLUSH_INTERVAL",       "0.5"))   # seconds
-_QUEUE_MAXSIZE  = int(os.getenv("DB_QUEUE_MAXSIZE",          "10000"))
+_QUEUE_MAXSIZE  = int(os.getenv("DB_QUEUE_MAXSIZE",          "5000"))
 _CB_FAILURES    = int(os.getenv("DB_CIRCUIT_BREAKER_FAILURES", "5"))
 _CB_RESET       = int(os.getenv("DB_CIRCUIT_BREAKER_RESET",   "30"))   # seconds
 

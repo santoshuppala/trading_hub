@@ -10,7 +10,7 @@
 
 **Name:** Trading Hub
 **Repo path:** `~/Documents/santosh/trading_hub/trading_hub/`
-**Active branch:** `tradier_platform`
+**Active branch:** `tradinghub_db_integration`
 **Language:** Python 3.10+
 **Purpose:** Real-time intraday algorithmic trading system — live execution via Alpaca, bar data via Tradier, durable event log via Redpanda.
 
@@ -329,7 +329,7 @@ streamlit run app.py
 ## Branch status
 
 ```
-branch:  tradier_platform
+branch:  tradinghub_db_integration
 ahead of main by: ~15 commits
 uncommitted changes: yes (db/*, docker/*, README, dev_notes, model_switch_prompt,
                          requirements.txt, .gitignore)

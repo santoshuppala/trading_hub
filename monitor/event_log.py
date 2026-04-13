@@ -217,7 +217,7 @@ class DurableEventLog:
             'batch.size':                   102400,         # 100KB batch size
             'compression.type':             'snappy',       # 50-70% payload reduction
             'enable.idempotence':           True,           # exactly-once semantics (prevents duplicates on retry)
-            'queue.buffering.max.messages': 100_000,
+            'queue.buffering.max.messages': 50_000,
         }
         if extra_config:
             cfg.update(extra_config)

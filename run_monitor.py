@@ -1,7 +1,7 @@
 """
 Standalone monitor launcher — runs without Streamlit UI.
 Scheduled daily at 6:00 AM PST (9:00 AM ET, 30 min before open).
-Stops automatically at 3:15 PM ET after all positions are force-closed.
+Stops automatically at 4:00 PM ET after market close.
 """
 import os
 import signal
@@ -328,7 +328,7 @@ def main():
         log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
 
     monitor.start()
-    log.info("Monitor running. Will stop at 3:15 PM ET.")
+    log.info("Monitor running. Will stop at 4:00 PM ET.")
 
     # ── Trading halted flag (daily loss kill switch) ──────────────────────────
     trading_halted = False
@@ -336,9 +336,9 @@ def main():
     try:
         while True:
             now = datetime.now(ET)
-            # Stop at 3:15 PM ET (after 3 PM force-close has fired)
-            if now.hour == 15 and now.minute >= 15:
-                log.info("3:15 PM ET reached — stopping monitor.")
+            # Stop at 4:00 PM ET (market close)
+            if now.hour >= 16:
+                log.info("4:00 PM ET reached — stopping monitor.")
                 break
             # Heartbeat every minute — confirms process is alive
             trades     = monitor.trade_log

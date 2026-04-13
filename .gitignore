@@ -12,11 +12,12 @@ venv/
 env/
 
 # --- Data & Logs ---
-# Ignore local Parquet or CSV data files you might download
 *.parquet
 *.csv
 *.log
 trade_log.json
+test/logs/
+logs/
 
 # --- Docker / Database ---
 docker/data/

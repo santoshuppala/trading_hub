@@ -25,6 +25,7 @@
 17. [run_monitor.py — PopStrategyEngine Wiring](#17-run_monitorpy--popstrategyengine-wiring)
 18. [Pro-Setup Multi-Tier Strategy System](#18-pro-setup-multi-tier-strategy-system)
 19. [TimescaleDB Event Store — Database Layer](#19-timescaledb-event-store--database-layer)
+20. [Strategy Audit, Production Readiness & DB Optimization](#20-strategy-audit-production-readiness--db-optimization)
 
 ---
 
@@ -1417,4 +1418,67 @@ Migrations are idempotent SQL files executed in filename order. `trading.schema_
 | `docker/postgresql.conf` | NEW — tuned PG16 config |
 | `requirements.txt` | UPDATED — added asyncpg, psycopg |
 | `README.md` | UPDATED — database layer documentation |
+
+---
+
+## 20. Strategy Audit, Production Readiness & DB Optimization
+
+### Strategy Audit (24 bugs, C+ → A)
+
+Full audit documented in `docs/strategy_audit_report.md`. Key fixes:
+
+| Phase | Bugs | Critical Fixes |
+|-------|------|----------------|
+| P0 (4) | C-1 ORB stop, C-2 duplicate orders, C-3 FILL-before-position, C-4 parabolic exhaustion | GlobalPositionRegistry, deferred patching |
+| P1 (6) | C-5 ghost sells, C-6 RVOL inflation, C-7 halt bar[0], C-8 durable fail-fast, M-4 stop cap, M-14 global limits | Idempotent sells, Redpanda event filtering |
+| Hotfix (3) | H-1 registry leak, H-2 thread-safe init, H-3 patch identity | try/finally, double-checked locking |
+| P2 (11) | All remaining: gap detector, flag metadata, classifier voting, RSI fallback, VWAP breakdown 3-bar, etc. | Full list in audit report |
+
+### VWAP Reclaim Consolidation
+
+Removed duplicate T3.5 and T3.6 VWAP implementations. Created thin adapters that delegate to T4 `SignalAnalyzer`. One source of truth, zero logic duplication.
+
+### Production APIs
+
+| Adapter | API | Auth | Cache |
+|---------|-----|------|-------|
+| `pop_screener/benzinga_news.py` | Benzinga v2 News | API key | 60s |
+| `pop_screener/stocktwits_social.py` | StockTwits v2 Streams | Free public | 5m |
+
+### Production Features (run_monitor.py)
+
+- **Pre-market connectivity check**: Tradier, Alpaca, Benzinga, StockTwits, Redpanda, TimescaleDB
+- **Daily loss kill switch**: `MAX_DAILY_LOSS` threshold; force-closes positions + halts monitor
+- **Activity logging**: Every event → `trading.activity_log` hypertable (replaces CSV)
+- **System health snapshots**: Per-minute metrics → `trading.system_health_log`
+- **CrashRecovery**: Wired from Redpanda on startup; merges with bot_state.json
+
+### DB Optimization (migration 012)
+
+**Problem**: 8-12x write amplification per BAR event (activity_log + signal_analysis + original tables + 18 indexes).
+
+**Fixes applied**:
+- Dropped 7 redundant indexes (bar duplicate, GIN on JSONB, activity strategy/outcome)
+- Consolidated signal_analysis into activity_log metadata JSONB (eliminated separate table writes)
+- Suspended continuous aggregate auto-refresh during trading hours (saves ~200ms CPU per 5-min cycle)
+- Increased shared_buffers 256MB → 512MB, effective_cache_size 768MB → 2GB
+- Created `trading.refresh_aggregates()` function for post-market refresh
+- Rewrote `pro_strategy_performance` view without correlated subquery
+
+**Memory reduction**: ~370MB (550MB → 180MB hot set estimated)
+
+### Test Suite Expansion (T11-T18)
+
+8 new test files added (36 functions, 195 assertions). 17/18 pass (T4 latency marginal).
+
+### Files changed in this session
+
+| Category | Files |
+|----------|-------|
+| Bug fixes | 15 strategy/risk/execution files |
+| New files | `position_registry.py`, `benzinga_news.py`, `stocktwits_social.py`, `activity_logger.py` |
+| New migrations | 010 (lateral indexes), 011 (activity log), 012 (optimize writes) |
+| New tests | `test_11` through `test_18` |
+| New docs | `strategy_audit_report.md`, `production_readiness_report.md`, `analysis_queries.md` |
+| Updated | `run_monitor.py`, `config.py`, `README.md`, `dev_notes.md`, `model_switch_prompt.md`, `requirements.txt`, `.gitignore` |
 

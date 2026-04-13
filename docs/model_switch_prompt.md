@@ -10,7 +10,7 @@
 
 **Name:** Trading Hub
 **Repo path:** `~/Documents/santosh/trading_hub/trading_hub/`
-**Active branch:** `tradier_platform`
+**Active branch:** `tradinghub_db_integration`
 **Language:** Python 3.10+
 **Purpose:** Real-time intraday algorithmic trading system — live execution via Alpaca, bar data via Tradier, durable event log via Redpanda.
 
@@ -159,10 +159,17 @@ BAR → PopStrategyEngine._on_bar()
 | EventBus → DB bridge | `db/subscriber.py` |
 | DB read queries + replay | `db/reader.py` |
 | ML feature store | `db/feature_store.py` |
-| SQL migrations (001–009) | `db/migrations/sql/*.sql` |
+| SQL migrations (001–012) | `db/migrations/sql/*.sql` |
 | Migration runner | `db/migrations/run.py` |
+| Activity logger (all events → DB) | `db/activity_logger.py` |
+| Benzinga news adapter | `pop_screener/benzinga_news.py` |
+| StockTwits social adapter | `pop_screener/stocktwits_social.py` |
+| Cross-layer position dedup | `monitor/position_registry.py` |
 | Docker orchestration | `docker/docker-compose.yml` |
 | PostgreSQL tuning | `docker/postgresql.conf` |
+| Strategy audit report | `docs/strategy_audit_report.md` |
+| Production readiness report | `docs/production_readiness_report.md` |
+| Analysis queries (60+ SQL) | `docs/analysis_queries.md` |
 
 ---
 
@@ -173,39 +180,54 @@ BAR → PopStrategyEngine._on_bar()
 - EventBus v5.2: priority queues, causal partitioning, durable delivery, backpressure
 - VWAP Reclaim strategy: 9 entry filters, 6 exit conditions, LRU indicator cache
 - RiskEngine: 6 pre-trade checks (max positions, cooldown, reclaim-today, RVOL, RSI, spread)
-- AlpacaBroker: limit+retry buy (3 retries, 0.5% slippage cap), market sell
+- AlpacaBroker: limit+retry buy (2 retries, 5s timeout, 0.5% slippage cap), market sell with idempotent client_order_id + poll on exception
 - PaperBroker: local simulation, no API needed
-- CrashRecovery: exact stop/target/ATR from FillPayload (no more ±% approximations)
+- CrashRecovery: wired in run_monitor.py; rebuilds from Redpanda on startup
 - State persistence: atomic writes, Alpaca reconciliation on restart, StateEngine seeding
-- 10-test integration suite in `test/`; 9/10 pass (T4 latency: P95 53–58 ms vs 50 ms target)
+- GlobalPositionRegistry: cross-layer dedup prevents duplicate orders across T4/T3.6/T3.5
+- 18-test suite (T1-T18): 36 functions, 195 assertions; 17/18 pass (T4 latency marginal)
 
-### What was added in the most recent session
+### What was added in the most recent session (2026-04-12)
 
-- `PRO_STRATEGY_SIGNAL` EventType + `ProStrategySignalPayload` payload
-- `pro_setups/` package: 38 new files — 11 detectors, 11 strategies (3 tiers), classifier, router, RiskAdapter, ProSetupEngine
-- `run_monitor.py` wired to instantiate `ProSetupEngine` before `monitor.start()`
-- `config.py` added: `PRO_MAX_POSITIONS`, `PRO_TRADE_BUDGET`, `PRO_ORDER_COOLDOWN`
-- `POP_SIGNAL` EventType + `PopSignalPayload` payload
-- `pop_screener/` package: 6 rule-based screeners, 6 strategy engines, feature engineering, classifier, router
-- `pop_strategy_engine.py` T3.5 layer with `PopExecutor` (dedicated Alpaca account, independent risk gate)
-- `demo_pop_strategies.py` offline demo (0 errors)
-- `stop_price/target_price/atr_value` forwarded through `OrderRequestPayload → FillPayload → CrashRecovery`
-- BAR queue depth 200 → 500; TradierDataClient HTTP pool raised to `_MAX_WORKERS`
-- SignalAnalyzer LRU indicator cache (500 entries, FIFO eviction)
-- `run_monitor.py` wired to instantiate `PopStrategyEngine` with pop credentials before `monitor.start()`
-- `config.py` added: `ALPACA_POPUP_KEY`, `ALPACA_PUPUP_SECRET_KEY`, `POP_PAPER_TRADING`, `POP_MAX_POSITIONS`, `POP_TRADE_BUDGET`, `POP_ORDER_COOLDOWN`
-- `db/` package: async TimescaleDB event store — 9 SQL migrations, asyncpg pool, batch DBWriter with circuit breaker, DBSubscriber (EventBus → DB bridge), DBReader (replay + analysis), FeatureStore (ML features + outcome labels), SessionManager (session lifecycle)
-- `docker/` — Docker Compose for TimescaleDB 2.26 + Redpanda, tuned postgresql.conf
-- `db/migrations/run.py` — idempotent migration runner with advisory lock + schema_migrations tracking
-- Continuous aggregates: `bar_5m`, `bar_1h` — downsampled OHLCV views
-- Compression policies (7-day) + retention policies (7–365 days per table)
-- ML feature views: `ml_bar_features`, `daily_trade_summary`, `strategy_signal_rates`, `pro_strategy_performance`
+**Strategy audit (24 bugs found and fixed, C+ → A):**
+- P0: Parabolic exhaustion detection, ORB stop logic, cross-layer dedup (GlobalPositionRegistry), deferred FILL→position patching
+- P1: RVOL first-hour guard (60min), Alpaca sell idempotency, halt bar[0], durable_fail_fast=True, VWAP stop cap, global position limits
+- P2: GapDetector fallback, FlagPennant metadata, classifier direction voting, RSI NaN fallback, VWAP breakdown 3-bar, RSI band [40,75], fill timeout 5s, trailing stop protection, VWAP None, EMA min bars, BOPB lookback, earnings_flag
+
+**VWAP Reclaim integration:**
+- Removed duplicate T3.5/T3.6 VWAP implementations
+- Created thin adapters delegating to T4 SignalAnalyzer (zero duplication)
+
+**Database layer (12 migrations):**
+- `db/` package: asyncpg pool (min=4, max=20), COPY-based batch writer, circuit breaker
+- `db/activity_logger.py`: every signal/fill/block → activity_log hypertable
+- 6 analysis views: daily_strategy_scorecard, signal_pipeline_efficiency, rejection_analysis, slippage_analysis, health_timeline, activity_feed
+- Optimization: dropped redundant indexes, suspended continuous aggregate auto-refresh, increased shared_buffers to 512MB
+
+**Infrastructure:**
+- Docker: resource limits (2 CPU, 2GB) for TimescaleDB + Redpanda
+- Redpanda: acks=1, snappy compression, idempotent producer, skip non-critical events (~60% fewer writes)
+- PostgreSQL: synchronous_commit=off, autovacuum tuned, query logging 100ms
+
+**Production APIs:**
+- `pop_screener/benzinga_news.py`: Benzinga v2 News (live headlines + keyword sentiment, 60s cache)
+- `pop_screener/stocktwits_social.py`: StockTwits v2 Streams (free public, real bullish/bearish, 5m cache)
+
+**Production features:**
+- Pre-market connectivity check (Tradier, Alpaca, Benzinga, StockTwits, Redpanda, TimescaleDB)
+- Daily loss kill switch (MAX_DAILY_LOSS, force-closes all positions)
+- BAR n_workers 4→8 (latency fix)
+- System health snapshots → system_health_log (per-minute)
+- 8 new test files (T11-T18)
+- `docs/analysis_queries.md`: 60+ SQL queries for paper trading validation
 
 ### What is not yet done / known limitations
 
-- Short selling (PARABOLIC_REVERSAL) emits `POP_SIGNAL` only — `PopExecutor` skips `side != 'buy'` entries until short-selling is added
-- News/social adapters are mock only — real API adapters (Benzinga, StockTwits, etc.) not implemented
-- `social_baseline_velocity` and `headline_baseline_velocity` for feature normalisation are hardcoded defaults — a 7-day rolling average from a data store would be more accurate
+- Short selling (PARABOLIC_REVERSAL) emits `POP_SIGNAL` only — execution deferred until short infrastructure reviewed
+- Paper trading validation NOT YET DONE — zero trades through full automated pipeline
+- `social_baseline_velocity` and `headline_baseline_velocity` hardcoded — 7-day rolling average would be more accurate
+- No monitoring dashboard (operator uses pgAdmin + log files)
+- No backtest infrastructure for historical validation
 - T4 latency test marginal failure (P95 ~53–58 ms vs 50 ms target) — needs profiling to identify the remaining bottleneck
 
 ---
@@ -307,7 +329,7 @@ streamlit run app.py
 ## Branch status
 
 ```
-branch:  tradier_platform
+branch:  tradinghub_db_integration
 ahead of main by: ~15 commits
 uncommitted changes: yes (db/*, docker/*, README, dev_notes, model_switch_prompt,
                          requirements.txt, .gitignore)

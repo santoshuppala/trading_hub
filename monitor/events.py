@@ -61,8 +61,8 @@ ET = ZoneInfo('America/New_York')
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class Side(str, Enum):
-    BUY  = 'buy'
-    SELL = 'sell'
+    BUY  = 'BUY'
+    SELL = 'SELL'
 
     def __str__(self) -> str:
         return self.value
@@ -400,7 +400,7 @@ class FillPayload:
     Consumers : Position Manager (open/close positions), State Engine, Observability
     """
     ticker:      str
-    side:        Side   # 'buy' | 'sell'
+    side:        Side   # 'BUY' | 'SELL'
     qty:         int    # shares actually filled > 0
     fill_price:  float  # average fill price > 0
     order_id:    str    # broker order ID

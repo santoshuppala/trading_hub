@@ -125,7 +125,7 @@ trading_hub/
 │
 ├── db/                      # Async TimescaleDB event store (NEW)
 │   ├── __init__.py           # Public API: init_db, close_db, get_writer, SessionManager
-│   ├── connection.py         # asyncpg pool singleton (min=2, max=10)
+│   ├── connection.py         # asyncpg pool singleton (min=4, max=20)
 │   ├── writer.py             # Async batch DBWriter with circuit breaker
 │   ├── subscriber.py         # EventBus → DBWriter bridge (all event types)
 │   ├── reader.py             # Read queries: bars, fills, signals, sessions, replay
@@ -535,7 +535,7 @@ Docker Compose provisions two services on a shared `trading_net` bridge:
 
 ### Schema
 
-9 ordered SQL migrations in `db/migrations/sql/`:
+12 ordered SQL migrations in `db/migrations/sql/`:
 
 | Migration | Content |
 |-----------|---------|
@@ -548,78 +548,67 @@ Docker Compose provisions two services on a shared `trading_net` bridge:
 | `007_compression_retention` | Compression after 7 days, retention 7–365 days per table |
 | `008_views` | 5-min + 1-hour continuous aggregates, daily trade summary, ML feature view |
 | `009_session_log` | Session lifecycle table (start/stop, crash detection, writer metrics) |
+| `010_lateral_indexes` | LATERAL join indexes for feature_store (fill + bar ASC) |
+| `011_activity_log` | Activity log, signal analysis, system health, preflight, kill switch tables + 6 analysis views |
+| `012_optimize_writes` | Drop redundant indexes, suspend continuous aggregate auto-refresh, optimize pro_strategy_performance view |
 
 ### Python modules (`db/`)
 
 | Module | Responsibility |
 |--------|---------------|
-| `connection.py` | asyncpg pool singleton (min=2, max=10, UTC, `trading` schema) |
-| `writer.py` | Async batch writer: queue → batch drain → `executemany()`, circuit breaker (5 failures → 30s open) |
-| `subscriber.py` | EventBus → DBWriter bridge: subscribes at priority=10 (LOW), converts payloads to row dicts |
-| `reader.py` | Read queries: bars, fills, signals, pro signals, risk blocks, daily summary, session log, session replay |
-| `feature_store.py` | ML feature extraction: bar features, signal outcome labels, pro-signal outcomes, detector effectiveness |
-| `migrations/run.py` | Idempotent migration runner with advisory lock and `schema_migrations` tracking |
+| `connection.py` | asyncpg pool singleton (min=4, max=20, UTC, `trading` schema) |
+| `writer.py` | Async batch writer: COPY protocol with executemany fallback, circuit breaker |
+| `subscriber.py` | EventBus → DBWriter bridge: 9 event types at priority=10 |
+| `reader.py` | Read queries: bars, fills, signals, sessions, replay |
+| `feature_store.py` | ML feature extraction: bar features, signal outcomes, detector effectiveness |
+| `activity_logger.py` | Every signal/fill/block → activity_log; health snapshots; kill switch + preflight logging |
+| `migrations/run.py` | Idempotent migration runner with advisory lock |
 
-### Wiring into the monitor
+### Production APIs
 
-```python
-from db import init_db, close_db, get_writer, DBSubscriber, SessionManager
+| Adapter | File | API | Auth |
+|---------|------|-----|------|
+| `benzinga_news.py` | `pop_screener/` | Benzinga v2 News | API key (60s cache) |
+| `stocktwits_social.py` | `pop_screener/` | StockTwits v2 Streams | Free public (5m cache) |
 
-# At startup:
-pool = await init_db()                      # create asyncpg pool
-writer = get_writer()                       # singleton DBWriter
-await writer.start()                        # start background flush task
-subscriber = DBSubscriber(bus=monitor._bus, writer=writer)
-subscriber.register()                       # wire all EventBus subscriptions
+### Production features (`run_monitor.py`)
 
-session = SessionManager()
-await session.start(mode="live", broker="alpaca", tickers=TICKERS)
+| Feature | Description |
+|---------|-------------|
+| Pre-market connectivity check | Validates Tradier, Alpaca, Benzinga, StockTwits, Redpanda, TimescaleDB before trading |
+| Daily loss kill switch | `MAX_DAILY_LOSS` threshold; force-closes all positions and halts trading |
+| Activity logging to DB | Every event persisted to TimescaleDB for post-session analysis |
+| System health snapshots | Per-minute: tickers, positions, P&L, pressure, memory → system_health_log |
+| CrashRecovery from Redpanda | Rebuilds positions on startup from durable event log |
+| GlobalPositionRegistry | Cross-layer dedup prevents duplicate orders across T4/T3.6/T3.5 |
 
-# At shutdown:
-await session.stop(exit_reason="clean", writer=writer)
-await writer.stop()
-await close_db()
-```
+### Analysis views (query from pgAdmin/DBeaver)
 
-### Compression & retention
+| View | Purpose |
+|------|---------|
+| `daily_strategy_scorecard` | Per-strategy daily stats |
+| `signal_pipeline_efficiency` | Signal → order → fill rates |
+| `rejection_analysis` | Block reasons grouped by day |
+| `slippage_analysis` | Fill slippage per strategy |
+| `health_timeline` | System health over time |
+| `activity_feed` | Real-time event feed |
 
-| Table | Compress after | Drop after |
-|-------|---------------|------------|
-| bar_events | 7 days | 90 days |
-| signal_events | 7 days | 90 days |
-| order_req_events | 7 days | 365 days |
-| fill_events | 7 days | 365 days |
-| position_events | 7 days | 365 days |
-| pop_signal_events | 7 days | 90 days |
-| pro_strategy_signal_events | 7 days | 90 days |
-| risk_block_events | 7 days | 30 days |
-| heartbeat_events | 1 day | 7 days |
-
-### Continuous aggregates
-
-- `bar_5m` — 5-minute OHLCV rollup (refreshed every 5 min)
-- `bar_1h` — 1-hour OHLCV rollup (refreshed every 1 hour)
-
-### ML feature store
-
-The `FeatureStore` class provides:
-- **Bar features** — raw OHLCV + derived: bar_return, bar_range_pct, close_position, vol_ratio_20, price_vs_ma10
-- **Signal outcome labels** — BUY signals joined with subsequent fills (executed flag, outcome_return)
-- **Pro-signal outcomes** — R:R achieved, hit_target_1 flag
-- **Detector effectiveness** — per-strategy/tier execution rates and avg confidence
+See `docs/analysis_queries.md` for 60+ ready-to-use SQL queries.
 
 ### Environment variables
 
 ```
-# Database (defaults shown — override in .env)
-DATABASE_URL=postgresql://trading:trading_secret@localhost:5432/trading_hub
+# Database
+DB_ENABLED=true
+DATABASE_URL=postgresql://postgres:trading_secret@localhost:5432/tradinghub
 
-# DBWriter tuning (optional)
-DB_BATCH_MAX=200
-DB_FLUSH_INTERVAL=0.5
-DB_QUEUE_MAXSIZE=10000
-DB_CIRCUIT_BREAKER_FAILURES=5
-DB_CIRCUIT_BREAKER_RESET=30
+# External APIs
+BENZINGA_API_KEY=bz.xxxxxxxxxxxxxxxxxxxx
+STOCKTWITS_TOKEN=                # optional — public API works without
+
+# Risk
+MAX_DAILY_LOSS=-10000            # kill switch threshold (paper: -10000, live: -500)
+GLOBAL_MAX_POSITIONS=8           # aggregate limit across all layers
 ```
 
 ---
@@ -655,7 +644,7 @@ Logged (and optionally emailed) when the monitor stops:
 
 ## Test Suite
 
-Ten integration tests live in `test/`. Run all:
+18 tests (36 functions, 195+ assertions). Run all:
 
 ```bash
 python test/run_all_tests.py
@@ -663,16 +652,24 @@ python test/run_all_tests.py
 
 | Test | Coverage |
 |------|----------|
-| `test_1` | Synthetic bar feed correctness |
+| `test_1` | Synthetic bar feed (200 tickers × 100 bars) |
 | `test_2` | Tradier sandbox connectivity + bar fetch |
-| `test_3` | Redpanda event ordering consistency |
-| `test_4` | Market-open latency budget |
-| `test_5` | Network warmup + connection pool readiness |
-| `test_6` | Pipeline integration (feed → signal → order → fill) |
-| `test_7` | Risk engine boundary conditions |
-| `test_8` | Signal edge cases (RSI extremes, flat VWAP, zero volume) |
-| `test_9` | EventBus advanced (backpressure, coalescing, ordering) |
+| `test_3` | Redpanda event ordering + crash recovery |
+| `test_4` | Market-open latency (P95 target < 50ms) |
+| `test_5` | Network warmup + connection pool |
+| `test_6` | Full pipeline (BAR → SIGNAL → ORDER → FILL → POSITION) |
+| `test_7` | Risk engine boundary conditions (all 6 gates) |
+| `test_8` | SignalAnalyzer edge cases (NaN, zero vol, RSI extremes) |
+| `test_9` | EventBus advanced (circuit breaker, DLQ, coalescing, dedup) |
 | `test_10` | State persistence + crash recovery round-trip |
+| `test_11` | EventBus ordering, backpressure, overflow, exceptions |
+| `test_12` | Market data normalization, corruption, throughput |
+| `test_13` | Detector validation (ORB, no-signal, determinism, P99 latency) |
+| `test_14` | Strategy signals, risk limits, cooldown, replay parity |
+| `test_15` | Order lifecycle (new → filled, partial, cancel, idempotency) |
+| `test_16` | DB persistence, circuit breaker, hypertable verification |
+| `test_17` | Replay determinism (same inputs → identical outputs) |
+| `test_18` | Risk kill switch, position cap, tick → PnL E2E, concurrent load |
 
 ---
 

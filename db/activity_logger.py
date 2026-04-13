@@ -95,15 +95,26 @@ class ActivityLogger:
                 'metadata':       None,
                 'ingested_at':    datetime.now(timezone.utc),
             }
-            self._writer.enqueue('activity_log', row)
-
-            # ── signal_analysis (SIGNAL, POP_SIGNAL, PRO_STRATEGY_SIGNAL) ─────
+            # Enrich with signal-specific fields for SIGNAL/POP/PRO events
+            # (stored in activity_log.metadata JSONB to avoid separate table)
             if et in ('SIGNAL', 'POP_SIGNAL', 'PRO_STRATEGY_SIGNAL'):
-                self._log_signal_analysis(et, p, event)
+                entry = _float_attr(p, 'current_price', 'entry_price')
+                stop = _float_attr(p, 'stop_price')
+                t2 = _float_attr(p, 'target_price', 'target_2')
+                risk = (entry - stop) if (entry and stop and entry > stop) else None
+                reward = (t2 - entry) if (t2 and entry and t2 > entry) else None
+                rr = round(reward / risk, 2) if (risk and reward and risk > 0) else None
+                row['metadata'] = json.dumps({
+                    'rr_ratio': rr,
+                    'target_1': _float_attr(p, 'half_target', 'target_1'),
+                    'pop_reason': _str_attr(p, 'pop_reason'),
+                    'detectors_fired': _str_attr(p, 'detector_signals'),
+                })
 
-            # ── signal_analysis update on RISK_BLOCK ──────────────────────────
             if et == 'RISK_BLOCK':
-                self._log_block(p, event)
+                row['outcome'] = 'blocked'
+
+            self._writer.enqueue('activity_log', row)
 
         except Exception as exc:
             log.debug("ActivityLogger._on_event error: %s", exc)

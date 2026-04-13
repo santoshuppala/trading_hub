@@ -29,3 +29,6 @@ docker/data/
 .idea/
 *.swp
 *.swo
+
+#----Docs---
+docs/

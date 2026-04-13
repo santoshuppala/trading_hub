@@ -243,7 +243,7 @@ class PopExecutor:
             type=EventType.FILL,
             payload=FillPayload(
                 ticker=entry.symbol,
-                side='buy',
+                side='BUY',
                 qty=qty,
                 fill_price=fill_price,
                 order_id=order_id,
@@ -319,7 +319,7 @@ class PopExecutor:
                     type=EventType.FILL,
                     payload=FillPayload(
                         ticker=symbol,
-                        side='buy',
+                        side='BUY',
                         qty=filled_qty,
                         fill_price=avg_price,
                         order_id=order_id,
@@ -357,7 +357,7 @@ class PopExecutor:
             type=EventType.ORDER_FAIL,
             payload=OrderFailPayload(
                 ticker=entry.symbol,
-                side='buy',
+                side='BUY',
                 qty=qty,
                 price=price,
                 reason=f"pop: {reason}",

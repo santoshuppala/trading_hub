@@ -102,10 +102,9 @@ class OptionsEngine:
             try:
                 from alpaca.trading.client import TradingClient
                 trading_client = TradingClient(
-                    options_key,
-                    options_secret,
-                    paper=paper,
-                    base_url='https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+                    api_key=options_key,
+                    secret_key=options_secret,
+                    paper=paper
                 )
                 self._broker = AlpacaOptionsBroker(trading_client, alert_email)
             except ImportError:

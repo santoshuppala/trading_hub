@@ -319,12 +319,12 @@ class SignalAnalyzer:
             pos['stop_price'] = trail_stop
 
         if current_price <= pos['stop_price']:
-            return 'sell_stop'
+            return 'SELL_STOP'
         if current_price >= target_price:
-            return 'sell_target'
+            return 'SELL_TARGET'
         if rsi_value > rsi_overbought:
-            return 'sell_rsi'
+            return 'SELL_RSI'
         if vwap_breakdown:
-            return 'sell_vwap'
+            return 'SELL_VWAP'
 
         return None

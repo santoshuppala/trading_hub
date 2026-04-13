@@ -190,7 +190,7 @@ class StrategyEngine:
             type=EventType.SIGNAL,
             payload=SignalPayload(
                 ticker=ticker,
-                action='buy',
+                action='BUY',
                 current_price=current_price,
                 ask_price=current_price,          # Risk Engine will fetch a fresh quote
                 atr_value=atr_value,
@@ -266,7 +266,7 @@ class StrategyEngine:
             type=EventType.SIGNAL,
             payload=SignalPayload(
                 ticker=ticker,
-                action='sell_stop',
+                action='SELL_STOP',
                 current_price=current_price,
                 ask_price=current_price,
                 atr_value=atr_value,

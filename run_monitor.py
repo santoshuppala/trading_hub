@@ -422,7 +422,7 @@ def main():
                         monitor._bus.emit(Event(
                             type=EventType.ORDER_REQ,
                             payload=OrderRequestPayload(
-                                ticker=ticker_name, side='sell', qty=qty,
+                                ticker=ticker_name, side='SELL', qty=qty,
                                 price=pos.get('entry_price', 0),
                                 reason='kill_switch_daily_loss',
                             ),

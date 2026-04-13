@@ -112,7 +112,7 @@ class RiskEngine:
     def _on_signal(self, event: Event) -> None:
         p: SignalPayload = event.payload
 
-        if p.action == 'buy':
+        if p.action == 'BUY':
             self._handle_buy(p, event)
         else:
             # Sell signals bypass all risk checks — exits must always execute.
@@ -193,7 +193,7 @@ class RiskEngine:
                 type=EventType.ORDER_REQ,
                 payload=OrderRequestPayload(
                     ticker=ticker,
-                    side='buy',
+                    side='BUY',
                     qty=qty,
                     price=effective_entry,
                     reason='VWAP reclaim',
@@ -237,7 +237,7 @@ class RiskEngine:
             type=EventType.ORDER_REQ,
             payload=OrderRequestPayload(
                 ticker=ticker,
-                side='sell',
+                side='SELL',
                 qty=sell_qty,
                 price=p.current_price,
                 reason=p.action,

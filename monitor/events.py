@@ -69,22 +69,22 @@ class Side(str, Enum):
 
 
 class SignalAction(str, Enum):
-    BUY          = 'buy'
-    SELL_STOP    = 'sell_stop'
-    SELL_TARGET  = 'sell_target'
-    SELL_RSI     = 'sell_rsi'
-    SELL_VWAP    = 'sell_vwap'
-    PARTIAL_SELL = 'partial_sell'
-    HOLD         = 'hold'
+    BUY          = 'BUY'
+    SELL_STOP    = 'SELL_STOP'
+    SELL_TARGET  = 'SELL_TARGET'
+    SELL_RSI     = 'SELL_RSI'
+    SELL_VWAP    = 'SELL_VWAP'
+    PARTIAL_SELL = 'PARTIAL_SELL'
+    HOLD         = 'HOLD'
 
     def __str__(self) -> str:
         return self.value
 
 
 class PositionAction(str, Enum):
-    OPENED       = 'opened'
-    PARTIAL_EXIT = 'partial_exit'
-    CLOSED       = 'closed'
+    OPENED       = 'OPENED'
+    PARTIAL_EXIT = 'PARTIAL_EXIT'
+    CLOSED       = 'CLOSED'
 
     def __str__(self) -> str:
         return self.value

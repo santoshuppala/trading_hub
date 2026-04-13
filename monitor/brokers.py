@@ -53,7 +53,7 @@ class BaseBroker(ABC):
 
     def _on_order_request(self, event: Event) -> None:
         p: OrderRequestPayload = event.payload
-        if p.side == 'buy':
+        if p.side == 'BUY':
             self._execute_buy(p)
         else:
             self._execute_sell(p)
@@ -161,7 +161,7 @@ class AlpacaBroker(BaseBroker):
                     f"(limit ${limit_price:.2f}, attempt {attempt})",
                 )
                 self._bus.emit(Event(EventType.FILL, FillPayload(
-                    ticker=p.ticker, side='buy', qty=filled_qty,
+                    ticker=p.ticker, side='BUY', qty=filled_qty,
                     fill_price=avg_price, order_id=order_id, reason=p.reason,
                     stop_price=p.stop_price, target_price=p.target_price,
                     atr_value=p.atr_value,
@@ -240,7 +240,7 @@ class AlpacaBroker(BaseBroker):
                 f"SELL {p.qty} {p.ticker} at market (order {order_id})",
             )
             self._bus.emit(Event(EventType.FILL, FillPayload(
-                ticker=p.ticker, side='sell', qty=p.qty,
+                ticker=p.ticker, side='SELL', qty=p.qty,
                 fill_price=p.price, order_id=order_id, reason=p.reason,
             )))
         except Exception as e:
@@ -262,7 +262,7 @@ class AlpacaBroker(BaseBroker):
                         f"(qty={filled_qty} @ ${fill_price:.2f}) — emitting FILL"
                     )
                     self._bus.emit(Event(EventType.FILL, FillPayload(
-                        ticker=p.ticker, side='sell', qty=filled_qty,
+                        ticker=p.ticker, side='SELL', qty=filled_qty,
                         fill_price=fill_price, order_id=order_id, reason=p.reason,
                     )))
                     return
@@ -295,7 +295,7 @@ class PaperBroker(BaseBroker):
         order_id = str(uuid.uuid4())
         log.info(f"[PAPER] BUY  {p.qty:>4} {p.ticker:<6} @ ${p.price:.2f}  ({p.reason})")
         self._bus.emit(Event(EventType.FILL, FillPayload(
-            ticker=p.ticker, side='buy', qty=p.qty,
+            ticker=p.ticker, side='BUY', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
             stop_price=p.stop_price, target_price=p.target_price,
             atr_value=p.atr_value,
@@ -305,7 +305,7 @@ class PaperBroker(BaseBroker):
         order_id = str(uuid.uuid4())
         log.info(f"[PAPER] SELL {p.qty:>4} {p.ticker:<6} @ ${p.price:.2f}  ({p.reason})")
         self._bus.emit(Event(EventType.FILL, FillPayload(
-            ticker=p.ticker, side='sell', qty=p.qty,
+            ticker=p.ticker, side='SELL', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
         )))
 

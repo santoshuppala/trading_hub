@@ -143,7 +143,7 @@ class PositionManager:
             type=EventType.POSITION,
             payload=PositionPayload(
                 ticker=ticker,
-                action='opened',
+                action='OPENED',
                 position=PositionSnapshot(
                     entry_price=pos['entry_price'],
                     entry_time=pos['entry_time'],
@@ -216,7 +216,7 @@ class PositionManager:
                 type=EventType.POSITION,
                 payload=PositionPayload(
                     ticker=ticker,
-                    action='partial_exit',
+                    action='PARTIAL_EXIT',
                     position=PositionSnapshot(
                         entry_price=pos['entry_price'],
                         entry_time=pos.get('entry_time', ''),
@@ -259,7 +259,7 @@ class PositionManager:
             type=EventType.POSITION,
             payload=PositionPayload(
                 ticker=ticker,
-                action='closed',
+                action='CLOSED',
                 position=None,
                 pnl=pnl,
             ),

@@ -1,20 +1,43 @@
 {
-  "date": "2026-04-12",
-  "positions": {},
-  "reclaimed_today": [
-    "AAPL"
-  ],
-  "trade_log": [
-    {
-      "ticker": "AAPL",
-      "entry_price": 150.0,
-      "entry_time": "16:47:40",
-      "exit_price": 152.0,
-      "qty": 10,
-      "pnl": 20.0,
-      "reason": "test_exit",
-      "time": "16:47:40",
-      "is_win": true
+  "date": "2026-04-13",
+  "positions": {
+    "ZS": {
+      "entry_price": 116.9,
+      "qty": 7,
+      "stop_price": 113.393,
+      "target_price": 122.745,
+      "half_target": 119.8225,
+      "entry_time": "alpaca_restored",
+      "reason": "alpaca_reconciliation",
+      "atr_value": 4.676
+    },
+    "NU": {
+      "entry_price": 14.81,
+      "entry_time": "10:22:49",
+      "quantity": 4,
+      "partial_done": false,
+      "order_id": "e3ff5f56-54a5-4cb8-952c-23550549d101",
+      "stop_price": 14.779285714285715,
+      "target_price": 14.9581,
+      "half_target": 14.884049999999998,
+      "atr_value": null
+    },
+    "HUT": {
+      "entry_price": 68.58,
+      "entry_time": "10:22:51",
+      "quantity": 1,
+      "partial_done": false,
+      "order_id": "fcf9f775-730f-4024-8c06-5b85a30eeec9",
+      "stop_price": 68.2371,
+      "target_price": 69.2658,
+      "half_target": 68.92289999999998,
+      "atr_value": null
     }
-  ]
+  },
+  "reclaimed_today": [
+    "ZS",
+    "NU",
+    "HUT"
+  ],
+  "trade_log": []
 }

@@ -53,7 +53,7 @@ class LongCall(BaseOptionsStrategy):
                 legs=[
                     OptionLeg(
                         symbol=call.symbol,
-                        side='buy',
+                        side='BUY',
                         qty=1,
                         ratio=1,
                         limit_price=premium,
@@ -111,7 +111,7 @@ class LongPut(BaseOptionsStrategy):
                 legs=[
                     OptionLeg(
                         symbol=put.symbol,
-                        side='buy',
+                        side='BUY',
                         qty=1,
                         ratio=1,
                         limit_price=premium,

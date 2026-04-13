@@ -223,8 +223,157 @@ def main():
         f"news={'benzinga' if news_source else 'mock'} | social=stocktwits"
     )
 
+    # ── Pre-market connectivity check ─────────────────────────────────────────
+    from config import MAX_DAILY_LOSS
+    log.info("=" * 60)
+    log.info("PRE-MARKET CONNECTIVITY CHECK")
+    log.info("=" * 60)
+    preflight_ok = True
+
+    # Check 1: Tradier data source
+    if DATA_SOURCE == 'tradier' and TRADIER_TOKEN:
+        try:
+            import requests as _req
+            r = _req.get('https://api.tradier.com/v1/markets/quotes',
+                         params={'symbols': 'SPY', 'greeks': 'false'},
+                         headers={'Authorization': f'Bearer {TRADIER_TOKEN}', 'Accept': 'application/json'},
+                         timeout=5)
+            if r.status_code == 200:
+                log.info("  [OK] Tradier API: connected (status 200)")
+            else:
+                log.warning(f"  [WARN] Tradier API: status {r.status_code}")
+        except Exception as e:
+            log.error(f"  [FAIL] Tradier API: {e}")
+            preflight_ok = False
+    else:
+        log.info("  [SKIP] Tradier: not configured as data source")
+
+    # Check 2: Alpaca broker
+    if ALPACA_API_KEY and ALPACA_SECRET:
+        try:
+            import requests as _req
+            base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+            r = _req.get(f'{base}/v2/account',
+                         headers={'APCA-API-KEY-ID': ALPACA_API_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET},
+                         timeout=5)
+            if r.status_code == 200:
+                acct = r.json()
+                bp = acct.get('buying_power', '?')
+                status = acct.get('status', '?')
+                is_paper = 'paper' in base
+                log.info(f"  [OK] Alpaca: connected | status={status} | buying_power=${bp} | paper={is_paper}")
+            else:
+                log.error(f"  [FAIL] Alpaca: status {r.status_code}")
+                preflight_ok = False
+        except Exception as e:
+            log.error(f"  [FAIL] Alpaca API: {e}")
+            preflight_ok = False
+    else:
+        log.error("  [FAIL] Alpaca: API keys not set")
+        preflight_ok = False
+
+    # Check 3: Benzinga news
+    if BENZINGA_API_KEY:
+        try:
+            import requests as _req
+            r = _req.get('https://api.benzinga.com/api/v2/news',
+                         params={'token': BENZINGA_API_KEY, 'tickers': 'SPY', 'pageSize': '1'},
+                         headers={'Accept': 'application/json'}, timeout=5)
+            log.info(f"  [OK] Benzinga API: status {r.status_code}")
+        except Exception as e:
+            log.warning(f"  [WARN] Benzinga API: {e} (pop screener will use fallback)")
+    else:
+        log.info("  [SKIP] Benzinga: no API key (pop screener uses mock news)")
+
+    # Check 4: StockTwits
+    try:
+        import requests as _req
+        r = _req.get('https://api.stocktwits.com/api/2/streams/symbol/SPY.json',
+                     headers={'User-Agent': 'TradingHub/1.0'}, timeout=5)
+        log.info(f"  [OK] StockTwits API: status {r.status_code}")
+    except Exception as e:
+        log.warning(f"  [WARN] StockTwits API: {e} (pop screener will use neutral sentiment)")
+
+    # Check 5: Redpanda
+    try:
+        import socket
+        rp_host, rp_port = redpanda_brokers.split(':')
+        sock = socket.create_connection((rp_host, int(rp_port)), timeout=3)
+        sock.close()
+        log.info(f"  [OK] Redpanda: reachable at {redpanda_brokers}")
+    except Exception as e:
+        log.warning(f"  [WARN] Redpanda: {e} (durable logging unavailable)")
+
+    # Check 6: TimescaleDB
+    if DB_ENABLED_RUNTIME:
+        log.info("  [OK] TimescaleDB: connected (pool initialized)")
+    else:
+        log.info("  [SKIP] TimescaleDB: disabled or unreachable")
+
+    log.info("=" * 60)
+    if preflight_ok:
+        log.info("PRE-MARKET CHECK: ALL CRITICAL SYSTEMS OK")
+    else:
+        log.error("PRE-MARKET CHECK: CRITICAL FAILURES DETECTED — review above")
+    log.info("=" * 60)
+
+    # ── Signal instrumentation (log every event to CSV for analysis) ───────────
+    signal_log_path = os.path.join(log_dir, f"signals_{datetime.now().strftime('%Y-%m-%d')}.csv")
+    _signal_log_file = open(signal_log_path, 'a')
+    _signal_log_started = os.path.getsize(signal_log_path) == 0 if os.path.exists(signal_log_path) else True
+
+    if _signal_log_started:
+        _signal_log_file.write(
+            "timestamp,event_type,ticker,action,price,stop,target,qty,"
+            "reason,atr,rsi,rvol,confidence,strategy,tier,stream_seq\n"
+        )
+        _signal_log_file.flush()
+
+    from monitor.event_bus import EventType, Event
+
+    def _instrument_event(event: Event) -> None:
+        """Log every trading-relevant event to CSV for post-session analysis."""
+        try:
+            p = event.payload
+            now_str = datetime.now(ET).strftime('%H:%M:%S.%f')[:-3]
+            et = event.type.name
+            ticker = getattr(p, 'ticker', getattr(p, 'symbol', ''))
+            action = getattr(p, 'action', getattr(p, 'side', ''))
+            price = getattr(p, 'current_price', getattr(p, 'fill_price',
+                    getattr(p, 'entry_price', getattr(p, 'price', ''))))
+            stop = getattr(p, 'stop_price', '')
+            target = getattr(p, 'target_price', getattr(p, 'target_2', ''))
+            qty = getattr(p, 'qty', '')
+            reason = getattr(p, 'reason', getattr(p, 'pop_reason', ''))
+            atr = getattr(p, 'atr_value', '')
+            rsi = getattr(p, 'rsi_value', '')
+            rvol = getattr(p, 'rvol', '')
+            conf = getattr(p, 'confidence', getattr(p, 'strategy_confidence', ''))
+            strat = getattr(p, 'strategy_name', getattr(p, 'strategy_type', ''))
+            tier = getattr(p, 'tier', '')
+            seq = event.stream_seq or ''
+
+            _signal_log_file.write(
+                f"{now_str},{et},{ticker},{action},{price},{stop},{target},{qty},"
+                f"{reason},{atr},{rsi},{rvol},{conf},{strat},{tier},{seq}\n"
+            )
+            _signal_log_file.flush()
+        except Exception:
+            pass  # instrumentation must never crash the pipeline
+
+    # Subscribe to all trading-relevant events at lowest priority (runs last)
+    for et in [EventType.SIGNAL, EventType.ORDER_REQ, EventType.FILL,
+               EventType.ORDER_FAIL, EventType.POSITION, EventType.RISK_BLOCK,
+               EventType.POP_SIGNAL, EventType.PRO_STRATEGY_SIGNAL]:
+        monitor._bus.subscribe(et, _instrument_event, priority=99)
+
+    log.info(f"Signal instrumentation active → {signal_log_path}")
+
     monitor.start()
     log.info("Monitor running. Will stop at 3:15 PM ET.")
+
+    # ── Trading halted flag (daily loss kill switch) ──────────────────────────
+    trading_halted = False
 
     try:
         while True:
@@ -238,12 +387,43 @@ def main():
             positions  = monitor.positions
             tickers    = monitor.tickers
             wins       = sum(1 for t in trades if t['is_win'])
+            losses     = len(trades) - wins
             total_pnl  = sum(t['pnl'] for t in trades)
+
+            # ── DAILY LOSS KILL SWITCH ────────────────────────────────────────
+            if not trading_halted and total_pnl <= MAX_DAILY_LOSS:
+                trading_halted = True
+                log.error(
+                    f"KILL SWITCH ACTIVATED: daily P&L ${total_pnl:+.2f} "
+                    f"breached limit ${MAX_DAILY_LOSS:+.2f} | "
+                    f"trades={len(trades)} wins={wins} losses={losses}"
+                )
+                log.error("HALTING ALL TRADING — force-closing open positions")
+                # Force-close all open positions via market sell
+                for ticker_name in list(positions.keys()):
+                    pos = positions[ticker_name]
+                    qty = pos.get('quantity', 0)
+                    if qty > 0:
+                        from monitor.events import OrderRequestPayload
+                        monitor._bus.emit(Event(
+                            type=EventType.ORDER_REQ,
+                            payload=OrderRequestPayload(
+                                ticker=ticker_name, side='sell', qty=qty,
+                                price=pos.get('entry_price', 0),
+                                reason='kill_switch_daily_loss',
+                            ),
+                        ))
+                        log.error(f"  KILL SWITCH: force-sell {qty} {ticker_name}")
+                # Stop the monitor to prevent new trades
+                monitor.stop()
+                log.error("Monitor stopped by kill switch. No further trading today.")
+                break
+
             log.info(
                 f"[heartbeat] scanning {len(tickers)} tickers | "
                 f"open positions: {len(positions)} {list(positions.keys()) or 'none'} | "
-                f"trades today: {len(trades)} ({wins} wins) | "
-                f"PnL: ${total_pnl:+.2f}"
+                f"trades today: {len(trades)} ({wins}W/{losses}L) | "
+                f"PnL: ${total_pnl:+.2f} | kill_switch: ${MAX_DAILY_LOSS:+.2f}"
             )
             # DB + Redpanda health check
             if DB_ENABLED_RUNTIME and db_writer:
@@ -253,12 +433,20 @@ def main():
                 )
             # Hourly summary
             if now.minute == 0 and trades:
-                log.info(f"Hourly summary: {len(trades)} trades | {wins} wins | PnL: ${total_pnl:+.2f}")
+                log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}")
             time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
     finally:
-        monitor.stop()
+        if not trading_halted:
+            monitor.stop()
+
+        # Close signal instrumentation log
+        try:
+            _signal_log_file.close()
+            log.info(f"Signal log saved: {signal_log_path}")
+        except Exception:
+            pass
 
         # ── Shutdown DB layer gracefully ─────────────────────────────────────
         if DB_ENABLED_RUNTIME and db_loop is not None:

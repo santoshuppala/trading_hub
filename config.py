@@ -83,7 +83,7 @@ PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
 ALPACA_POPUP_KEY          = os.getenv('APCA_POPUP_KEY')
 ALPACA_PUPUP_SECRET_KEY   = os.getenv('APCA_PUPUP_SECRET_KEY')
 POP_PAPER_TRADING         = os.getenv('POP_PAPER_TRADING', 'true').lower() == 'true'
-POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 3))    # max concurrent pop positions
+POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 25))   # max concurrent pop positions
 POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 500))   # dollars per pop trade
 POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds cooldown per ticker
 
@@ -92,7 +92,7 @@ POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds 
 # Execution goes through the shared AlpacaBroker via ORDER_REQ events.
 # RiskAdapter is the independent risk gate; existing RiskEngine is not used for
 # pro-setup entries.
-PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))    # max concurrent pro positions
+PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   25))   # max concurrent pro positions
 PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))   # dollars allocated per pro trade
 PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))  # seconds cooldown per ticker
 

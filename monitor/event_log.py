@@ -699,7 +699,7 @@ class CrashRecovery:
                             'time':        rec.get('timestamp', '')[:8],
                             'is_win':      pnl >= 0,
                         })
-                        if remaining > 0 and reason == 'partial_sell':
+                        if remaining > 0 and reason == 'PARTIAL_SELL':
                             pos['quantity'] = remaining
                             pos['partial_done'] = True
                             pos['stop_price']   = pos['entry_price']

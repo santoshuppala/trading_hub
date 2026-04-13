@@ -194,7 +194,7 @@ class PositionManager:
 
         # Partial exit: qty sold is less than total position
         remaining = pos['quantity'] - qty
-        if remaining > 0 and reason == 'partial_sell':
+        if remaining > 0 and reason == 'PARTIAL_SELL':
             pos['quantity']     = remaining
             pos['partial_done'] = True
             # Move stop to breakeven only if it's currently below entry (don't lower a trailing stop)

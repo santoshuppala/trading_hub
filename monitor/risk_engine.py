@@ -224,7 +224,7 @@ class RiskEngine:
             return
 
         # Partial exit sells half; guard against qty=1 (can't split)
-        if p.action == 'partial_sell':
+        if p.action == 'PARTIAL_SELL':
             sell_qty = qty // 2
             if sell_qty <= 0:
                 log.info(f"[RiskEngine] Skipping partial sell for {ticker}: qty={qty} too small.")

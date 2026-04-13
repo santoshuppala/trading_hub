@@ -145,7 +145,7 @@ class SignalAnalyzer:
         -------
         dict with keys:
             action          : str or None — 'buy', 'sell_stop', 'sell_target',
-                              'sell_rsi', 'sell_vwap', 'sell_eod', 'partial_sell', None
+                              'sell_rsi', 'sell_vwap', 'sell_eod', 'PARTIAL_SELL', None
             current_price   : float or None
             ask_price       : float or None  (populated by caller after spread check)
             spread_pct      : float or None  (populated by caller after spread check)
@@ -291,7 +291,7 @@ class SignalAnalyzer:
         -------
         str or None
             One of: 'sell_stop', 'sell_target', 'sell_rsi', 'sell_vwap',
-            'partial_sell', None
+            'PARTIAL_SELL', None
         """
         result = self.analyze(ticker, data, rvol_cache)
         if result is None:
@@ -311,7 +311,7 @@ class SignalAnalyzer:
 
         # Partial exit — sell 50% at 1x ATR, move stop to breakeven
         if not partial_done and current_price >= half_target and qty >= 2:
-            return 'partial_sell'
+            return 'PARTIAL_SELL'
 
         # Trailing stop update (caller is responsible for updating pos)
         trail_stop = current_price - (atr_value * 1.0)

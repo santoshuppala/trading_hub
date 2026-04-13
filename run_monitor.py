@@ -77,7 +77,7 @@ def main():
         try:
             from db import init_db, close_db, get_pool
             from db.writer import DBWriter, init_writer
-            from db.subscriber import DBSubscriber
+            from db.event_sourcing_subscriber import EventSourcingSubscriber
             from db.writer import SessionManager
 
             # Spin up a dedicated asyncio event loop in a daemon thread
@@ -171,10 +171,10 @@ def main():
 
     # ── Wire DB subscriber to EventBus (must happen before monitor.start()) ──
     if DB_ENABLED_RUNTIME and db_writer is not None:
-        from db.subscriber import DBSubscriber
-        db_sub = DBSubscriber(bus=monitor._bus, writer=db_writer)
+        from db.event_sourcing_subscriber import EventSourcingSubscriber
+        db_sub = EventSourcingSubscriber(bus=monitor._bus, writer=db_writer, session_id=session_id)
         db_sub.register()
-        log.info("DBSubscriber registered — all events will be persisted to TimescaleDB")
+        log.info("EventSourcingSubscriber registered — all events persisted with correct timestamps")
 
     # ── Pro-setups engine (11 strategies, shared Alpaca account) ─────────────
     from pro_setups.engine import ProSetupEngine

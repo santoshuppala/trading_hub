@@ -2,6 +2,7 @@
 # Never commit your Alpaca or Email credentials
 .env
 .env.local
+bot_state.json
 
 # --- Python Artifacts ---
 __pycache__/

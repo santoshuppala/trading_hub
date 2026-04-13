@@ -1,6 +1,18 @@
 {
   "date": "2026-04-13",
   "positions": {
+    "HUBS": {
+      "entry_price": 206.93,
+      "entry_time": "alpaca_restored",
+      "quantity": 2,
+      "qty": 2,
+      "partial_done": false,
+      "order_id": "alpaca_reconciliation",
+      "stop_price": 200.72,
+      "target_price": 217.28,
+      "half_target": 212.1,
+      "atr_value": 3.28
+    },
     "HUT": {
       "entry_price": 68.58,
       "entry_time": "07:23:16",
@@ -16,16 +28,18 @@
     "NU": {
       "entry_price": 14.81,
       "entry_time": "10:22:49",
-      "quantity": 4,
+      "quantity": 67,
+      "qty": 67,
       "partial_done": false,
       "order_id": "e3ff5f56-54a5-4cb8-952c-23550549d101",
-      "stop_price": 14.779285714285715,
-      "target_price": 14.9581,
-      "half_target": 14.884049999999998,
-      "atr_value": null
+      "stop_price": 14.6482,
+      "target_price": 15.0318,
+      "half_target": 14.84,
+      "atr_value": 0.0918
     }
   },
   "reclaimed_today": [
+    "HUBS",
     "NU",
     "HUT"
   ],

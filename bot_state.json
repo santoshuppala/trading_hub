@@ -1,16 +1,6 @@
 {
   "date": "2026-04-13",
   "positions": {
-    "ZS": {
-      "entry_price": 116.9,
-      "qty": 7,
-      "stop_price": 113.393,
-      "target_price": 122.745,
-      "half_target": 119.8225,
-      "entry_time": "alpaca_restored",
-      "reason": "alpaca_reconciliation",
-      "atr_value": 4.676
-    },
     "NU": {
       "entry_price": 14.81,
       "entry_time": "10:22:49",
@@ -35,7 +25,6 @@
     }
   },
   "reclaimed_today": [
-    "ZS",
     "NU",
     "HUT"
   ],

@@ -433,18 +433,8 @@ def main():
                 log.error("Monitor stopped by kill switch. No further trading today.")
                 break
 
-            log.info(
-                f"[heartbeat] scanning {len(tickers)} tickers | "
-                f"open positions: {len(positions)} {list(positions.keys()) or 'none'} | "
-                f"trades today: {len(trades)} ({wins}W/{losses}L) | "
-                f"PnL: ${total_pnl:+.2f} | kill_switch: ${MAX_DAILY_LOSS:+.2f}"
-            )
-            # DB health + activity logging
+            # Activity logging to TimescaleDB
             if DB_ENABLED_RUNTIME and db_writer:
-                log.info(
-                    f"[heartbeat] DB: written={db_writer.rows_written} "
-                    f"dropped={db_writer.rows_dropped} batches={db_writer.batches_flushed}"
-                )
                 if activity_logger:
                     try:
                         metrics = monitor._bus.metrics()

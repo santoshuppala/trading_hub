@@ -28,11 +28,15 @@ log = logging.getLogger(__name__)
 _alert_queue: queue.Queue = queue.Queue(maxsize=200)
 _worker_started = False
 _worker_lock = threading.Lock()
+_consecutive_failures = 0
+_backoff_until = 0.0
 
 
 def _alert_worker() -> None:
     """Daemon thread: drain the queue and send each email."""
     import time
+    global _consecutive_failures, _backoff_until
+
     server = None
     last_send_time = 0.0
 
@@ -41,6 +45,17 @@ def _alert_worker() -> None:
         if item is None:          # sentinel — stop signal
             break
         alert_email, message = item
+
+        now = time.time()
+
+        # Exponential backoff: if many consecutive failures, wait before retry
+        if now < _backoff_until:
+            wait_time = _backoff_until - now
+            log.warning(
+                f"Alert backoff active ({wait_time:.1f}s remaining) — "
+                f"{_consecutive_failures} consecutive failures"
+            )
+            time.sleep(min(wait_time, 5.0))  # cap wait at 5s per message
 
         # Rate limiting: minimum 1 second between sends
         elapsed = time.time() - last_send_time
@@ -53,8 +68,20 @@ def _alert_worker() -> None:
 
         success = _deliver_with_connection(server, alert_email, message)
         if not success:
-            # Connection failed — discard and reconnect next time
+            # Connection failed — increment backoff counter
+            _consecutive_failures += 1
+            # Exponential backoff: 2^failures seconds (1s, 2s, 4s, 8s, 16s max)
+            backoff_secs = min(2 ** _consecutive_failures, 16)
+            _backoff_until = time.time() + backoff_secs
+            log.warning(
+                f"Alert delivery failed — backoff {backoff_secs}s "
+                f"({_consecutive_failures} consecutive failures)"
+            )
             server = None
+        else:
+            # Success — reset failure counter
+            _consecutive_failures = 0
+            _backoff_until = 0.0
 
         last_send_time = time.time()
         _alert_queue.task_done()
@@ -116,8 +143,14 @@ def _get_smtp_connection():
             'and if using Gmail enable an App Password.'
         )
         return None
+    except (ConnectionRefusedError, ConnectionResetError, TimeoutError) as e:
+        log.warning(f"SMTP connection refused: {e} — server may be rate-limiting")
+        return None
+    except smtplib.SMTPException as e:
+        log.warning(f"SMTP server error: {e} — will backoff and retry")
+        return None
     except Exception as e:
-        log.warning(f"SMTP connection failed: {e} — will retry next alert")
+        log.warning(f"SMTP connection failed: {e}")
         return None
 
 

@@ -62,7 +62,7 @@ STRATEGY_PARAMS = {
 
 # ── Risk / order settings ──────────────────────────────────────────────────────
 MAX_POSITIONS  = 5
-GLOBAL_MAX_POSITIONS = int(os.getenv('GLOBAL_MAX_POSITIONS', 8))  # aggregate limit across ALL layers
+GLOBAL_MAX_POSITIONS = int(os.getenv('GLOBAL_MAX_POSITIONS', 75))  # aggregate limit across ALL layers
 MAX_DAILY_LOSS = float(os.getenv('MAX_DAILY_LOSS', -10000))  # kill switch: halt trading if daily P&L drops below this
 ORDER_COOLDOWN = 300   # seconds between orders on same ticker
 TRADE_BUDGET   = int(os.getenv('TRADE_BUDGET', 1000))  # dollars allocated per trade

@@ -27,11 +27,14 @@ from config import (
     TICKERS, STRATEGY, STRATEGY_PARAMS,
     OPEN_COST, CLOSE_COST, MAX_POSITIONS, ORDER_COOLDOWN, TRADE_BUDGET,
     ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, TRADIER_TOKEN,
-    PAPER_TRADING, DATA_SOURCE,
+    PAPER_TRADING, DATA_SOURCE, BROKER,
     ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
     POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
     PRO_MAX_POSITIONS, PRO_TRADE_BUDGET, PRO_ORDER_COOLDOWN,
+    GLOBAL_MAX_POSITIONS,
+    DB_ENABLED, DATABASE_URL,
 )
+from monitor.position_registry import registry
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
@@ -50,10 +53,91 @@ log = logging.getLogger(__name__)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"Starting monitor | Strategy: {STRATEGY} | Tickers: {len(TICKERS)} | Paper: {PAPER_TRADING} | Data: {DATA_SOURCE}")
+    import asyncio
+    import hashlib
+    import json
+    import threading
+
+    # Initialize global position registry with aggregate limit
+    registry._global_max = GLOBAL_MAX_POSITIONS
+    log.info(f"Starting monitor | Strategy: {STRATEGY} | Tickers: {len(TICKERS)} | Paper: {PAPER_TRADING} | Data: {DATA_SOURCE} | GlobalMaxPositions: {GLOBAL_MAX_POSITIONS}")
+
+    # ── Database layer (optional — runs in a background asyncio loop) ─────────
+    db_loop    = None
+    db_thread  = None
+    db_writer  = None
+    db_sub     = None
+    db_session = None
+
+    if DB_ENABLED:
+        try:
+            from db import init_db, close_db, get_pool
+            from db.writer import DBWriter, init_writer
+            from db.subscriber import DBSubscriber
+            from db.writer import SessionManager
+
+            # Spin up a dedicated asyncio event loop in a daemon thread
+            db_loop = asyncio.new_event_loop()
+
+            def _run_db_loop():
+                asyncio.set_event_loop(db_loop)
+                db_loop.run_forever()
+
+            db_thread = threading.Thread(target=_run_db_loop, name="db-event-loop", daemon=True)
+            db_thread.start()
+
+            # Initialize pool + writer on the DB loop
+            pool_future = asyncio.run_coroutine_threadsafe(init_db(DATABASE_URL), db_loop)
+            pool_future.result(timeout=15)  # wait up to 15s for DB connection
+
+            db_writer = init_writer(db_loop)
+            start_future = asyncio.run_coroutine_threadsafe(db_writer.start(), db_loop)
+            start_future.result(timeout=5)
+
+            # Start session
+            db_session = SessionManager()
+            config_hash = hashlib.sha256(
+                json.dumps(STRATEGY_PARAMS, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
+            session_future = asyncio.run_coroutine_threadsafe(
+                db_session.start(
+                    mode="paper" if PAPER_TRADING else "live",
+                    broker=BROKER,
+                    tickers=list(TICKERS),
+                    config_hash=config_hash,
+                ),
+                db_loop,
+            )
+            session_id = session_future.result(timeout=5)
+            log.info(f"DB layer ready | session={session_id} | pool connected")
+        except Exception as exc:
+            log.warning(f"DB layer failed to initialize — continuing without persistence: {exc}")
+            DB_ENABLED_RUNTIME = False
+            db_loop = db_writer = db_sub = db_session = None
+        else:
+            DB_ENABLED_RUNTIME = True
+    else:
+        DB_ENABLED_RUNTIME = False
+        log.info("DB layer disabled (DB_ENABLED=false)")
+
+    # ── Crash recovery from Redpanda (supplements bot_state.json) ───────────
+    redpanda_brokers = os.getenv('REDPANDA_BROKERS', '127.0.0.1:9092')
+    try:
+        from monitor.event_log import CrashRecovery
+        recovery = CrashRecovery(brokers=redpanda_brokers)
+        recovered_positions, recovered_trades = recovery.rebuild()
+        if recovered_positions:
+            log.info(
+                f"CrashRecovery: rebuilt {len(recovered_positions)} position(s) "
+                f"and {len(recovered_trades)} trade(s) from Redpanda"
+            )
+    except Exception as exc:
+        log.warning(f"CrashRecovery failed (non-fatal — using bot_state.json only): {exc}")
+        recovered_positions, recovered_trades = {}, []
 
     monitor = RealTimeMonitor(
         tickers=TICKERS,
+        redpanda_brokers=redpanda_brokers,
         strategy_name=STRATEGY,
         strategy_params=STRATEGY_PARAMS,
         open_cost=OPEN_COST,
@@ -69,6 +153,25 @@ def main():
         data_source=DATA_SOURCE,
     )
 
+    # ── Merge Redpanda-recovered state into monitor (supplements bot_state.json) ──
+    if recovered_positions:
+        for ticker, pos in recovered_positions.items():
+            if ticker not in monitor.positions:
+                monitor.positions[ticker] = pos
+                log.info(f"CrashRecovery: restored position {ticker} from Redpanda")
+    if recovered_trades:
+        existing_ids = {(t['ticker'], t.get('time','')) for t in monitor.trade_log}
+        for trade in recovered_trades:
+            if (trade['ticker'], trade.get('time','')) not in existing_ids:
+                monitor.trade_log.append(trade)
+
+    # ── Wire DB subscriber to EventBus (must happen before monitor.start()) ──
+    if DB_ENABLED_RUNTIME and db_writer is not None:
+        from db.subscriber import DBSubscriber
+        db_sub = DBSubscriber(bus=monitor._bus, writer=db_writer)
+        db_sub.register()
+        log.info("DBSubscriber registered — all events will be persisted to TimescaleDB")
+
     # ── Pro-setups engine (11 strategies, shared Alpaca account) ─────────────
     from pro_setups.engine import ProSetupEngine
     pro_engine = ProSetupEngine(
@@ -83,6 +186,24 @@ def main():
     )
 
     # ── T3.5: Pop-strategy engine (dedicated Alpaca account) ──────────────────
+    # Production data sources: Benzinga (news) + StockTwits (social)
+    from config import BENZINGA_API_KEY, STOCKTWITS_TOKEN
+    news_source = None
+    social_source = None
+
+    if BENZINGA_API_KEY:
+        from pop_screener.benzinga_news import BenzingaNewsSentimentSource
+        news_source = BenzingaNewsSentimentSource(api_key=BENZINGA_API_KEY)
+        log.info("Benzinga news adapter loaded (live headlines + sentiment)")
+    else:
+        log.warning("BENZINGA_API_KEY not set — using mock news source")
+
+    from pop_screener.stocktwits_social import StockTwitsSocialSource
+    social_source = StockTwitsSocialSource(
+        access_token=STOCKTWITS_TOKEN or None,
+    )
+    log.info(f"StockTwits social adapter loaded (auth={'token' if STOCKTWITS_TOKEN else 'public'})")
+
     from pop_strategy_engine import PopStrategyEngine
     pop_engine = PopStrategyEngine(
         bus=monitor._bus,
@@ -93,14 +214,124 @@ def main():
         pop_trade_budget=float(POP_TRADE_BUDGET),
         pop_order_cooldown=POP_ORDER_COOLDOWN,
         alert_email=ALERT_EMAIL,
+        news_source=news_source,
+        social_source=social_source,
     )
     log.info(
         f"PopStrategyEngine ready | paper={POP_PAPER_TRADING} | "
-        f"max_positions={POP_MAX_POSITIONS} | budget=${POP_TRADE_BUDGET}"
+        f"max_positions={POP_MAX_POSITIONS} | budget=${POP_TRADE_BUDGET} | "
+        f"news={'benzinga' if news_source else 'mock'} | social=stocktwits"
     )
+
+    # ── Pre-market connectivity check ─────────────────────────────────────────
+    from config import MAX_DAILY_LOSS
+    log.info("=" * 60)
+    log.info("PRE-MARKET CONNECTIVITY CHECK")
+    log.info("=" * 60)
+    preflight_ok = True
+
+    # Check 1: Tradier data source
+    if DATA_SOURCE == 'tradier' and TRADIER_TOKEN:
+        try:
+            import requests as _req
+            r = _req.get('https://api.tradier.com/v1/markets/quotes',
+                         params={'symbols': 'SPY', 'greeks': 'false'},
+                         headers={'Authorization': f'Bearer {TRADIER_TOKEN}', 'Accept': 'application/json'},
+                         timeout=5)
+            if r.status_code == 200:
+                log.info("  [OK] Tradier API: connected (status 200)")
+            else:
+                log.warning(f"  [WARN] Tradier API: status {r.status_code}")
+        except Exception as e:
+            log.error(f"  [FAIL] Tradier API: {e}")
+            preflight_ok = False
+    else:
+        log.info("  [SKIP] Tradier: not configured as data source")
+
+    # Check 2: Alpaca broker
+    if ALPACA_API_KEY and ALPACA_SECRET:
+        try:
+            import requests as _req
+            base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+            r = _req.get(f'{base}/v2/account',
+                         headers={'APCA-API-KEY-ID': ALPACA_API_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET},
+                         timeout=5)
+            if r.status_code == 200:
+                acct = r.json()
+                bp = acct.get('buying_power', '?')
+                status = acct.get('status', '?')
+                is_paper = 'paper' in base
+                log.info(f"  [OK] Alpaca: connected | status={status} | buying_power=${bp} | paper={is_paper}")
+            else:
+                log.error(f"  [FAIL] Alpaca: status {r.status_code}")
+                preflight_ok = False
+        except Exception as e:
+            log.error(f"  [FAIL] Alpaca API: {e}")
+            preflight_ok = False
+    else:
+        log.error("  [FAIL] Alpaca: API keys not set")
+        preflight_ok = False
+
+    # Check 3: Benzinga news
+    if BENZINGA_API_KEY:
+        try:
+            import requests as _req
+            r = _req.get('https://api.benzinga.com/api/v2/news',
+                         params={'token': BENZINGA_API_KEY, 'tickers': 'SPY', 'pageSize': '1'},
+                         headers={'Accept': 'application/json'}, timeout=5)
+            log.info(f"  [OK] Benzinga API: status {r.status_code}")
+        except Exception as e:
+            log.warning(f"  [WARN] Benzinga API: {e} (pop screener will use fallback)")
+    else:
+        log.info("  [SKIP] Benzinga: no API key (pop screener uses mock news)")
+
+    # Check 4: StockTwits
+    try:
+        import requests as _req
+        r = _req.get('https://api.stocktwits.com/api/2/streams/symbol/SPY.json',
+                     headers={'User-Agent': 'TradingHub/1.0'}, timeout=5)
+        log.info(f"  [OK] StockTwits API: status {r.status_code}")
+    except Exception as e:
+        log.warning(f"  [WARN] StockTwits API: {e} (pop screener will use neutral sentiment)")
+
+    # Check 5: Redpanda
+    try:
+        import socket
+        rp_host, rp_port = redpanda_brokers.split(':')
+        sock = socket.create_connection((rp_host, int(rp_port)), timeout=3)
+        sock.close()
+        log.info(f"  [OK] Redpanda: reachable at {redpanda_brokers}")
+    except Exception as e:
+        log.warning(f"  [WARN] Redpanda: {e} (durable logging unavailable)")
+
+    # Check 6: TimescaleDB
+    if DB_ENABLED_RUNTIME:
+        log.info("  [OK] TimescaleDB: connected (pool initialized)")
+    else:
+        log.info("  [SKIP] TimescaleDB: disabled or unreachable")
+
+    log.info("=" * 60)
+    if preflight_ok:
+        log.info("PRE-MARKET CHECK: ALL CRITICAL SYSTEMS OK")
+    else:
+        log.error("PRE-MARKET CHECK: CRITICAL FAILURES DETECTED — review above")
+    log.info("=" * 60)
+
+    # ── Activity Logger (every event → TimescaleDB for analysis) ────────────
+    activity_logger = None
+    if DB_ENABLED_RUNTIME and db_writer:
+        from db.activity_logger import ActivityLogger
+        activity_logger = ActivityLogger(bus=monitor._bus, writer=db_writer)
+        activity_logger.register()
+        log.info("ActivityLogger active → all signals/fills/blocks logged to TimescaleDB")
+    else:
+        log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
 
     monitor.start()
     log.info("Monitor running. Will stop at 3:15 PM ET.")
+
+    # ── Trading halted flag (daily loss kill switch) ──────────────────────────
+    trading_halted = False
 
     try:
         while True:
@@ -114,21 +345,115 @@ def main():
             positions  = monitor.positions
             tickers    = monitor.tickers
             wins       = sum(1 for t in trades if t['is_win'])
+            losses     = len(trades) - wins
             total_pnl  = sum(t['pnl'] for t in trades)
+
+            # ── DAILY LOSS KILL SWITCH ────────────────────────────────────────
+            if not trading_halted and total_pnl <= MAX_DAILY_LOSS:
+                trading_halted = True
+                log.error(
+                    f"KILL SWITCH ACTIVATED: daily P&L ${total_pnl:+.2f} "
+                    f"breached limit ${MAX_DAILY_LOSS:+.2f} | "
+                    f"trades={len(trades)} wins={wins} losses={losses}"
+                )
+                log.error("HALTING ALL TRADING — force-closing open positions")
+                # Log kill switch activation to DB
+                if activity_logger:
+                    activity_logger.log_kill_switch(
+                        daily_pnl=total_pnl,
+                        threshold=MAX_DAILY_LOSS,
+                        trades_count=len(trades),
+                        wins=wins,
+                        losses=losses,
+                        positions_closed=list(positions.keys()),
+                    )
+                # Force-close all open positions via market sell
+                for ticker_name in list(positions.keys()):
+                    pos = positions[ticker_name]
+                    qty = pos.get('quantity', 0)
+                    if qty > 0:
+                        from monitor.events import OrderRequestPayload
+                        monitor._bus.emit(Event(
+                            type=EventType.ORDER_REQ,
+                            payload=OrderRequestPayload(
+                                ticker=ticker_name, side='sell', qty=qty,
+                                price=pos.get('entry_price', 0),
+                                reason='kill_switch_daily_loss',
+                            ),
+                        ))
+                        log.error(f"  KILL SWITCH: force-sell {qty} {ticker_name}")
+                # Stop the monitor to prevent new trades
+                monitor.stop()
+                log.error("Monitor stopped by kill switch. No further trading today.")
+                break
+
             log.info(
                 f"[heartbeat] scanning {len(tickers)} tickers | "
                 f"open positions: {len(positions)} {list(positions.keys()) or 'none'} | "
-                f"trades today: {len(trades)} ({wins} wins) | "
-                f"PnL: ${total_pnl:+.2f}"
+                f"trades today: {len(trades)} ({wins}W/{losses}L) | "
+                f"PnL: ${total_pnl:+.2f} | kill_switch: ${MAX_DAILY_LOSS:+.2f}"
             )
+            # DB health + activity logging
+            if DB_ENABLED_RUNTIME and db_writer:
+                log.info(
+                    f"[heartbeat] DB: written={db_writer.rows_written} "
+                    f"dropped={db_writer.rows_dropped} batches={db_writer.batches_flushed}"
+                )
+                if activity_logger:
+                    try:
+                        metrics = monitor._bus.metrics()
+                        activity_logger.log_health(
+                            tickers_scanned=len(tickers),
+                            open_positions=len(positions),
+                            trades_today=len(trades),
+                            wins_today=wins,
+                            losses_today=losses,
+                            daily_pnl=total_pnl,
+                            system_pressure=metrics.system_pressure,
+                            db_rows_written=db_writer.rows_written,
+                            db_rows_dropped=db_writer.rows_dropped,
+                            db_batches_flushed=db_writer.batches_flushed,
+                            registry_count=registry.count(),
+                            kill_switch_active=trading_halted,
+                            queue_depths=metrics.queue_depths,
+                            handler_avg_ms=metrics.handler_avg_ms,
+                        )
+                    except Exception:
+                        pass  # health logging must never crash the monitor
             # Hourly summary
             if now.minute == 0 and trades:
-                log.info(f"Hourly summary: {len(trades)} trades | {wins} wins | PnL: ${total_pnl:+.2f}")
+                log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}")
             time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
     finally:
-        monitor.stop()
+        if not trading_halted:
+            monitor.stop()
+
+        # ── Shutdown DB layer gracefully ─────────────────────────────────────
+        if DB_ENABLED_RUNTIME and db_loop is not None:
+            try:
+                if db_session:
+                    stop_future = asyncio.run_coroutine_threadsafe(
+                        db_session.stop(
+                            exit_reason="clean",
+                            writer=db_writer,
+                        ),
+                        db_loop,
+                    )
+                    stop_future.result(timeout=5)
+                if db_writer:
+                    flush_future = asyncio.run_coroutine_threadsafe(db_writer.stop(), db_loop)
+                    flush_future.result(timeout=5)
+                close_future = asyncio.run_coroutine_threadsafe(close_db(), db_loop)
+                close_future.result(timeout=5)
+                db_loop.call_soon_threadsafe(db_loop.stop)
+                log.info(
+                    f"DB layer stopped | written={db_writer.rows_written if db_writer else 0} "
+                    f"dropped={db_writer.rows_dropped if db_writer else 0}"
+                )
+            except Exception as exc:
+                log.warning(f"DB shutdown error (non-fatal): {exc}")
         trades = monitor.trade_log
         W = 60
         bar = "=" * W

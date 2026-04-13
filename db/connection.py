@@ -41,13 +41,13 @@ async def init_db(dsn: str | None = None) -> asyncpg.Pool:
     log.info("Connecting to TimescaleDB: %s", _mask_dsn(url))
     _pool = await asyncpg.create_pool(
         url,
-        min_size=2,
-        max_size=10,
+        min_size=4,
+        max_size=20,
         command_timeout=30,
         # Ensure UTC timestamps are returned as aware datetimes
         init=_init_connection,
     )
-    log.info("TimescaleDB pool ready (min=2 max=10)")
+    log.info("TimescaleDB pool ready (min=4 max=20)")
     return _pool
 
 

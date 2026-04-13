@@ -28,14 +28,13 @@ class GapDetector(BaseDetector):
         df:      pd.DataFrame,
         rvol_df: Optional[pd.DataFrame],
     ) -> DetectorSignal:
-        # Resolve previous close
+        # Resolve previous close — must be prior day's close, not an intra-session bar
         if rvol_df is not None and len(rvol_df) > 0:
             prev_close = float(rvol_df['close'].iloc[-1])
         else:
-            # Use the open of the very first bar vs close of second bar as proxy
-            if len(df) < 2:
-                return DetectorSignal.no_signal()
-            prev_close = float(df['close'].iloc[-2])
+            # Without historical data we cannot determine the prior day's close.
+            # Using an intra-session bar would produce false gap signals.
+            return DetectorSignal.no_signal()
 
         session_open = float(df['open'].iloc[0])
         last_close   = float(df['close'].iloc[-1])

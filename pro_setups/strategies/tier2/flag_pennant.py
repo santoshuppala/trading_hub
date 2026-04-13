@@ -27,6 +27,10 @@ class FlagPennant(BaseProStrategy):
     PARTIAL_R: float = 1.5
     FULL_R:    float = 3.0
 
+    def __init__(self):
+        self._last_flag_low:  Optional[float] = None
+        self._last_flag_high: Optional[float] = None
+
     def detect_signal(
         self,
         ticker:           str,
@@ -36,6 +40,9 @@ class FlagPennant(BaseProStrategy):
         flag = detector_outputs.get('flag')
         if not (flag and flag.fired and flag.strength >= 0.45):
             return None
+        # Cache flag boundaries from detector metadata for generate_stop()
+        self._last_flag_low  = flag.metadata.get('flag_low')
+        self._last_flag_high = flag.metadata.get('flag_high')
         return flag.direction
 
     def generate_entry(
@@ -57,13 +64,12 @@ class FlagPennant(BaseProStrategy):
         flag_sig   = None
         offset     = self.SL_ATR * atr
 
-        # Try to use flag channel boundary as structural stop
-        flag_bars  = df.tail(10)
+        # Use flag channel boundaries from detector metadata when available
         if direction == 'long':
-            flag_low   = float(flag_bars['low'].min())
-            stop       = max(flag_low - 0.01, entry_price - offset)
-            stop       = min(stop, entry_price - 0.01)
+            flag_low = float(self._last_flag_low) if self._last_flag_low else float(df.tail(10)['low'].min())
+            stop     = max(flag_low - 0.01, entry_price - offset)
+            stop     = min(stop, entry_price - 0.01)
         else:
-            flag_high  = float(flag_bars['high'].max())
-            stop       = min(flag_high + 0.01, entry_price + offset)
+            flag_high = float(self._last_flag_high) if self._last_flag_high else float(df.tail(10)['high'].max())
+            stop      = min(flag_high + 0.01, entry_price + offset)
         return round(stop, 4)

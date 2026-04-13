@@ -179,11 +179,20 @@ class DBWriter:
         if not rows:
             return
         cols = list(rows[0].keys())
-        col_list  = ", ".join(cols)
-        val_refs  = ", ".join(f"${i+1}" for i in range(len(cols)))
-        sql = f"INSERT INTO trading.{table} ({col_list}) VALUES ({val_refs}) ON CONFLICT DO NOTHING"
         records = [tuple(r[c] for c in cols) for r in rows]
-        await conn.executemany(sql, records)
+        try:
+            # Preferred: asyncpg COPY protocol (~5-10x faster than executemany)
+            await conn.copy_records_to_table(
+                f"trading.{table}",
+                records=records,
+                columns=cols,
+            )
+        except Exception:
+            # Fallback: parameterised INSERT with ON CONFLICT (handles schema mismatches)
+            col_list = ", ".join(cols)
+            val_refs = ", ".join(f"${i+1}" for i in range(len(cols)))
+            sql = f"INSERT INTO trading.{table} ({col_list}) VALUES ({val_refs}) ON CONFLICT DO NOTHING"
+            await conn.executemany(sql, records)
 
 
 # ── Session lifecycle ────────────────────────────────────────────────────────

@@ -44,18 +44,17 @@ GAP_SIZE_EARNINGS_MIN: float      = 0.05   # ≥ 5 % gap on earnings
 
 # ── Classifier thresholds ──────────────────────────────────────────────────────
 
-# VWAP_RECLAIM compatibility
-VWAP_DISTANCE_MAX_FOR_RECLAIM: float    = 0.02   # within 2 % of VWAP
-RVOL_VWAP_RECLAIM_MIN:         float    = 1.5
-RVOL_VWAP_RECLAIM_MAX:         float    = 5.0
+# Classifier thresholds (VWAP Reclaim handled exclusively by T4 monitor layer)
+RVOL_VWAP_RECLAIM_MIN:         float    = 1.5    # retained for _vwap_compat_score()
+RVOL_VWAP_RECLAIM_MAX:         float    = 5.0    # retained for _vwap_compat_score()
 TREND_CLEAN_VWAP_MIN:          float    = 0.55   # cleanliness score threshold
 
 # EMA_TREND_CONTINUATION
 TREND_CLEAN_EMA_MIN:            float   = 0.60
 VWAP_DISTANCE_EMA_MAX:          float   = 0.03
 
-# Earnings VWAP boundary
-GAP_SIZE_EARNINGS_VWAP_MAX:     float   = 0.08   # < 8 % gap → VWAP_RECLAIM; ≥ 8 % → ORB
+# Earnings gap boundary
+GAP_SIZE_EARNINGS_VWAP_MAX:     float   = 0.08   # < 8% gap → EMA_TREND; ≥ 8% → ORB
 
 # High-impact secondary classification
 VOLATILITY_EXTREME_THRESHOLD:   float   = 0.25   # volatility_score > 0.25 → add HALT/PARABOLIC
@@ -65,19 +64,6 @@ GAP_EXTREME_THRESHOLD:          float   = 0.15   # gap > 15 % → extremely gapp
 _WEIGHT_TREND:    float = 0.35
 _WEIGHT_RVOL:     float = 0.30
 _WEIGHT_VWAP:     float = 0.35
-
-# ── VWAP Reclaim Engine ────────────────────────────────────────────────────────
-VWAP_COMPAT_MIN:     float  = 0.40   # minimum vwap_compatibility_score to run engine
-RVOL_VWAP_MIN:       float  = 1.5    # minimum RVOL for a valid reclaim signal
-RSI_VWAP_MIN:        float  = 50.0
-RSI_VWAP_MAX:        float  = 70.0
-RSI_VWAP_OVERBOUGHT: float  = 75.0
-ATR_MULT_STOP_VWAP:  float  = 1.0    # stop = entry − 1× ATR
-ATR_MULT_TP1_VWAP:   float  = 1.0    # target_1 = entry + 1× ATR
-ATR_MULT_TP2_VWAP:   float  = 2.0    # target_2 = entry + 2× ATR
-VWAP_BUFFER_PCT:     float  = 0.002  # stop may be vwap − 0.2 % of price
-VWAP_EOD_HOUR:       int    = 15     # force-exit hour (ET)
-VWAP_EOD_MINUTE:     int    = 0
 
 # ── ORB Engine ─────────────────────────────────────────────────────────────────
 OR_MINUTES:              int   = 15    # first N minutes define the opening range

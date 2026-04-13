@@ -22,7 +22,7 @@ GROUP BY bucket, ticker
 WITH NO DATA;
 
 SELECT add_continuous_aggregate_policy('trading.bar_5m',
-    start_offset  => INTERVAL '10 minutes',
+    start_offset  => INTERVAL '30 minutes',
     end_offset    => INTERVAL '5 minutes',
     schedule_interval => INTERVAL '5 minutes',
     if_not_exists => TRUE);
@@ -47,7 +47,7 @@ GROUP BY bucket, ticker
 WITH NO DATA;
 
 SELECT add_continuous_aggregate_policy('trading.bar_1h',
-    start_offset  => INTERVAL '2 hours',
+    start_offset  => INTERVAL '4 hours',
     end_offset    => INTERVAL '1 hour',
     schedule_interval => INTERVAL '1 hour',
     if_not_exists => TRUE);

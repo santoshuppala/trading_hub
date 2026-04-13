@@ -62,7 +62,8 @@ class ORB(BaseProStrategy):
             orb_slice = df.iloc[:15]
             orb_high  = float(orb_slice['high'].max()) if len(orb_slice) >= 15 else entry_price
             struct_stop = orb_high - 0.01    # just below OR high
-            stop = max(entry_price - offset, struct_stop)
+            # Use min() to take the wider (lower) stop — max() could push stop above entry
+            stop = min(entry_price - offset, struct_stop)
             stop = min(stop, entry_price - 0.01)
         else:
             orb_slice = df.iloc[:15]

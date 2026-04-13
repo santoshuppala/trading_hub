@@ -22,7 +22,8 @@ from typing import Dict, List, Optional
 # ── Enums ──────────────────────────────────────────────────────────────────────
 
 class StrategyType(str, Enum):
-    """Six deterministic strategy types the classifier can assign."""
+    """Six deterministic strategy types the classifier can assign.
+    VWAP Reclaim delegates to the T4 SignalAnalyzer (monitor/signals.py)."""
     VWAP_RECLAIM           = 'VWAP_RECLAIM'
     ORB                    = 'ORB'
     HALT_RESUME_BREAKOUT   = 'HALT_RESUME_BREAKOUT'
@@ -188,6 +189,7 @@ class EngineeredFeatures:
     atr_value:              float
     last_price:             float
     current_vwap:           float
+    earnings_flag:          bool = False
 
 
 # ── Screener layer model ───────────────────────────────────────────────────────

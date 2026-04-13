@@ -27,7 +27,7 @@ from pop_screener.models import (
     EngineeredFeatures, EntrySignal, ExitSignal,
     OHLCVBar, StrategyAssignment, StrategyType,
 )
-from pop_screener.strategies.vwap_reclaim_engine   import VWAPReclaimEngine
+from pop_screener.strategies.vwap_reclaim_engine    import VWAPReclaimEngine
 from pop_screener.strategies.orb_engine             import ORBEngine
 from pop_screener.strategies.halt_resume_engine     import HaltResumeEngine
 from pop_screener.strategies.parabolic_reversal_engine import ParabolicReversalEngine

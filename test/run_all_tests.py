@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Trading Hub — Weekend Sandbox Validation Runner
-================================================
-Runs all 5 weekend tests and writes a consolidated report to
-test/logs/test_report.md.
+Trading Hub — Full Validation Suite Runner
+==========================================
+Runs all 18 tests (T1-T10 original + T11-T18 comprehensive validation)
+and writes a consolidated report to test/logs/test_report.md.
 
 Usage
 -----
@@ -93,6 +93,63 @@ TESTS = [
         'name':  'State Persistence & Observability',
         'file':  'test_10_state_persistence.py',
         'desc':  'Round-trip save/load; corrupt JSON backup; concurrent writes; StateEngine; HeartbeatEmitter',
+        'needs': [],
+    },
+    # ── New validation suite (T11–T18) ────────────────────────────────────────
+    {
+        'id':    'T11',
+        'name':  'EventBus Ordering & Backpressure',
+        'file':  'test_11_eventbus_ordering.py',
+        'desc':  'TC-EB-01..06: producer/consumer ordering; burst; overflow; exception handling',
+        'needs': [],
+    },
+    {
+        'id':    'T12',
+        'name':  'Market Data Ingestor',
+        'file':  'test_12_market_data_ingestor.py',
+        'desc':  'TC-MD-01..04: normalization; corrupt ticks; out-of-order; throughput',
+        'needs': [],
+    },
+    {
+        'id':    'T13',
+        'name':  'Detector Validation',
+        'file':  'test_13_detector_validation.py',
+        'desc':  'TC-DT-01..05: ORB basic; no-signal; edge cases; replay determinism; latency',
+        'needs': [],
+    },
+    {
+        'id':    'T14',
+        'name':  'Strategy Validation',
+        'file':  'test_14_strategy_validation.py',
+        'desc':  'TC-ST-01..05: long signal; no-trade zone; max positions; cooldown; replay parity',
+        'needs': [],
+    },
+    {
+        'id':    'T15',
+        'name':  'Order Manager Lifecycle',
+        'file':  'test_15_order_manager.py',
+        'desc':  'TC-OM-01..04: new→filled; partial fills; cancel/close; duplicate fill idempotency',
+        'needs': [],
+    },
+    {
+        'id':    'T16',
+        'name':  'DB Writer + TimescaleDB',
+        'file':  'test_16_db_persistence.py',
+        'desc':  'TC-DBW-01..04 + TC-TS-01..02: persistence; idempotent writes; throughput; circuit breaker; hypertables; compression',
+        'needs': [],
+    },
+    {
+        'id':    'T17',
+        'name':  'Replay Determinism',
+        'file':  'test_17_replay_determinism.py',
+        'desc':  'TC-RP-01..02: end-to-end replay parity; mid-session restart',
+        'needs': [],
+    },
+    {
+        'id':    'T18',
+        'name':  'Risk Safety & E2E Integration',
+        'file':  'test_18_risk_safety_e2e.py',
+        'desc':  'TC-RS-01..02 + TC-E2E-01..02: drawdown kill switch; position cap; tick→PnL pipeline; multi-strategy load',
         'needs': [],
     },
 ]

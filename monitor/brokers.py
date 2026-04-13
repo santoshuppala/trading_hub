@@ -81,9 +81,9 @@ class AlpacaBroker(BaseBroker):
     """
 
     SLIPPAGE_PCT     = 0.0001   # 0.01% — used for stop/target accounting only
-    FILL_TIMEOUT_SEC = 2.0      # seconds to wait before cancel/retry
-    FILL_POLL_SEC    = 0.25     # poll interval while waiting for fill
-    MAX_RETRIES      = 3        # cancel-and-retry attempts per entry
+    FILL_TIMEOUT_SEC = 5.0      # seconds to wait before cancel/retry (2s was too aggressive for illiquid names)
+    FILL_POLL_SEC    = 0.5      # poll interval while waiting for fill
+    MAX_RETRIES      = 2        # cancel-and-retry attempts per entry (fewer retries, longer timeout)
     MAX_SLIPPAGE_PCT = 0.005    # 0.5%  — abandon retry if ask drifts beyond this
 
     def __init__(
@@ -215,17 +215,23 @@ class AlpacaBroker(BaseBroker):
     def _execute_sell(self, p: OrderRequestPayload) -> None:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
+        import uuid
 
         if not self._client:
             send_alert(self._alert_email, f"SELL skipped (no Alpaca client): {p.qty} {p.ticker}")
             self._fail(p)
             return
+
+        # Idempotent client order ID — prevents duplicate sells on retry
+        client_order_id = f"th-sell-{p.ticker}-{uuid.uuid4().hex[:8]}"
+
         try:
             req   = MarketOrderRequest(
                 symbol=p.ticker,
                 qty=p.qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
+                client_order_id=client_order_id,
             )
             order = self._client.submit_order(req)
             order_id = str(order.id)
@@ -238,6 +244,31 @@ class AlpacaBroker(BaseBroker):
                 fill_price=p.price, order_id=order_id, reason=p.reason,
             )))
         except Exception as e:
+            # Network error — order MAY have been submitted and filled at Alpaca.
+            # Poll Alpaca to check before declaring failure.
+            log.error(
+                f"SELL exception for {p.qty} {p.ticker}: {e} — "
+                f"polling Alpaca for order status (client_order_id={client_order_id})"
+            )
+            try:
+                order = self._client.get_order_by_client_id(client_order_id)
+                status = str(getattr(order, 'status', 'unknown'))
+                if status in ('filled', 'partially_filled'):
+                    fill_price = float(order.filled_avg_price or p.price)
+                    filled_qty = int(float(order.filled_qty or p.qty))
+                    order_id = str(order.id)
+                    log.warning(
+                        f"SELL for {p.ticker} was actually {status} at Alpaca "
+                        f"(qty={filled_qty} @ ${fill_price:.2f}) — emitting FILL"
+                    )
+                    self._bus.emit(Event(EventType.FILL, FillPayload(
+                        ticker=p.ticker, side='sell', qty=filled_qty,
+                        fill_price=fill_price, order_id=order_id, reason=p.reason,
+                    )))
+                    return
+            except Exception as poll_exc:
+                log.error(f"Failed to poll Alpaca for sell status: {poll_exc}")
+
             send_alert(self._alert_email, f"SELL failed: {p.qty} {p.ticker} — {e}")
             self._fail(p)
 

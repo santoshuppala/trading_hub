@@ -170,27 +170,41 @@ class PopExecutor:
         now    = time.monotonic()
 
         # ── Risk gate ────────────────────────────────────────────────────────
-        if len(self._positions) >= self._max_positions:
-            log.info("POP risk block %s: max pop positions (%d) reached",
-                     symbol, self._max_positions)
+        # Cross-layer dedup: check global registry first
+        from monitor.position_registry import registry
+        if not registry.try_acquire(symbol, layer="pop"):
+            log.info("POP risk block %s: held by another strategy layer (%s)",
+                     symbol, registry.held_by(symbol))
             return
 
-        last = self._last_order_time.get(symbol, 0.0)
-        if (now - last) < self._order_cooldown:
-            remaining = int(self._order_cooldown - (now - last))
-            log.info("POP risk block %s: cooldown %ds remaining", symbol, remaining)
-            return
+        _approved = False
+        try:
+            if len(self._positions) >= self._max_positions:
+                log.info("POP risk block %s: max pop positions (%d) reached",
+                         symbol, self._max_positions)
+                return
 
-        if symbol in self._positions:
-            log.info("POP risk block %s: already in open pop position", symbol)
-            return
+            last = self._last_order_time.get(symbol, 0.0)
+            if (now - last) < self._order_cooldown:
+                remaining = int(self._order_cooldown - (now - last))
+                log.info("POP risk block %s: cooldown %ds remaining", symbol, remaining)
+                return
 
-        # ── Size: shares = floor(budget / entry_price) ────────────────────────
-        qty = int(self._trade_budget // entry.entry_price)
-        if qty <= 0:
-            log.warning("POP risk block %s: trade_budget $%.0f too small for price $%.2f",
-                        symbol, self._trade_budget, entry.entry_price)
-            return
+            if symbol in self._positions:
+                log.info("POP risk block %s: already in open pop position", symbol)
+                return
+
+            # ── Size: shares = floor(budget / entry_price) ────────────────────
+            qty = int(self._trade_budget // entry.entry_price)
+            if qty <= 0:
+                log.warning("POP risk block %s: trade_budget $%.0f too small for price $%.2f",
+                            symbol, self._trade_budget, entry.entry_price)
+                return
+
+            _approved = True
+        finally:
+            if not _approved:
+                registry.release(symbol)
 
         # ── Execute ───────────────────────────────────────────────────────────
         self._last_order_time[symbol] = now
@@ -203,6 +217,8 @@ class PopExecutor:
     def close_position(self, symbol: str, reason: str, current_price: float) -> None:
         """Mark a pop position as closed (called by PopStrategyEngine on exit signal)."""
         self._positions.discard(symbol)
+        from monitor.position_registry import registry
+        registry.release(symbol)
         log.info("POP position closed: %s @ $%.4f reason=%s", symbol, current_price, reason)
 
     # ── Private execution methods ──────────────────────────────────────────────

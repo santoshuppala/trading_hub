@@ -55,7 +55,7 @@ class StrategyClassifier:
         ('orb',               2, [('orb',        0.50)]),
         # ── Tier 1 ───────────────────────────────────────────────────────
         ('sr_flip',           1, [('sr',         0.60)]),
-        ('vwap_reclaim',      1, [('vwap',       0.40)]),
+        ('vwap_reclaim',      1, [('vwap',       0.50)]),
         ('trend_pullback',    1, [('trend',      0.50), ('vwap', 0.30)]),
     ]
 
@@ -122,14 +122,18 @@ class StrategyClassifier:
 
         confidence = min(base_conf + optional_bonus, 1.0)
 
-        # Direction: primary from the first required detector
-        primary_det  = required[0][0]
-        primary_sig  = outputs[primary_det]
-        direction    = primary_sig.direction
+        # Direction: weighted vote from all required detectors.
+        # If detectors disagree, reject the signal (return None).
+        directions = set()
+        for det_name, _ in required:
+            sig = outputs[det_name]
+            if sig.direction in ('long', 'short'):
+                directions.add(sig.direction)
 
-        # Validate direction is actionable
-        if direction not in ('long', 'short'):
+        if len(directions) != 1:
+            # Detectors disagree on direction or none provided a valid one
             return None
+        direction = directions.pop()
 
         return ClassificationResult(
             strategy_name=strategy_name,

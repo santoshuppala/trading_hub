@@ -103,63 +103,81 @@ class RiskAdapter:
         """
         tag = f"[RiskAdapter][{ticker}][{strategy_name}][T{tier}]"
 
+        # ── Check 0: cross-layer dedup ──────────────────────────────────────────
+        from monitor.position_registry import registry
+        if not registry.try_acquire(ticker, layer="pro_setups"):
+            log.info(
+                "%s BLOCKED: held by another strategy layer (%s)",
+                tag, registry.held_by(ticker),
+            )
+            return
+
         # ── Check 1: only long entries go through (short execution not yet wired) ──
         if direction != 'long':
             log.info("%s SKIPPED: direction=%s (short execution not enabled)", tag, direction)
+            registry.release(ticker)
             return
 
-        # ── Check 2: max concurrent positions ─────────────────────────────────────
-        if len(self._positions) >= self._max_positions:
-            log.info(
-                "%s BLOCKED: max_positions=%d reached (open: %s)",
-                tag, self._max_positions, sorted(self._positions),
-            )
-            return
+        # All checks after acquire must release on failure (try/finally with _approved flag)
+        _approved = False
+        try:
+            # ── Check 2: max concurrent positions ─────────────────────────────────
+            if len(self._positions) >= self._max_positions:
+                log.info(
+                    "%s BLOCKED: max_positions=%d reached (open: %s)",
+                    tag, self._max_positions, sorted(self._positions),
+                )
+                return
 
-        # ── Check 3: per-ticker cooldown ──────────────────────────────────────────
-        now     = time.monotonic()
-        elapsed = now - self._last_order.get(ticker, 0.0)
-        if elapsed < self._order_cooldown:
-            log.info(
-                "%s BLOCKED: cooldown %.0fs remaining",
-                tag, self._order_cooldown - elapsed,
-            )
-            return
+            # ── Check 3: per-ticker cooldown ──────────────────────────────────────
+            now     = time.monotonic()
+            elapsed = now - self._last_order.get(ticker, 0.0)
+            if elapsed < self._order_cooldown:
+                log.info(
+                    "%s BLOCKED: cooldown %.0fs remaining",
+                    tag, self._order_cooldown - elapsed,
+                )
+                return
 
-        # ── Check 4: no duplicate position ────────────────────────────────────────
-        if ticker in self._positions:
-            log.info("%s BLOCKED: already holding position", tag)
-            return
+            # ── Check 4: no duplicate position ────────────────────────────────────
+            if ticker in self._positions:
+                log.info("%s BLOCKED: already holding position", tag)
+                return
 
-        # ── Check 5: minimum R:R ──────────────────────────────────────────────────
-        risk   = entry_price - stop_price       # always positive for long
-        reward = target_2    - entry_price
-        if risk <= 0:
-            log.warning("%s BLOCKED: risk=%.4f (stop above entry?)", tag, risk)
-            return
-        rr = reward / risk
-        min_rr = _MIN_RR.get(tier, 1.5)
-        if rr < min_rr:
-            log.info(
-                "%s BLOCKED: R:R=%.2f < min %.2f  (risk=%.4f reward=%.4f)",
-                tag, rr, min_rr, risk, reward,
-            )
-            return
+            # ── Check 5: minimum R:R ──────────────────────────────────────────────
+            risk   = entry_price - stop_price       # always positive for long
+            reward = target_2    - entry_price
+            if risk <= 0:
+                log.warning("%s BLOCKED: risk=%.4f (stop above entry?)", tag, risk)
+                return
+            rr = reward / risk
+            min_rr = _MIN_RR.get(tier, 1.5)
+            if rr < min_rr:
+                log.info(
+                    "%s BLOCKED: R:R=%.2f < min %.2f  (risk=%.4f reward=%.4f)",
+                    tag, rr, min_rr, risk, reward,
+                )
+                return
 
-        # ── Check 6: ATR sanity ───────────────────────────────────────────────────
-        if atr_value <= 0:
-            log.warning("%s BLOCKED: atr_value=%.4f invalid", tag, atr_value)
-            return
+            # ── Check 6: ATR sanity ───────────────────────────────────────────────
+            if atr_value <= 0:
+                log.warning("%s BLOCKED: atr_value=%.4f invalid", tag, atr_value)
+                return
 
-        # ── Position sizing (risk-based) ──────────────────────────────────────────
-        max_dollar_risk = self._trade_budget * _RISK_PCT
-        qty_by_risk     = int(max_dollar_risk / risk)
-        qty_by_budget   = int(self._trade_budget / entry_price)
-        qty             = min(max(qty_by_risk, 1), max(qty_by_budget, 1))
+            # ── Position sizing (risk-based) ──────────────────────────────────────
+            max_dollar_risk = self._trade_budget * _RISK_PCT
+            qty_by_risk     = int(max_dollar_risk / risk)
+            qty_by_budget   = int(self._trade_budget / entry_price)
+            qty             = min(max(qty_by_risk, 1), max(qty_by_budget, 1))
 
-        if qty <= 0:
-            log.warning("%s BLOCKED: qty=0 (budget=%.0f entry=%.4f)", tag, self._trade_budget, entry_price)
-            return
+            if qty <= 0:
+                log.warning("%s BLOCKED: qty=0 (budget=%.0f entry=%.4f)", tag, self._trade_budget, entry_price)
+                return
+
+            _approved = True
+        finally:
+            if not _approved:
+                registry.release(ticker)
 
         # ── Emit ORDER_REQ ────────────────────────────────────────────────────────
         reason  = f"pro:{strategy_name}:T{tier}:long"
@@ -218,10 +236,7 @@ class RiskAdapter:
     def _on_position(self, event: Event) -> None:
         p = event.payload
         if p.action == PositionAction.CLOSED:
-            removed = self._positions.discard(p.ticker)
-            if removed is None and p.ticker in self._positions:
-                # discard returns None always; check via 'in' before
-                pass
+            self._positions.discard(p.ticker)
             log.debug(
                 "[RiskAdapter][%s] position CLOSED — removed from tracking",
                 p.ticker,

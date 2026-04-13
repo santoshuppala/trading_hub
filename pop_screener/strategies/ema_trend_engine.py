@@ -217,8 +217,8 @@ def _check_higher_highs_lows(
     in the last *lookback* bars.  Requires at least 60 % of pairs to qualify.
     """
     window = bars[-lookback:] if len(bars) >= lookback else bars
-    if len(window) < 3:
-        return True   # insufficient data — don't block signals
+    if len(window) < 5:
+        return False   # insufficient data for reliable trend — require at least 5 bars
 
     hh_count = sum(
         1 for i in range(1, len(window)) if window[i].high > window[i - 1].high

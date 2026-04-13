@@ -52,13 +52,14 @@ def get_rvol(hist_df, current_volume_sum, current_bar_index):
             return current_volume_sum / avg if avg > 0 else 1.0
         else:
             # Daily bars: estimate expected volume using time-fraction of trading day.
-            # Before 10:15 AM ET (45 min of trading) the denominator is tiny and
-            # RVOL is artificially inflated — return 1.0 (neutral) to avoid
-            # false momentum signals during the volatile open.
+            # In the first 60 minutes of trading the time-fraction denominator is
+            # tiny and RVOL is artificially inflated (e.g. normal opening volume
+            # appears as 10-25× RVOL).  Return 1.0 (neutral) to avoid false
+            # momentum signals during the volatile open.
             now = datetime.now(ET)
             market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
             elapsed = max(0.0, (now - market_open).total_seconds())
-            if elapsed < 45 * 60:
+            if elapsed < 60 * 60:          # first hour — RVOL unreliable
                 return 1.0
 
             daily_vols = [
@@ -196,11 +197,12 @@ class SignalAnalyzer:
             current_vwap  = ts(vwap.iloc[-1])
             prev_vwap     = ts(vwap.iloc[-2])
 
-            # RSI
+            # RSI — returns 50.0 (neutral) if insufficient bars for the rolling window
             delta = close.diff()
             gain = delta.where(delta > 0, 0).rolling(window=rsi_period).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
-            rsi_value = ts((100 - (100 / (1 + gain / loss))).iloc[-1])
+            rsi_raw = ts((100 - (100 / (1 + gain / loss))).iloc[-1])
+            rsi_value = rsi_raw if (rsi_raw is not None and rsi_raw == rsi_raw) else 50.0
 
             # ATR
             tr = pd.concat([

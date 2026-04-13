@@ -2,18 +2,18 @@
   "date": "2026-04-12",
   "positions": {},
   "reclaimed_today": [
-    "CONC"
+    "AAPL"
   ],
   "trade_log": [
     {
-      "ticker": "CONC",
-      "entry_price": 100.0,
-      "entry_time": "01:13:59",
-      "exit_price": 101.0,
-      "qty": 1,
-      "pnl": 1.0,
-      "reason": "sell_stop",
-      "time": "01:13:59",
+      "ticker": "AAPL",
+      "entry_price": 150.0,
+      "entry_time": "16:47:40",
+      "exit_price": 152.0,
+      "qty": 10,
+      "pnl": 20.0,
+      "reason": "test_exit",
+      "time": "16:47:40",
       "is_win": true
     }
   ]

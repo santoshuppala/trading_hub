@@ -609,9 +609,9 @@ ORDER BY 1 DESC;
 SELECT
     date_trunc('day', ts AT TIME ZONE 'America/New_York') AS trade_date,
     count(*) AS health_checks,
-    -- Expect ~345 checks per day (9:30-3:15 = 345 minutes)
-    round(count(*)::numeric / 345 * 100, 1) AS uptime_pct,
-    CASE WHEN count(*)::numeric / 345 >= 0.98 THEN 'PASS' ELSE 'FAIL: < 98% uptime' END AS uptime_check
+    -- Expect ~345 checks per day (9:30-4:00 = 390 minutes)
+    round(count(*)::numeric / 390 * 100, 1) AS uptime_pct,
+    CASE WHEN count(*)::numeric / 390 >= 0.98 THEN 'PASS' ELSE 'FAIL: < 98% uptime' END AS uptime_check
 FROM trading.system_health_log
 WHERE ts > now() - INTERVAL '14 days'
 GROUP BY 1

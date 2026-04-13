@@ -3,27 +3,27 @@
   "positions": {
     "HUBS": {
       "entry_price": 206.93,
-      "entry_time": "alpaca_restored",
+      "entry_time": "10:14:50",
       "quantity": 2,
       "qty": 2,
       "partial_done": false,
-      "order_id": "alpaca_reconciliation",
+      "order_id": "access_key",
       "stop_price": 200.72,
       "target_price": 217.28,
       "half_target": 212.1,
       "atr_value": 3.28
     },
-    "HUT": {
-      "entry_price": 68.58,
-      "entry_time": "07:23:16",
-      "quantity": 13,
-      "qty": 13,
-      "partial_done": true,
-      "order_id": "fcf9f775-730f-4024-8c06-5b85a30eeec9",
-      "stop_price": 67.9994,
-      "target_price": 69.2658,
-      "half_target": 68.6327,
-      "atr_value": 0.1292
+    "MU": {
+      "entry_price": 416.51,
+      "entry_time": "10:27:21",
+      "quantity": 2,
+      "qty": 2,
+      "partial_done": false,
+      "order_id": "access_key",
+      "stop_price": 404.47,
+      "target_price": 439.61,
+      "half_target": 428.06,
+      "atr_value": 6.05
     },
     "NU": {
       "entry_price": 14.81,
@@ -40,19 +40,30 @@
   },
   "reclaimed_today": [
     "HUBS",
-    "NU",
-    "HUT"
+    "MU",
+    "NU"
   ],
   "trade_log": [
     {
       "ticker": "HUT",
       "entry_price": 68.58,
-      "entry_time": "10:22:51",
-      "exit_price": 69.71,
-      "qty": 1,
-      "pnl": 1.13,
+      "entry_time": "07:23:16",
+      "exit_price": 69.67,
+      "qty": 13,
+      "pnl": 14.18,
       "reason": "SELL_TARGET",
-      "time": "13:15:02",
+      "time": "10:27:51",
+      "is_win": true
+    },
+    {
+      "ticker": "HUT",
+      "entry_price": 68.58,
+      "entry_time": "07:23:16",
+      "exit_price": 69.72,
+      "qty": 1,
+      "pnl": 1.14,
+      "reason": "SELL_TARGET",
+      "time": "10:15:02",
       "is_win": true
     }
   ]

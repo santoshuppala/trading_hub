@@ -216,7 +216,8 @@ class DurableEventLog:
             'linger.ms':                    50,             # batch for 50ms — reduces 50ms→5ms per-event latency
             'batch.size':                   102400,         # 100KB batch size
             'compression.type':             'snappy',       # 50-70% payload reduction
-            'enable.idempotence':           True,           # exactly-once semantics (prevents duplicates on retry)
+            # Note: enable.idempotence requires acks=all which adds latency.
+            # TimescaleDB provides dedup via event_id, so we skip idempotence here.
             'queue.buffering.max.messages': 50_000,
         }
         if extra_config:

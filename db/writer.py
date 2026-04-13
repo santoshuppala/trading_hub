@@ -147,28 +147,39 @@ class DBWriter:
             by_table.setdefault(rec.table, []).append(rec.row)
 
         pool = get_pool()
-        try:
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    for table, rows in by_table.items():
-                        await self._insert_batch(conn, table, rows)
-            self.rows_written    += len(batch)
+        written = 0
+        failed_tables = []
+
+        # Write each table INDEPENDENTLY — one bad table shouldn't kill the others.
+        # No outer transaction — each table gets its own connection + transaction
+        # so a COPY failure on one table doesn't abort writes to other tables.
+        for table, rows in by_table.items():
+            try:
+                async with pool.acquire() as conn:
+                    await self._insert_batch(conn, table, rows)
+                written += len(rows)
+            except Exception as exc:
+                failed_tables.append(table)
+                log.error("DBWriter flush failed for table '%s' (%d rows): %s",
+                          table, len(rows), exc)
+                # Log first row's keys for debugging schema mismatches
+                if rows:
+                    log.error("  columns: %s", list(rows[0].keys()))
+                # Drop failed rows — don't re-queue (prevents infinite retry)
+                self.rows_dropped += len(rows)
+
+        if written > 0:
+            self.rows_written    += written
             self.batches_flushed += 1
             self._cb_failures     = 0
-        except Exception as exc:
+
+        if failed_tables:
             self._cb_failures += 1
-            log.error("DBWriter flush failed (failure %d/%d): %s",
-                      self._cb_failures, _CB_FAILURES, exc)
             if self._cb_failures >= _CB_FAILURES:
                 self._cb_open       = True
                 self._cb_open_since = time.monotonic()
-                log.error("DBWriter circuit breaker OPEN — writes suspended for %ds", _CB_RESET)
-            # Re-queue dropped rows (best-effort, may overflow)
-            for rec in batch:
-                try:
-                    self._queue.put_nowait(rec)
-                except asyncio.QueueFull:
-                    self.rows_dropped += 1
+                log.error("DBWriter circuit breaker OPEN — writes suspended for %ds "
+                          "(failed tables: %s)", _CB_RESET, failed_tables)
 
     @staticmethod
     async def _insert_batch(
@@ -180,19 +191,14 @@ class DBWriter:
             return
         cols = list(rows[0].keys())
         records = [tuple(r[c] for c in cols) for r in rows]
-        try:
-            # Preferred: asyncpg COPY protocol (~5-10x faster than executemany)
-            await conn.copy_records_to_table(
-                f"trading.{table}",
-                records=records,
-                columns=cols,
-            )
-        except Exception:
-            # Fallback: parameterised INSERT with ON CONFLICT (handles schema mismatches)
-            col_list = ", ".join(cols)
-            val_refs = ", ".join(f"${i+1}" for i in range(len(cols)))
-            sql = f"INSERT INTO trading.{table} ({col_list}) VALUES ({val_refs}) ON CONFLICT DO NOTHING"
-            await conn.executemany(sql, records)
+        # Use parameterised INSERT with ON CONFLICT DO NOTHING.
+        # COPY protocol is faster but fails on schema mismatches (JSONB, UUID,
+        # enum types) and aborts the transaction, causing cascading failures.
+        # executemany() is safer and handles type coercion automatically.
+        col_list = ", ".join(cols)
+        val_refs = ", ".join(f"${i+1}" for i in range(len(cols)))
+        sql = f"INSERT INTO trading.{table} ({col_list}) VALUES ({val_refs}) ON CONFLICT DO NOTHING"
+        await conn.executemany(sql, records)
 
 
 # ── Session lifecycle ────────────────────────────────────────────────────────

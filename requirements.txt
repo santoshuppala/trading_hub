@@ -10,3 +10,4 @@ confluent-kafka
 asyncpg>=0.29.0
 psycopg[binary]>=3.1
 psutil
+python-dateutil

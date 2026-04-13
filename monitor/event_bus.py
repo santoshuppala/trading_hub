@@ -293,6 +293,10 @@ class EventType(Enum):
     # fire.  Consumed by ProStrategyRouter → RiskAdapter → ORDER_REQ.
     # Does NOT route through the existing RiskEngine — has its own risk gate.
     PRO_STRATEGY_SIGNAL = auto()
+    # ── Options subsystem (T3.7) ───────────────────────────────────────────────
+    # Emitted by OptionsEngine after strategy selection + option chain lookup.
+    # Does NOT route through the existing RiskEngine or AlpacaBroker.
+    OPTIONS_SIGNAL = auto()
 
 
 # Populate config dicts now that EventType exists
@@ -317,6 +321,8 @@ _DEFAULT_ASYNC_CONFIG.update({
     EventType.POP_SIGNAL: {'maxsize':  50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},
     # Pro-setup signals — same profile as POP_SIGNAL
     EventType.PRO_STRATEGY_SIGNAL: {'maxsize': 100, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},
+    # Options signals — same profile as SIGNAL; low frequency
+    EventType.OPTIONS_SIGNAL: {'maxsize': 50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
 })
 
 _DEFAULT_PRIORITY.update({
@@ -327,6 +333,7 @@ _DEFAULT_PRIORITY.update({
     EventType.SIGNAL:     EventPriority.MEDIUM,
     EventType.POP_SIGNAL:          EventPriority.MEDIUM,
     EventType.PRO_STRATEGY_SIGNAL: EventPriority.MEDIUM,
+    EventType.OPTIONS_SIGNAL:      EventPriority.MEDIUM,
     EventType.RISK_BLOCK: EventPriority.MEDIUM,
     EventType.BAR:        EventPriority.LOW,
     EventType.QUOTE:      EventPriority.LOW,
@@ -755,6 +762,7 @@ from .events import (           # noqa: E402
     OrderRequestPayload, FillPayload, OrderFailPayload,
     PositionPayload, RiskBlockPayload, HeartbeatPayload,
     PopSignalPayload, ProStrategySignalPayload,
+    OptionsSignalPayload,
 )
 
 _PAYLOAD_TYPES: Dict[EventType, type] = {
@@ -769,6 +777,7 @@ _PAYLOAD_TYPES: Dict[EventType, type] = {
     EventType.HEARTBEAT:           HeartbeatPayload,
     EventType.POP_SIGNAL:          PopSignalPayload,
     EventType.PRO_STRATEGY_SIGNAL: ProStrategySignalPayload,
+    EventType.OPTIONS_SIGNAL:      OptionsSignalPayload,
 }
 
 __all__ = [

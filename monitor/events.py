@@ -730,3 +730,72 @@ class ProStrategySignalPayload:
                 raise ValueError(
                     f"target_2 ({self.target_2}) must be < target_1 ({self.target_1})"
                 )
+
+
+# ── OPTIONS_SIGNAL ────────────────────────────────────────────────────────────
+
+class OptionStrategyType(str, Enum):
+    """All 13 supported option strategy types."""
+    LONG_CALL         = 'long_call'
+    LONG_PUT          = 'long_put'
+    BULL_CALL_SPREAD  = 'bull_call_spread'
+    BEAR_PUT_SPREAD   = 'bear_put_spread'
+    BULL_PUT_SPREAD   = 'bull_put_spread'
+    BEAR_CALL_SPREAD  = 'bear_call_spread'
+    LONG_STRADDLE     = 'long_straddle'
+    LONG_STRANGLE     = 'long_strangle'
+    IRON_CONDOR       = 'iron_condor'
+    IRON_BUTTERFLY    = 'iron_butterfly'
+    CALENDAR_SPREAD   = 'calendar_spread'
+    DIAGONAL_SPREAD   = 'diagonal_spread'
+    BUTTERFLY_SPREAD  = 'butterfly_spread'
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class OptionsSignalPayload:
+    """
+    Options trade signal produced by OptionsEngine (T3.7).
+
+    Producer  : OptionsEngine
+    Consumers : AlpacaOptionsBroker (multi-leg), DurableEventLog (audit)
+
+    legs_json : JSON string encoding a list of leg dicts:
+                [{'symbol': 'AAPL240119C00180000', 'side': 'buy', 'qty': 1,
+                  'ratio': 1, 'limit_price': 2.50}, ...]
+                Stored as str to keep the payload frozen and serialisable.
+
+    source    : 'signal' (from StrategyEngine SIGNAL event) or 'bar_scan'
+                (independent neutral/volatility scan).
+    """
+    ticker:           str
+    strategy_type:    OptionStrategyType
+    underlying_price: float
+    expiry_date:      str    # ISO date string: 'YYYY-MM-DD'
+    net_debit:        float  # positive=cost, negative=credit received
+    max_risk:         float  # maximum dollar loss; always > 0
+    max_reward:       float  # maximum dollar gain; always > 0
+    atr_value:        float
+    rvol:             float
+    rsi_value:        float
+    legs_json:        str    # JSON list of leg dicts
+    source:           str    # 'signal' | 'bar_scan'
+
+    def __post_init__(self):
+        _require_ticker(self.ticker)
+        object.__setattr__(self, 'strategy_type', OptionStrategyType(self.strategy_type))
+        _require_positive('underlying_price', self.underlying_price)
+        if not self.expiry_date:
+            raise ValueError("expiry_date must be a non-empty string")
+        _require_positive('max_risk', self.max_risk)
+        _require_positive('max_reward', self.max_reward)
+        _require_positive('atr_value', self.atr_value)
+        _require_non_negative('rvol', self.rvol)
+        if not math.isfinite(self.rsi_value) or not (0.0 <= self.rsi_value <= 100.0):
+            raise ValueError(f"rsi_value must be in [0, 100], got {self.rsi_value!r}")
+        if not self.legs_json:
+            raise ValueError("legs_json must be a non-empty string")
+        if self.source not in ('signal', 'bar_scan'):
+            raise ValueError(f"source must be 'signal' or 'bar_scan', got {self.source!r}")

@@ -31,6 +31,10 @@ from config import (
     ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
     POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
     PRO_MAX_POSITIONS, PRO_TRADE_BUDGET, PRO_ORDER_COOLDOWN,
+    ALPACA_OPTIONS_KEY, ALPACA_OPTIONS_SECRET,
+    OPTIONS_PAPER_TRADING, OPTIONS_MAX_POSITIONS, OPTIONS_TRADE_BUDGET,
+    OPTIONS_TOTAL_BUDGET, OPTIONS_ORDER_COOLDOWN,
+    OPTIONS_MIN_DTE, OPTIONS_MAX_DTE, OPTIONS_LEAPS_DTE,
     GLOBAL_MAX_POSITIONS,
     DB_ENABLED, DATABASE_URL,
 )
@@ -223,6 +227,28 @@ def main():
         f"news={'benzinga' if news_source else 'mock'} | social=stocktwits"
     )
 
+    # ── T3.7: Options engine (dedicated Alpaca options account) ───────────────────
+    from options.engine import OptionsEngine
+    options_engine = OptionsEngine(
+        bus=monitor._bus,
+        options_key=ALPACA_OPTIONS_KEY,
+        options_secret=ALPACA_OPTIONS_SECRET,
+        paper=OPTIONS_PAPER_TRADING,
+        max_positions=OPTIONS_MAX_POSITIONS,
+        trade_budget=float(OPTIONS_TRADE_BUDGET),
+        total_budget=float(OPTIONS_TOTAL_BUDGET),
+        order_cooldown=OPTIONS_ORDER_COOLDOWN,
+        min_dte=OPTIONS_MIN_DTE,
+        max_dte=OPTIONS_MAX_DTE,
+        leaps_dte=OPTIONS_LEAPS_DTE,
+        alert_email=ALERT_EMAIL,
+    )
+    log.info(
+        f"OptionsEngine ready | paper={OPTIONS_PAPER_TRADING} | "
+        f"max_positions={OPTIONS_MAX_POSITIONS} | budget=${OPTIONS_TRADE_BUDGET}/trade | "
+        f"total=${OPTIONS_TOTAL_BUDGET} | DTE={OPTIONS_MIN_DTE}-{OPTIONS_MAX_DTE}"
+    )
+
     # ── Pre-market connectivity check ─────────────────────────────────────────
     from config import MAX_DAILY_LOSS
     log.info("=" * 60)
@@ -309,6 +335,26 @@ def main():
         log.info("  [OK] TimescaleDB: connected (pool initialized)")
     else:
         log.info("  [SKIP] TimescaleDB: disabled or unreachable")
+
+    # Check 7: Alpaca Options account
+    if ALPACA_OPTIONS_KEY and ALPACA_OPTIONS_SECRET:
+        try:
+            import requests as _req
+            base = 'https://paper-api.alpaca.markets' if OPTIONS_PAPER_TRADING else 'https://api.alpaca.markets'
+            r = _req.get(f'{base}/v2/account',
+                         headers={'APCA-API-KEY-ID': ALPACA_OPTIONS_KEY,
+                                  'APCA-API-SECRET-KEY': ALPACA_OPTIONS_SECRET},
+                         timeout=5)
+            if r.status_code == 200:
+                acct = r.json()
+                bp = acct.get('buying_power', '?')
+                log.info(f"  [OK] Alpaca Options: connected | buying_power=${bp}")
+            else:
+                log.warning(f"  [WARN] Alpaca Options: status {r.status_code}")
+        except Exception as e:
+            log.warning(f"  [WARN] Alpaca Options: {e}")
+    else:
+        log.info("  [SKIP] Alpaca Options: APCA_OPTIONS_KEY not set")
 
     log.info("=" * 60)
     if preflight_ok:

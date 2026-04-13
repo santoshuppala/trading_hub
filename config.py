@@ -96,6 +96,21 @@ PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))    # max concurren
 PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))   # dollars allocated per pro trade
 PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))  # seconds cooldown per ticker
 
+# ── Options engine (T3.7) — dedicated Alpaca account ────────────────────────────
+# Uses separate APCA_OPTIONS_KEY / APCA_OPTIONS_SECRET credentials for options trading.
+# Independent risk gate (OptionsRiskGate); does NOT route through existing RiskEngine.
+# Starting budget: $10,000 total; $500 per trade max; 5 concurrent positions.
+ALPACA_OPTIONS_KEY     = os.getenv('APCA_OPTIONS_KEY')
+ALPACA_OPTIONS_SECRET  = os.getenv('APCA_OPTIONS_SECRET')
+OPTIONS_PAPER_TRADING  = os.getenv('OPTIONS_PAPER_TRADING', 'true').lower() == 'true'
+OPTIONS_MAX_POSITIONS  = int(os.getenv('OPTIONS_MAX_POSITIONS', 5))
+OPTIONS_TRADE_BUDGET   = int(os.getenv('OPTIONS_TRADE_BUDGET', 500))      # per trade
+OPTIONS_TOTAL_BUDGET   = int(os.getenv('OPTIONS_TOTAL_BUDGET', 10000))    # $10K ceiling
+OPTIONS_ORDER_COOLDOWN = int(os.getenv('OPTIONS_ORDER_COOLDOWN', 300))    # seconds per ticker
+OPTIONS_MIN_DTE        = int(os.getenv('OPTIONS_MIN_DTE', 20))             # days to expiry
+OPTIONS_MAX_DTE        = int(os.getenv('OPTIONS_MAX_DTE', 45))             # days to expiry
+OPTIONS_LEAPS_DTE      = int(os.getenv('OPTIONS_LEAPS_DTE', 365))          # LEAPS leg DTE
+
 # ── External data APIs ────────────────────────────────────────────────────────
 BENZINGA_API_KEY    = os.getenv('BENZINGA_API_KEY') or os.getenv('BENZENGA_API_KEY', '')
 STOCKTWITS_TOKEN    = os.getenv('STOCKTWITS_TOKEN', '')  # optional — public API works without token

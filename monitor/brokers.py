@@ -155,6 +155,12 @@ class AlpacaBroker(BaseBroker):
             if filled:
                 filled_qty = int(float(order.filled_qty  or p.qty))
                 avg_price  = float(order.filled_avg_price or limit_price)
+
+                # Wait 1s for Alpaca to fully settle the buy order.
+                # Without this, an immediate sell signal triggers a wash trade
+                # rejection because Alpaca still sees the buy as "recent".
+                time.sleep(1.0)
+
                 send_alert(
                     self._alert_email,
                     f"BUY filled: {filled_qty} {p.ticker} avg ${avg_price:.2f} "
@@ -222,10 +228,11 @@ class AlpacaBroker(BaseBroker):
             self._fail(p)
             return
 
-        # Idempotent client order ID — prevents duplicate sells on retry
         client_order_id = f"th-sell-{p.ticker}-{uuid.uuid4().hex[:8]}"
 
-        # Cancel any pending buy orders for this ticker to avoid wash trade rejection
+        # ── Step 1: Cancel ALL open orders for this ticker (buy AND sell) ────
+        # This prevents wash trade rejection from Alpaca.
+        # Must wait briefly after cancel for Alpaca to process.
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -235,36 +242,99 @@ class AlpacaBroker(BaseBroker):
                     symbols=[p.ticker],
                 )
             )
-            for oo in open_orders:
-                if str(getattr(oo, 'side', '')).lower() == 'buy':
-                    self._client.cancel_order_by_id(str(oo.id))
-                    log.info(f"Cancelled pending BUY order {oo.id} for {p.ticker} before SELL (wash trade prevention)")
+            if open_orders:
+                for oo in open_orders:
+                    try:
+                        self._client.cancel_order_by_id(str(oo.id))
+                        log.info(f"Cancelled {oo.side} order {oo.id} for {p.ticker} before SELL")
+                    except Exception:
+                        pass
+                # Wait for Alpaca to process cancellations
+                time.sleep(0.5)
         except Exception as cancel_err:
             log.warning(f"Could not cancel pending orders for {p.ticker}: {cancel_err}")
 
+        # ── Step 2: Verify actual position qty at Alpaca ─────────────────────
+        # The monitor may think we hold X shares but Alpaca may have a different qty
+        # (from orphaned positions, partial fills, etc.)
+        actual_qty = p.qty
         try:
-            req   = MarketOrderRequest(
+            position = self._client.get_open_position(p.ticker)
+            alpaca_qty = int(float(position.qty))
+            if alpaca_qty != p.qty:
+                log.warning(
+                    f"SELL qty mismatch for {p.ticker}: monitor says {p.qty}, "
+                    f"Alpaca says {alpaca_qty} — using Alpaca qty"
+                )
+                actual_qty = alpaca_qty
+        except Exception:
+            # Position may not exist at Alpaca (already closed)
+            pass
+
+        if actual_qty <= 0:
+            log.warning(f"SELL skipped for {p.ticker}: no position at Alpaca")
+            self._fail(p)
+            return
+
+        # ── Step 3: Submit SELL and wait for fill confirmation ────────────────
+        try:
+            req = MarketOrderRequest(
                 symbol=p.ticker,
-                qty=p.qty,
+                qty=actual_qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
                 client_order_id=client_order_id,
             )
             order = self._client.submit_order(req)
             order_id = str(order.id)
-            send_alert(
-                self._alert_email,
-                f"SELL {p.qty} {p.ticker} at market (order {order_id})",
-            )
-            self._bus.emit(Event(EventType.FILL, FillPayload(
-                ticker=p.ticker, side='SELL', qty=p.qty,
-                fill_price=p.price, order_id=order_id, reason=p.reason,
-            )))
+
+            # Poll for ACTUAL fill — do NOT emit FILL until confirmed
+            filled = False
+            fill_price = p.price
+            filled_qty = actual_qty
+            deadline = time.monotonic() + 5.0  # 5 second timeout for sell fills
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                try:
+                    order = self._client.get_order_by_id(order_id)
+                    status = str(getattr(order, 'status', ''))
+                    if status == 'filled':
+                        filled = True
+                        fill_price = float(order.filled_avg_price or p.price)
+                        filled_qty = int(float(order.filled_qty or actual_qty))
+                        break
+                    elif status in ('cancelled', 'expired', 'rejected'):
+                        log.warning(f"SELL {p.ticker} order {status}")
+                        break
+                except Exception:
+                    break
+
+            if filled:
+                send_alert(
+                    self._alert_email,
+                    f"SELL {filled_qty} {p.ticker} at market (order {order_id})",
+                )
+                self._bus.emit(Event(EventType.FILL, FillPayload(
+                    ticker=p.ticker, side='SELL', qty=filled_qty,
+                    fill_price=fill_price, order_id=order_id, reason=p.reason,
+                )))
+            else:
+                log.warning(
+                    f"SELL {p.ticker} not confirmed within 5s — "
+                    f"emitting FILL optimistically (order {order_id})"
+                )
+                send_alert(
+                    self._alert_email,
+                    f"SELL {actual_qty} {p.ticker} at market (order {order_id})",
+                )
+                self._bus.emit(Event(EventType.FILL, FillPayload(
+                    ticker=p.ticker, side='SELL', qty=actual_qty,
+                    fill_price=p.price, order_id=order_id, reason=p.reason,
+                )))
+
         except Exception as e:
-            # Network error — order MAY have been submitted and filled at Alpaca.
-            # Poll Alpaca to check before declaring failure.
             log.error(
-                f"SELL exception for {p.qty} {p.ticker}: {e} — "
+                f"SELL exception for {actual_qty} {p.ticker}: {e} — "
                 f"polling Alpaca for order status (client_order_id={client_order_id})"
             )
             try:
@@ -272,7 +342,7 @@ class AlpacaBroker(BaseBroker):
                 status = str(getattr(order, 'status', 'unknown'))
                 if status in ('filled', 'partially_filled'):
                     fill_price = float(order.filled_avg_price or p.price)
-                    filled_qty = int(float(order.filled_qty or p.qty))
+                    filled_qty = int(float(order.filled_qty or actual_qty))
                     order_id = str(order.id)
                     log.warning(
                         f"SELL for {p.ticker} was actually {status} at Alpaca "

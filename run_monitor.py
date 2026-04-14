@@ -56,6 +56,123 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def _fetch_account_snapshot(api_key, api_secret, paper):
+    """Fetch equity, last_equity (previous close), and cash from Alpaca account API."""
+    import requests as _req
+    base = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+    r = _req.get(
+        f'{base}/v2/account',
+        headers={'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret},
+        timeout=10,
+    )
+    r.raise_for_status()
+    acct = r.json()
+    return {
+        'equity':       float(acct.get('equity', 0)),
+        'last_equity':  float(acct.get('last_equity', 0)),   # previous close equity
+        'cash':         float(acct.get('cash', 0)),
+        'buying_power': float(acct.get('buying_power', 0)),
+        'portfolio_value': float(acct.get('portfolio_value', 0)),
+        'status':       acct.get('status', '?'),
+    }
+
+
+def _fetch_daily_fees(api_key, api_secret, paper, date_str=None):
+    """Fetch total regulatory + commission fees from Alpaca account activities for a given date.
+
+    Returns dict with 'total_fees', 'fee_count', and 'fee_details' list.
+    Alpaca activity types: FEE (regulatory), CFEE (commission).
+    """
+    import requests as _req
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if date_str is None:
+        date_str = datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
+
+    base = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+    headers = {'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret}
+
+    total_fees = 0.0
+    fee_details = []
+
+    for activity_type in ('FEE', 'CFEE'):
+        try:
+            r = _req.get(
+                f'{base}/v2/account/activities/{activity_type}',
+                headers=headers,
+                params={'date': date_str, 'direction': 'desc', 'page_size': 100},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                activities = r.json()
+                for act in activities:
+                    amount = abs(float(act.get('net_amount', 0) or act.get('qty', 0) or 0))
+                    total_fees += amount
+                    fee_details.append({
+                        'type': activity_type,
+                        'amount': amount,
+                        'symbol': act.get('symbol', ''),
+                        'description': act.get('description', ''),
+                    })
+        except Exception:
+            pass  # fees are best-effort; don't crash the monitor
+
+    return {
+        'total_fees': round(total_fees, 4),
+        'fee_count':  len(fee_details),
+        'fee_details': fee_details,
+    }
+
+
+def _fetch_filled_orders(api_key, api_secret, paper, date_str=None):
+    """Fetch all filled orders from Alpaca for a given date.
+
+    Returns list of dicts with ticker, side, qty, filled_avg_price, filled_at.
+    Used to detect orphaned/missed trades not captured in the monitor's trade_log.
+    """
+    import requests as _req
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if date_str is None:
+        date_str = datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
+
+    base = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+    headers = {'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret}
+
+    filled_orders = []
+    try:
+        r = _req.get(
+            f'{base}/v2/orders',
+            headers=headers,
+            params={
+                'status': 'closed',
+                'after': f'{date_str}T00:00:00Z',
+                'until': f'{date_str}T23:59:59Z',
+                'limit': 500,
+                'direction': 'asc',
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            for order in r.json():
+                if order.get('status') == 'filled' and order.get('filled_qty'):
+                    filled_orders.append({
+                        'id':         order.get('id', ''),
+                        'ticker':     order.get('symbol', ''),
+                        'side':       order.get('side', '').upper(),
+                        'qty':        int(float(order.get('filled_qty', 0))),
+                        'fill_price': float(order.get('filled_avg_price', 0)),
+                        'filled_at':  order.get('filled_at', ''),
+                        'order_type': order.get('type', ''),
+                    })
+    except Exception:
+        pass  # best-effort; don't crash the monitor
+
+    return filled_orders
+
+
 def main():
     import asyncio
     import hashlib
@@ -363,6 +480,26 @@ def main():
         log.error("PRE-MARKET CHECK: CRITICAL FAILURES DETECTED — review above")
     log.info("=" * 60)
 
+    # ── Session equity baseline (ground truth from Alpaca) ──────────────────
+    session_start_equity = None
+    session_prev_close_equity = None
+    if ALPACA_API_KEY and ALPACA_SECRET:
+        try:
+            snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+            session_start_equity = snap['equity']
+            session_prev_close_equity = snap['last_equity']
+            log.info("=" * 60)
+            log.info("SESSION EQUITY BASELINE (Alpaca Ground Truth)")
+            log.info("=" * 60)
+            log.info(f"  {'Previous Close Equity':<25} ${session_prev_close_equity:>12,.2f}")
+            log.info(f"  {'Current Equity':<25} ${session_start_equity:>12,.2f}")
+            log.info(f"  {'Cash':<25} ${snap['cash']:>12,.2f}")
+            log.info(f"  {'Buying Power':<25} ${snap['buying_power']:>12,.2f}")
+            log.info(f"  {'Portfolio Value':<25} ${snap['portfolio_value']:>12,.2f}")
+            log.info("=" * 60)
+        except Exception as exc:
+            log.warning(f"Could not fetch equity baseline (non-fatal): {exc}")
+
     # ── Activity Logger (every event → TimescaleDB for analysis) ────────────
     activity_logger = None
     if DB_ENABLED_RUNTIME and db_writer:
@@ -372,6 +509,18 @@ def main():
         log.info("ActivityLogger active → all signals/fills/blocks logged to TimescaleDB")
     else:
         log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
+
+    # ── Initialize canonical RVOL engine ────────────────────────────────────
+    try:
+        from monitor.rvol import init_global_rvol_engine
+        rvol_engine = init_global_rvol_engine()
+        # Seed profiles from data client (non-blocking, best-effort)
+        try:
+            rvol_engine.seed_profiles(monitor.tickers, monitor._data)
+        except Exception as seed_err:
+            log.warning(f"RVOL profile seeding failed (will lazy-seed): {seed_err}")
+    except ImportError:
+        log.warning("RVOL engine not available — using legacy calculation")
 
     monitor.start()
     log.info("Monitor running. New entries stop at 3:00 PM ET, exits until 4:00 PM ET.")
@@ -458,9 +607,17 @@ def main():
                         )
                     except Exception:
                         pass  # health logging must never crash the monitor
-            # Hourly summary
+            # Hourly summary (with equity ground truth when available)
             if now.minute == 0 and trades:
-                log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}")
+                hourly_extra = ""
+                if ALPACA_API_KEY and ALPACA_SECRET and session_start_equity is not None:
+                    try:
+                        hr_snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                        equity_pnl = hr_snap['equity'] - session_start_equity
+                        hourly_extra = f" | Equity PnL: ${equity_pnl:+.2f} (Alpaca)"
+                    except Exception:
+                        pass
+                log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}{hourly_extra}")
             time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
@@ -497,11 +654,12 @@ def main():
         # Only cancel stale open ORDERS (prevents wash trade issues next morning).
         try:
             from alpaca.trading.client import TradingClient
-            from config import APCA_API_KEY_ID, APCA_API_SECRET_KEY, PAPER_TRADING
+            from config import APCA_API_KEY_ID, APCA_API_SECRET_KEY
+            _paper = PAPER_TRADING  # use module-level import, don't re-import locally
             eod_client = TradingClient(
                 api_key=APCA_API_KEY_ID,
                 secret_key=APCA_API_SECRET_KEY,
-                paper=PAPER_TRADING,
+                paper=_paper,
             )
             # Cancel all open orders (prevents wash trade errors on next session)
             try:
@@ -557,6 +715,16 @@ def main():
 
         if not trades:
             log.info("  No trades executed today.")
+            # Still log equity change even with no trades (positions, fees, dividends)
+            if ALPACA_API_KEY and ALPACA_SECRET:
+                try:
+                    eod_snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    baseline = session_prev_close_equity or session_start_equity
+                    if baseline:
+                        equity_pnl = round(eod_snap['equity'] - baseline, 2)
+                        log.info(f"  Equity change (Alpaca): ${equity_pnl:+.2f} (no trades — unrealized/fees/dividends)")
+                except Exception:
+                    pass
             log.info(bar)
         else:
             wins       = [t for t in trades if t['is_win']]
@@ -575,12 +743,190 @@ def main():
             log.info(f"  {'Total Trades':<20} {len(trades)}")
             log.info(f"  {'Wins / Losses':<20} {len(wins)} / {len(losses)}")
             log.info(f"  {'Win Rate':<20} {win_rate:.1f}%")
-            log.info(f"  {'Total PnL':<20} ${total_pnl:+.2f}")
+            log.info(f"  {'Total PnL (trades)':<20} ${total_pnl:+.2f}")
             log.info(f"  {'Avg Win':<20} ${avg_win:+.2f}")
             log.info(f"  {'Avg Loss':<20} ${avg_loss:+.2f}")
             log.info(f"  {'Profit Factor':<20} {pf:.2f}x")
             log.info(f"  {'Best Trade':<20} {best['ticker']} ${best['pnl']:+.2f} ({best['reason']})")
             log.info(f"  {'Worst Trade':<20} {worst['ticker']} ${worst['pnl']:+.2f} ({worst['reason']})")
+
+            # ── P&L RECONCILIATION (Alpaca ground truth) ─────────────
+            log.info("")
+            log.info("  " + "-" * (W - 2))
+            log.info("  P&L RECONCILIATION vs Alpaca Ground Truth")
+            log.info("  " + "-" * (W - 2))
+
+            eod_equity = None
+            eod_fees = None
+            if ALPACA_API_KEY and ALPACA_SECRET:
+                # 1. Fetch ending equity snapshot
+                try:
+                    eod_snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    eod_equity = eod_snap['equity']
+                    log.info(f"  {'Ending Equity':<25} ${eod_equity:>12,.2f}")
+                    if session_prev_close_equity is not None:
+                        log.info(f"  {'Prev Close Equity':<25} ${session_prev_close_equity:>12,.2f}")
+                    if session_start_equity is not None:
+                        log.info(f"  {'Session Start Equity':<25} ${session_start_equity:>12,.2f}")
+                except Exception as exc:
+                    log.warning(f"  Could not fetch ending equity: {exc}")
+
+                # 2. Fetch daily fees/commissions
+                try:
+                    fee_data = _fetch_daily_fees(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    eod_fees = fee_data['total_fees']
+                    log.info(f"  {'Alpaca Fees/Reg':<25} ${eod_fees:>12,.4f}  ({fee_data['fee_count']} charges)")
+                except Exception as exc:
+                    log.warning(f"  Could not fetch fees: {exc}")
+                    eod_fees = 0.0
+
+                # 3. Compute equity-based P&L (ground truth)
+                log.info("")
+                baseline = session_prev_close_equity or session_start_equity
+                if eod_equity is not None and baseline is not None:
+                    equity_pnl = round(eod_equity - baseline, 2)
+                    fee_adjusted_pnl = round(total_pnl - (eod_fees or 0.0), 2)
+                    discrepancy = round(equity_pnl - fee_adjusted_pnl, 2)
+
+                    log.info(f"  {'Trade-log PnL':<25} ${total_pnl:>+12.2f}  (sum of closed trades)")
+                    log.info(f"  {'Fees Deducted':<25} ${-(eod_fees or 0.0):>+12.4f}")
+                    log.info(f"  {'Fee-Adjusted PnL':<25} ${fee_adjusted_pnl:>+12.2f}  (trades - fees)")
+                    log.info(f"  {'Equity-Based PnL':<25} ${equity_pnl:>+12.2f}  (Alpaca ground truth)")
+                    log.info(f"  {'Discrepancy':<25} ${discrepancy:>+12.2f}  (equity - fee-adjusted)")
+
+                    if abs(discrepancy) > 0.01:
+                        log.warning(
+                            f"  ** P&L DISCREPANCY: ${discrepancy:+.2f} **"
+                        )
+                        log.warning(
+                            f"  ** Equity says ${equity_pnl:+.2f} but trades-fees says ${fee_adjusted_pnl:+.2f} **"
+                        )
+                        # TODO(santosh): Possible causes to validate manually:
+                        #   - Unrealized P&L on positions held overnight (open positions change equity)
+                        #   - Dividends or corporate actions credited/debited intraday
+                        #   - Interest on cash balance (margin accounts)
+                        #   - Fees not captured by FEE/CFEE activity types
+                        #   - Partial fills where monitor qty != broker qty
+                        #   - Rounding differences across many small trades
+                        #   - Positions opened by other engines (Pop/Pro/Options) on same account
+                        log.warning("  ** Review above causes — see TODO comments in run_monitor.py **")
+                    else:
+                        log.info("  P&L RECONCILED — trade-log matches Alpaca equity (within $0.01)")
+                else:
+                    log.warning("  Could not reconcile — equity baseline or ending equity unavailable")
+
+                # 4. Orphaned / missed trade audit (compare Alpaca fills vs trade_log)
+                log.info("")
+                log.info("  " + "-" * (W - 2))
+                log.info("  ORPHANED / MISSED TRADE AUDIT")
+                log.info("  " + "-" * (W - 2))
+                try:
+                    alpaca_fills = _fetch_filled_orders(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    alpaca_sells = [f for f in alpaca_fills if f['side'] == 'SELL']
+                    alpaca_buys  = [f for f in alpaca_fills if f['side'] == 'BUY']
+
+                    log.info(f"  Alpaca filled orders today: {len(alpaca_fills)} ({len(alpaca_buys)} buys, {len(alpaca_sells)} sells)")
+                    log.info(f"  Monitor trade_log entries:  {len(trades)}")
+
+                    # Build monitor sell map: ticker -> list of (qty, exit_price)
+                    monitor_sells = {}
+                    for t in trades:
+                        tk = t['ticker']
+                        monitor_sells.setdefault(tk, [])
+                        monitor_sells[tk].append({
+                            'qty': t['qty'],
+                            'price': t['exit_price'],
+                        })
+
+                    # Build Alpaca sell map: ticker -> list of (qty, fill_price)
+                    broker_sells = {}
+                    for f in alpaca_sells:
+                        tk = f['ticker']
+                        broker_sells.setdefault(tk, [])
+                        broker_sells[tk].append({
+                            'qty': f['qty'],
+                            'price': f['fill_price'],
+                            'filled_at': f['filled_at'],
+                            'order_id': f['id'],
+                        })
+
+                    # Compare total sell qty per ticker
+                    all_sell_tickers = set(list(monitor_sells.keys()) + list(broker_sells.keys()))
+                    orphaned_found = False
+                    orphaned_pnl_impact = 0.0
+
+                    for tk in sorted(all_sell_tickers):
+                        m_qty = sum(s['qty'] for s in monitor_sells.get(tk, []))
+                        b_qty = sum(s['qty'] for s in broker_sells.get(tk, []))
+
+                        if m_qty != b_qty:
+                            orphaned_found = True
+                            diff = b_qty - m_qty
+                            # Estimate missed P&L: find corresponding buy for this ticker
+                            buy_prices = [f['fill_price'] for f in alpaca_buys if f['ticker'] == tk]
+                            avg_buy = sum(buy_prices) / len(buy_prices) if buy_prices else 0
+                            sell_prices = [s['price'] for s in broker_sells.get(tk, [])]
+                            avg_sell = sum(sell_prices) / len(sell_prices) if sell_prices else 0
+                            est_missed_pnl = round((avg_sell - avg_buy) * abs(diff), 2) if avg_buy else 0
+
+                            if diff > 0:
+                                log.warning(
+                                    f"  MISSED SELL: {tk} — Alpaca sold {b_qty} shares, "
+                                    f"monitor logged {m_qty} (missed {diff} shares, "
+                                    f"est. PnL impact: ${est_missed_pnl:+.2f})"
+                                )
+                            else:
+                                log.warning(
+                                    f"  PHANTOM SELL: {tk} — monitor logged {m_qty} shares sold, "
+                                    f"but Alpaca only filled {b_qty} (phantom {abs(diff)} shares)"
+                                )
+                            orphaned_pnl_impact += est_missed_pnl
+
+                    # Check for buys at Alpaca with no corresponding monitor entry
+                    monitor_buy_tickers = set(t['ticker'] for t in trades)
+                    # Also include open positions the monitor knows about
+                    monitor_open_tickers = set(monitor.positions.keys()) if hasattr(monitor, 'positions') else set()
+                    known_tickers = monitor_buy_tickers | monitor_open_tickers
+
+                    orphan_buys = {}
+                    for f in alpaca_buys:
+                        tk = f['ticker']
+                        orphan_buys.setdefault(tk, [])
+                        orphan_buys[tk].append(f)
+
+                    for tk, buys in sorted(orphan_buys.items()):
+                        b_buy_qty = sum(b['qty'] for b in buys)
+                        # Check if monitor has any record of buying this ticker
+                        m_buy_qty = sum(
+                            s['qty'] for s in monitor_sells.get(tk, [])
+                        )
+                        # Also check open positions
+                        open_qty = 0
+                        if hasattr(monitor, 'positions') and tk in monitor.positions:
+                            open_qty = monitor.positions[tk].get('quantity', 0)
+                        m_total = m_buy_qty + open_qty
+
+                        if b_buy_qty > m_total and tk not in monitor_sells:
+                            orphaned_found = True
+                            log.warning(
+                                f"  ORPHANED BUY: {tk} — Alpaca bought {b_buy_qty} shares, "
+                                f"monitor has no record (not in trade_log or open positions)"
+                            )
+
+                    if orphaned_found:
+                        if orphaned_pnl_impact != 0:
+                            log.warning(f"  Estimated orphaned trade PnL impact: ${orphaned_pnl_impact:+.2f}")
+                        # TODO(santosh): Orphaned trades to investigate:
+                        #   - Check if broker filled an order but monitor missed the FILL event
+                        #   - Check if position was opened by Pop/Pro/Options engine on same account
+                        #   - Check for wash-trade cancel/resubmit that created duplicate fills
+                        #   - Review logs around the fill time for errors/timeouts
+                        log.warning("  ** Orphaned trades detected — review logs for missed fills **")
+                    else:
+                        log.info("  No orphaned or missed trades — monitor and Alpaca fills match")
+
+                except Exception as exc:
+                    log.warning(f"  Orphaned trade audit failed (non-fatal): {exc}")
 
             # ── Exit reason breakdown ─────────────────────────────────
             log.info("")

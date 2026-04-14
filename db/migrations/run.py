@@ -53,7 +53,7 @@ async def run_migrations(dsn: str | None = None) -> int:
     """
     url = dsn or os.getenv(
         "DATABASE_URL",
-        "postgresql://trading:trading_secret@localhost:5432/trading_hub",
+        "postgresql://trading:trading_secret@localhost:5432/tradinghub",
     )
 
     conn: asyncpg.Connection = await asyncpg.connect(url)

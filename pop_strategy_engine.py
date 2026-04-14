@@ -80,6 +80,7 @@ from typing import Dict, List, Optional, Set
 
 from monitor.event_bus import Event, EventBus, EventType
 from monitor.events import FillPayload, OrderFailPayload, PopSignalPayload
+from monitor.sector_map import get_sector, count_sector_positions
 from pop_screener.classifier      import StrategyClassifier
 from pop_screener.features        import FeatureEngineer
 from pop_screener.ingestion       import (
@@ -182,6 +183,15 @@ class PopExecutor:
             if len(self._positions) >= self._max_positions:
                 log.info("POP risk block %s: max pop positions (%d) reached",
                          symbol, self._max_positions)
+                return
+
+            # Sector concentration limit (max 2 per sector)
+            _MAX_PER_SECTOR = 2
+            sector = get_sector(symbol)
+            sector_counts = count_sector_positions(self._positions)
+            if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
+                log.info("POP risk block %s: sector %s already has %d positions",
+                         symbol, sector, sector_counts[sector])
                 return
 
             last = self._last_order_time.get(symbol, 0.0)

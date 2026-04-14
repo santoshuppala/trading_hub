@@ -76,6 +76,10 @@ class StockTwitsSocialSource:
         # Rate limit tracking
         self._last_request_time = 0.0
         self._min_interval = 0.3  # 300ms between requests (safe for 200/hr)
+        # Hourly request counter for rate limit monitoring
+        self._request_count = 0
+        self._request_window_start = time.time()
+        self._rate_limit_warnings = 0
 
     def get_social(self, symbol: str, window_hours: float = 1.0) -> SocialData:
         """
@@ -88,6 +92,24 @@ class StockTwitsSocialSource:
         cached = self._cache.get(symbol)
         if cached and (time.monotonic() - cached[0]) < _CACHE_TTL:
             return cached[1]
+
+        # --- Rate limit monitoring ---
+        self._request_count += 1
+        # Reset counter every hour
+        if time.time() - self._request_window_start > 3600:
+            self._request_count = 1
+            self._request_window_start = time.time()
+        # Warn if approaching limit
+        if self._request_count >= 180:  # 90% of 200
+            log.warning(
+                "[StockTwits] Rate limit approaching: %d/200 requests this hour",
+                self._request_count,
+            )
+        # Hard stop at limit
+        if self._request_count >= 195:
+            log.warning("[StockTwits] Rate limit reached — returning cached data")
+            self._rate_limit_warnings += 1
+            return self._get_cached_or_default(symbol)
 
         try:
             result = self._fetch(symbol)
@@ -103,6 +125,19 @@ class StockTwitsSocialSource:
                 bullish_pct=0.50,
                 bearish_pct=0.50,
             )
+
+    def _get_cached_or_default(self, symbol: str) -> SocialData:
+        """Return last cached SocialData for *symbol*, or a neutral default."""
+        cached = self._cache.get(symbol)
+        if cached:
+            return cached[1]
+        return SocialData(
+            symbol=symbol,
+            mention_count=0,
+            mention_velocity=0.0,
+            bullish_pct=0.50,
+            bearish_pct=0.50,
+        )
 
     def _fetch(self, symbol: str) -> SocialData:
         """Call StockTwits API and parse response."""

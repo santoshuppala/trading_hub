@@ -87,6 +87,8 @@ class DBWriter:
             elapsed = time.monotonic() - self._cb_open_since
             if elapsed < _CB_RESET:
                 self.rows_dropped += 1
+                if self.rows_dropped % 100 == 0 and self.rows_dropped > 0:
+                    log.error("DB DROPPED %d events total — data loss occurring", self.rows_dropped)
                 return
             # Reset circuit breaker
             self._cb_open     = False
@@ -180,6 +182,11 @@ class DBWriter:
                 self._cb_open_since = time.monotonic()
                 log.error("DBWriter circuit breaker OPEN — writes suspended for %ds "
                           "(failed tables: %s)", _CB_RESET, failed_tables)
+                log.error(
+                    "DB CIRCUIT BREAKER OPEN: %d consecutive failures — "
+                    "events being DROPPED. Check PostgreSQL connection.",
+                    self._cb_failures,
+                )
 
     @staticmethod
     async def _insert_batch(

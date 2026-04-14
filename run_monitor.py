@@ -1,7 +1,7 @@
 """
 Standalone monitor launcher — runs without Streamlit UI.
 Scheduled daily at 6:00 AM PST (9:00 AM ET, 30 min before open).
-Stops automatically at 4:00 PM ET after market close.
+Stops at 4:00 PM ET (market close). New entries blocked at 3:00 PM, exits monitored until close.
 """
 import os
 import signal
@@ -77,7 +77,7 @@ def main():
         try:
             from db import init_db, close_db, get_pool
             from db.writer import DBWriter, init_writer
-            from db.subscriber import DBSubscriber
+            from db.event_sourcing_subscriber import EventSourcingSubscriber
             from db.writer import SessionManager
 
             # Spin up a dedicated asyncio event loop in a daemon thread
@@ -171,10 +171,10 @@ def main():
 
     # ── Wire DB subscriber to EventBus (must happen before monitor.start()) ──
     if DB_ENABLED_RUNTIME and db_writer is not None:
-        from db.subscriber import DBSubscriber
-        db_sub = DBSubscriber(bus=monitor._bus, writer=db_writer)
+        from db.event_sourcing_subscriber import EventSourcingSubscriber
+        db_sub = EventSourcingSubscriber(bus=monitor._bus, writer=db_writer, session_id=session_id)
         db_sub.register()
-        log.info("DBSubscriber registered — all events will be persisted to TimescaleDB")
+        log.info("EventSourcingSubscriber registered — all events persisted with correct timestamps")
 
     # ── Pro-setups engine (11 strategies, shared Alpaca account) ─────────────
     from pro_setups.engine import ProSetupEngine
@@ -374,7 +374,7 @@ def main():
         log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
 
     monitor.start()
-    log.info("Monitor running. Will stop at 4:00 PM ET.")
+    log.info("Monitor running. New entries stop at 3:00 PM ET, exits until 4:00 PM ET.")
 
     # ── Trading halted flag (daily loss kill switch) ──────────────────────────
     trading_halted = False
@@ -383,6 +383,8 @@ def main():
         while True:
             now = datetime.now(ET)
             # Stop at 4:00 PM ET (market close)
+            # New entries blocked at 3:30 PM (handled by StrategyEngine._FORCE_CLOSE)
+            # Exits still monitored 3:30-4:00 PM so open positions can close
             if now.hour >= 16:
                 log.info("4:00 PM ET reached — stopping monitor.")
                 break
@@ -422,7 +424,7 @@ def main():
                         monitor._bus.emit(Event(
                             type=EventType.ORDER_REQ,
                             payload=OrderRequestPayload(
-                                ticker=ticker_name, side='sell', qty=qty,
+                                ticker=ticker_name, side='SELL', qty=qty,
                                 price=pos.get('entry_price', 0),
                                 reason='kill_switch_daily_loss',
                             ),
@@ -433,18 +435,8 @@ def main():
                 log.error("Monitor stopped by kill switch. No further trading today.")
                 break
 
-            log.info(
-                f"[heartbeat] scanning {len(tickers)} tickers | "
-                f"open positions: {len(positions)} {list(positions.keys()) or 'none'} | "
-                f"trades today: {len(trades)} ({wins}W/{losses}L) | "
-                f"PnL: ${total_pnl:+.2f} | kill_switch: ${MAX_DAILY_LOSS:+.2f}"
-            )
-            # DB health + activity logging
+            # Activity logging to TimescaleDB
             if DB_ENABLED_RUNTIME and db_writer:
-                log.info(
-                    f"[heartbeat] DB: written={db_writer.rows_written} "
-                    f"dropped={db_writer.rows_dropped} batches={db_writer.batches_flushed}"
-                )
                 if activity_logger:
                     try:
                         metrics = monitor._bus.metrics()
@@ -500,6 +492,61 @@ def main():
                 )
             except Exception as exc:
                 log.warning(f"DB shutdown error (non-fatal): {exc}")
+        # ── EOD POSITION AUDIT (log what's still open, don't force close) ──
+        # Pro/Pop positions may be valid swing holds — don't liquidate.
+        # Only cancel stale open ORDERS (prevents wash trade issues next morning).
+        try:
+            from alpaca.trading.client import TradingClient
+            from config import APCA_API_KEY_ID, APCA_API_SECRET_KEY, PAPER_TRADING
+            eod_client = TradingClient(
+                api_key=APCA_API_KEY_ID,
+                secret_key=APCA_API_SECRET_KEY,
+                paper=PAPER_TRADING,
+            )
+            # Cancel all open orders (prevents wash trade errors on next session)
+            try:
+                eod_client.cancel_orders()
+                log.info("EOD: cancelled all open orders (wash trade prevention)")
+            except Exception as cancel_err:
+                log.warning(f"EOD: cancel orders failed: {cancel_err}")
+
+            # Log open positions (audit trail, no close)
+            open_positions = eod_client.get_all_positions()
+            if open_positions:
+                tickers_held = [f"{p.symbol}({p.qty})" for p in open_positions]
+                log.info(
+                    f"EOD: {len(open_positions)} swing position(s) held overnight: "
+                    f"{', '.join(tickers_held)}"
+                )
+            else:
+                log.info("EOD: no open positions — clean shutdown")
+        except ImportError:
+            log.warning("EOD: alpaca-py not available — cannot audit positions")
+        except Exception as exc:
+            log.warning(f"EOD position audit error (non-fatal): {exc}")
+
+        # ── Post-session analytics (runs in background, non-blocking) ────────
+        try:
+            import subprocess
+            analytics_script = os.path.join(os.path.dirname(__file__), 'scripts', 'post_session_analytics.py')
+            if os.path.exists(analytics_script):
+                subprocess.Popen(
+                    [sys.executable, analytics_script],
+                    stdout=open(os.path.join(os.path.dirname(__file__), 'logs', 'post_session.log'), 'a'),
+                    stderr=subprocess.STDOUT,
+                )
+                log.info("Post-session analytics triggered (background)")
+        except Exception as exc:
+            log.warning(f"Post-session analytics trigger failed (non-fatal): {exc}")
+
+        # ── Close all options positions at EOD ─────────────────────────────
+        try:
+            if 'options_engine' in dir() and options_engine:
+                options_engine.close_all_positions('eod_close')
+                log.info("Options positions closed at EOD")
+        except Exception as exc:
+            log.warning(f"Options EOD close error (non-fatal): {exc}")
+
         trades = monitor.trade_log
         W = 60
         bar = "=" * W

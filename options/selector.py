@@ -1,5 +1,17 @@
 """
-OptionStrategySelector maps signal/bar conditions to option strategy types.
+OptionStrategySelector — maps signal/bar conditions to option strategy types.
+
+Uses IV rank (not raw IV) for strategy selection. This is the critical difference
+between a naive system and one with statistical edge:
+
+  - IV rank > 50 → IV is HIGH relative to its own history → SELL premium
+  - IV rank < 30 → IV is LOW relative to its own history → BUY premium
+  - Without IV rank, we fall back to raw IV thresholds (less reliable)
+
+Strategy selection principles:
+  - High RVOL + low IV rank → buy premium (debit: long calls/puts, straddles)
+  - Low RVOL  + high IV rank → sell premium (credit: iron condors, credit spreads)
+  - Moderate conditions       → defined-risk spreads (verticals, butterflies)
 """
 from __future__ import annotations
 
@@ -8,69 +20,101 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Strategy selection thresholds
-RVOL_HIGH_THRESHOLD   = 3.0   # high RVOL → directional single leg
-RVOL_MOD_THRESHOLD    = 1.5   # moderate RVOL → spread
-ATR_SPIKE_THRESHOLD   = 0.04  # ATR/price > 4% → straddle
-ATR_MOD_THRESHOLD     = 0.02  # ATR/price > 2% → strangle
-IV_HIGH_THRESHOLD     = 0.35  # IV > 35% → credit spread or neutral
-IV_MOD_THRESHOLD      = 0.20  # IV > 20% → debit spread
+# ── Signal path thresholds ───────────────────────────────────────────────────
+RVOL_HIGH_THRESHOLD   = 2.5
+RVOL_MOD_THRESHOLD    = 1.2
+RVOL_LOW_THRESHOLD    = 0.8
+
+# ── Bar path thresholds ─────────────────────────────────────────────────────
+ATR_SPIKE_THRESHOLD   = 0.035
+ATR_MOD_THRESHOLD     = 0.015
+
+# ── IV rank thresholds (0-100 scale) ────────────────────────────────────────
+IV_RANK_HIGH          = 50    # above 50 → sell premium (IV is rich)
+IV_RANK_LOW           = 30    # below 30 → buy premium (IV is cheap)
+IV_RANK_VERY_HIGH     = 70    # above 70 → aggressive credit selling
+
+# ── Raw IV fallbacks (used when IV rank unavailable) ─────────────────────────
+IV_HIGH_THRESHOLD     = 0.35
+IV_MOD_THRESHOLD      = 0.25
+IV_LOW_THRESHOLD      = 0.15
+
+# ── RSI thresholds ───────────────────────────────────────────────────────────
+RSI_NEUTRAL_LOW       = 40
+RSI_NEUTRAL_HIGH      = 60
+RSI_VERY_NEUTRAL_LOW  = 42
+RSI_VERY_NEUTRAL_HIGH = 58
 
 
 class OptionStrategySelector:
     """
-    Maps SignalPayload fields and BAR indicators to the appropriate
-    OptionsStrategy type.
-
-    Called by OptionsEngine._on_signal() and OptionsEngine._on_bar().
-    Returns a strategy type string (OptionStrategyType.value) or None.
+    Maps signal/bar conditions to the best options strategy type.
+    Uses IV rank when available for statistically-backed selection.
     """
 
     def select_from_signal(
         self,
-        action:      str,    # SignalAction.value
+        action:      str,
         rvol:        float,
         rsi:         float,
         atr_value:   float,
         spot_price:  float,
-        iv_estimate: float,  # from option chain mid-market IV
+        iv_estimate: float,
+        iv_rank:     float = 50.0,
     ) -> Optional[str]:
         """
-        Signal-driven selection logic:
+        Signal-driven selection using IV rank.
 
-        BUY signals:
-          rvol >= RVOL_HIGH  → long_call
-          RVOL_MOD <= rvol < RVOL_HIGH and IV < IV_HIGH → bull_call_spread
-          IV >= IV_HIGH or rvol < RVOL_MOD              → bull_put_spread (credit)
+        IV rank dictates regime:
+          iv_rank >= 50 → premium is rich → favor credit strategies (sell)
+          iv_rank < 30  → premium is cheap → favor debit strategies (buy)
 
-        SELL signals (sell_stop, sell_target, sell_rsi, sell_vwap):
-          rvol >= RVOL_HIGH  → long_put
-          RVOL_MOD <= rvol < RVOL_HIGH                  → bear_put_spread
-          IV >= IV_HIGH                                 → bear_call_spread (credit)
-
-        Returns OptionStrategyType.value string or None.
+        RVOL dictates conviction:
+          high RVOL → strong move → more aggressive (single leg or wider spread)
+          low RVOL  → weak move → only credit if IV rank supports it
         """
-        if action == 'buy':
-            if rvol >= RVOL_HIGH_THRESHOLD:
-                return 'long_call'
-            elif RVOL_MOD_THRESHOLD <= rvol < RVOL_HIGH_THRESHOLD:
-                if iv_estimate < IV_HIGH_THRESHOLD:
-                    return 'bull_call_spread'
-                else:
-                    return 'bull_put_spread'
-            else:
-                return None  # rvol too low
+        action_upper = action.upper()
+        is_buy = action_upper == 'BUY'
+        is_sell = action_upper in ('SELL_STOP', 'SELL_TARGET', 'SELL_RSI', 'SELL_VWAP')
 
-        elif action in ('sell_stop', 'sell_target', 'sell_rsi', 'sell_vwap'):
-            if rvol >= RVOL_HIGH_THRESHOLD:
-                return 'long_put'
-            elif RVOL_MOD_THRESHOLD <= rvol < RVOL_HIGH_THRESHOLD:
-                if iv_estimate < IV_HIGH_THRESHOLD:
-                    return 'bear_put_spread'
-                else:
-                    return 'bear_call_spread'
+        if not is_buy and not is_sell:
+            return None
+
+        iv_is_rich = iv_rank >= IV_RANK_HIGH
+        iv_is_cheap = iv_rank < IV_RANK_LOW
+        iv_very_rich = iv_rank >= IV_RANK_VERY_HIGH
+
+        # ── Tier 1: High RVOL — strong directional momentum ──────────
+        if rvol >= RVOL_HIGH_THRESHOLD:
+            if iv_is_cheap or (not iv_is_rich):
+                # IV cheap/neutral: buy outright (premium is affordable)
+                return 'long_call' if is_buy else 'long_put'
             else:
-                return None  # rvol too low
+                # IV rich: use debit spread (reduce IV crush exposure)
+                return 'bull_call_spread' if is_buy else 'bear_put_spread'
+
+        # ── Tier 2: Moderate RVOL — spreads ───────────────────────────
+        if rvol >= RVOL_MOD_THRESHOLD:
+            if iv_is_rich:
+                # IV rich: sell premium (credit spread)
+                return 'bull_put_spread' if is_buy else 'bear_call_spread'
+            else:
+                # IV cheap/neutral: buy defined risk (debit spread)
+                return 'bull_call_spread' if is_buy else 'bear_put_spread'
+
+        # ── Tier 3: Low RVOL — only trade if IV rank gives clear edge ─
+        if rvol >= RVOL_LOW_THRESHOLD:
+            if iv_very_rich:
+                # IV very rich + low vol = ideal credit selling
+                return 'bull_put_spread' if is_buy else 'bear_call_spread'
+            elif iv_is_rich:
+                return 'bull_put_spread' if is_buy else 'bear_call_spread'
+            # IV not rich enough → skip
+            return None
+
+        # ── Tier 4: Very low RVOL — only if IV rank is extreme ────────
+        if iv_very_rich:
+            return 'bull_put_spread' if is_buy else 'bear_call_spread'
 
         return None
 
@@ -82,41 +126,55 @@ class OptionStrategySelector:
         rsi:         float,
         rvol:        float,
         has_existing_position: bool,
+        iv_rank:     float = 50.0,
     ) -> Optional[str]:
         """
-        BAR-driven neutral/volatility scan:
+        BAR-driven neutral/volatility selection using IV rank.
 
-        ATR/price > ATR_SPIKE_THRESHOLD → long_straddle
-        ATR_MOD <= ATR/price <= ATR_SPIKE → long_strangle
-        RSI in [40, 60] and IV > IV_HIGH   → iron_condor
-        RSI in [45, 55] and IV > IV_HIGH   → iron_butterfly (more neutral)
-        has_existing_position + term structure → calendar_spread
-
-        Returns OptionStrategyType.value string or None.
+        Key insight: IV rank determines BUY vs SELL premium:
+          - IV rank < 30 + ATR spike → BUY vol (straddle/strangle) — IV will expand
+          - IV rank > 50 + range-bound → SELL vol (iron condor) — IV will contract
+          - IV rank > 70 + neutral RSI → aggressive credit selling
         """
         if spot_price <= 0:
             return None
 
         atr_ratio = atr_value / spot_price
+        iv_is_rich = iv_rank >= IV_RANK_HIGH
+        iv_is_cheap = iv_rank < IV_RANK_LOW
+        iv_very_rich = iv_rank >= IV_RANK_VERY_HIGH
 
-        # High volatility spike → straddle
-        if atr_ratio > ATR_SPIKE_THRESHOLD:
+        # When IV rank is at default (no history), fall back to raw IV
+        no_iv_history = (iv_rank == 50.0)
+        if no_iv_history:
+            iv_is_rich = iv_estimate >= IV_HIGH_THRESHOLD
+            iv_is_cheap = iv_estimate <= IV_LOW_THRESHOLD
+            iv_very_rich = iv_estimate >= 0.40
+
+        # ── 1. ATR spike + cheap/neutral IV → buy straddle ───────────
+        if atr_ratio > ATR_SPIKE_THRESHOLD and not iv_is_rich:
             return 'long_straddle'
 
-        # Moderate volatility → strangle
-        if ATR_MOD_THRESHOLD <= atr_ratio <= ATR_SPIKE_THRESHOLD:
-            return 'long_strangle'
+        # ── 2. Moderate ATR + cheap IV → buy strangle ────────────────
+        if ATR_MOD_THRESHOLD < atr_ratio <= ATR_SPIKE_THRESHOLD:
+            if iv_is_cheap or (no_iv_history and iv_estimate < IV_MOD_THRESHOLD):
+                return 'long_strangle'
 
-        # Range-bound, high IV → iron condor / butterfly
-        if 40 <= rsi <= 60 and iv_estimate > IV_HIGH_THRESHOLD:
-            if 45 <= rsi <= 55:
-                return 'iron_butterfly'  # very neutral
-            else:
-                return 'iron_condor'
+        # ── 3. Range-bound + rich IV → sell premium ──────────────────
+        if RSI_NEUTRAL_LOW <= rsi <= RSI_NEUTRAL_HIGH:
+            if (iv_very_rich or (iv_is_rich and not no_iv_history)) and not has_existing_position:
+                if RSI_VERY_NEUTRAL_LOW <= rsi <= RSI_VERY_NEUTRAL_HIGH:
+                    return 'iron_butterfly'
+                else:
+                    return 'iron_condor'
 
-        # Calendar/diagonal spreads for existing positions
-        if has_existing_position:
-            # TODO: Check term structure for calendar spreads
-            pass
+            if iv_is_rich and not has_existing_position:
+                if atr_ratio < ATR_MOD_THRESHOLD:
+                    return 'butterfly_spread'
+
+        # ── 4. Calendar spread for existing positions with rich IV ────
+        if has_existing_position and iv_is_rich:
+            if RSI_NEUTRAL_LOW <= rsi <= RSI_NEUTRAL_HIGH:
+                return 'calendar_spread'
 
         return None

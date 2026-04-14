@@ -199,7 +199,8 @@ class DBSubscriber:
             p: PopSignalPayload = event.payload
             features = None
             if hasattr(p, "features_json") and p.features_json:
-                features = json.loads(p.features_json) if isinstance(p.features_json, str) else p.features_json
+                # Keep as JSON string for JSONB column — psycopg2 needs str, not dict
+                features = p.features_json if isinstance(p.features_json, str) else json.dumps(p.features_json)
             row = {
                 "ts":                   _NOW(),
                 "symbol":               p.symbol,
@@ -225,9 +226,15 @@ class DBSubscriber:
     def _on_pro_strategy_signal(self, event: Event) -> None:
         try:
             p: ProStrategySignalPayload = event.payload
-            det = None
+            det = '{}'
             if hasattr(p, "detector_signals") and p.detector_signals:
-                det = json.loads(p.detector_signals) if isinstance(p.detector_signals, str) else p.detector_signals
+                # detector_signals must be a JSON string, not a dict
+                if isinstance(p.detector_signals, str):
+                    det = p.detector_signals
+                elif isinstance(p.detector_signals, dict):
+                    det = json.dumps(p.detector_signals)
+                else:
+                    det = '{}'
             row = {
                 "ts":               _NOW(),
                 "ticker":           p.ticker,

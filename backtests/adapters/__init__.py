@@ -1,0 +1,1 @@
+"""Strategy adapters for backtesting."""

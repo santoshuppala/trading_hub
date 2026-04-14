@@ -62,7 +62,7 @@ STRATEGY_PARAMS = {
 
 # ── Risk / order settings ──────────────────────────────────────────────────────
 MAX_POSITIONS  = 5
-GLOBAL_MAX_POSITIONS = int(os.getenv('GLOBAL_MAX_POSITIONS', 8))  # aggregate limit across ALL layers
+GLOBAL_MAX_POSITIONS = int(os.getenv('GLOBAL_MAX_POSITIONS', 75))  # aggregate limit across ALL layers
 MAX_DAILY_LOSS = float(os.getenv('MAX_DAILY_LOSS', -10000))  # kill switch: halt trading if daily P&L drops below this
 ORDER_COOLDOWN = 300   # seconds between orders on same ticker
 TRADE_BUDGET   = int(os.getenv('TRADE_BUDGET', 1000))  # dollars allocated per trade
@@ -83,8 +83,8 @@ PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
 ALPACA_POPUP_KEY          = os.getenv('APCA_POPUP_KEY')
 ALPACA_PUPUP_SECRET_KEY   = os.getenv('APCA_PUPUP_SECRET_KEY')
 POP_PAPER_TRADING         = os.getenv('POP_PAPER_TRADING', 'true').lower() == 'true'
-POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 3))    # max concurrent pop positions
-POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 500))   # dollars per pop trade
+POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 25))   # max concurrent pop positions
+POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 10000))  # dollars per pop trade
 POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds cooldown per ticker
 
 # ── Pro-setups subsystem (pro_setups/) ────────────────────────────────────────
@@ -92,7 +92,7 @@ POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds 
 # Execution goes through the shared AlpacaBroker via ORDER_REQ events.
 # RiskAdapter is the independent risk gate; existing RiskEngine is not used for
 # pro-setup entries.
-PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   3))    # max concurrent pro positions
+PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   25))   # max concurrent pro positions
 PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))   # dollars allocated per pro trade
 PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))  # seconds cooldown per ticker
 
@@ -110,6 +110,11 @@ OPTIONS_ORDER_COOLDOWN = int(os.getenv('OPTIONS_ORDER_COOLDOWN', 300))    # seco
 OPTIONS_MIN_DTE        = int(os.getenv('OPTIONS_MIN_DTE', 20))             # days to expiry
 OPTIONS_MAX_DTE        = int(os.getenv('OPTIONS_MAX_DTE', 45))             # days to expiry
 OPTIONS_LEAPS_DTE      = int(os.getenv('OPTIONS_LEAPS_DTE', 365))          # LEAPS leg DTE
+# Exit management
+OPTIONS_PROFIT_TARGET_CREDIT = float(os.getenv('OPTIONS_PROFIT_TARGET_CREDIT', 0.50))  # close credit at 50% of max reward
+OPTIONS_PROFIT_TARGET_DEBIT  = float(os.getenv('OPTIONS_PROFIT_TARGET_DEBIT',  1.00))  # close debit at 100% of max reward
+OPTIONS_STOP_LOSS_FRACTION   = float(os.getenv('OPTIONS_STOP_LOSS_FRACTION',   0.80))  # cut at 80% of max risk
+OPTIONS_DTE_CLOSE            = int(os.getenv('OPTIONS_DTE_CLOSE', 7))                  # close at 7 DTE
 
 # ── External data APIs ────────────────────────────────────────────────────────
 BENZINGA_API_KEY    = os.getenv('BENZINGA_API_KEY') or os.getenv('BENZENGA_API_KEY', '')

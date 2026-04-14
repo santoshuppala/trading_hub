@@ -28,16 +28,62 @@ log = logging.getLogger(__name__)
 _alert_queue: queue.Queue = queue.Queue(maxsize=200)
 _worker_started = False
 _worker_lock = threading.Lock()
+_consecutive_failures = 0
+_backoff_until = 0.0
 
 
 def _alert_worker() -> None:
     """Daemon thread: drain the queue and send each email."""
+    import time
+    global _consecutive_failures, _backoff_until
+
+    server = None
+    last_send_time = 0.0
+
     while True:
         item = _alert_queue.get()
         if item is None:          # sentinel — stop signal
             break
         alert_email, message = item
-        _deliver(alert_email, message)
+
+        now = time.time()
+
+        # Exponential backoff: if many consecutive failures, wait before retry
+        if now < _backoff_until:
+            wait_time = _backoff_until - now
+            log.warning(
+                f"Alert backoff active ({wait_time:.1f}s remaining) — "
+                f"{_consecutive_failures} consecutive failures"
+            )
+            time.sleep(min(wait_time, 5.0))  # cap wait at 5s per message
+
+        # Rate limiting: minimum 1 second between sends
+        elapsed = time.time() - last_send_time
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
+
+        # Try with connection reuse, fall back to new connection
+        if server is None:
+            server = _get_smtp_connection()
+
+        success = _deliver_with_connection(server, alert_email, message)
+        if not success:
+            # Connection failed — increment backoff counter
+            _consecutive_failures += 1
+            # Exponential backoff: 2^failures seconds (1s, 2s, 4s, 8s, 16s max)
+            backoff_secs = min(2 ** _consecutive_failures, 16)
+            _backoff_until = time.time() + backoff_secs
+            log.warning(
+                f"Alert delivery failed — backoff {backoff_secs}s "
+                f"({_consecutive_failures} consecutive failures)"
+            )
+            server = None
+        else:
+            # Success — reset failure counter
+            _consecutive_failures = 0
+            _backoff_until = 0.0
+
+        last_send_time = time.time()
         _alert_queue.task_done()
 
 
@@ -73,41 +119,82 @@ def send_alert(alert_email, message):
 
 # ── SMTP delivery (runs in background thread only) ────────────────────────────
 
-def _deliver(alert_email: str, message: str) -> None:
-    """Blocking SMTP call — executed exclusively in the alert-smtp daemon thread."""
+def _get_smtp_connection():
+    """Create a new SMTP connection. Returns None on failure."""
     email_user  = os.getenv('ALERT_EMAIL_USER')
     email_pass  = os.getenv('ALERT_EMAIL_PASS')
-    email_from  = os.getenv('ALERT_EMAIL_FROM') or email_user
     smtp_server = os.getenv('ALERT_EMAIL_SERVER') or 'smtp.mail.yahoo.com'
     smtp_port   = int(os.getenv('ALERT_EMAIL_PORT') or 587)
 
-    if not email_user or not email_pass or not email_from:
+    if not email_user or not email_pass:
+        return None
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(email_user, email_pass)
+        return server
+    except smtplib.SMTPAuthenticationError as e:
+        log.error(f"SMTP auth failed: {e}")
         log.warning(
-            'Alert skipped: missing SMTP settings. '
-            'Set ALERT_EMAIL_USER, ALERT_EMAIL_PASS, and ALERT_EMAIL_FROM.'
+            'Check ALERT_EMAIL_USER and ALERT_EMAIL_PASS, '
+            'and if using Gmail enable an App Password.'
         )
+        return None
+    except (ConnectionRefusedError, ConnectionResetError, TimeoutError) as e:
+        log.warning(f"SMTP connection refused: {e} — server may be rate-limiting")
+        return None
+    except smtplib.SMTPException as e:
+        log.warning(f"SMTP server error: {e} — will backoff and retry")
+        return None
+    except Exception as e:
+        log.warning(f"SMTP connection failed: {e}")
+        return None
+
+
+def _deliver_with_connection(server, alert_email: str, message: str) -> bool:
+    """
+    Send email using existing connection.
+    Returns True on success, False if connection failed.
+    """
+    email_user  = os.getenv('ALERT_EMAIL_USER')
+    email_from  = os.getenv('ALERT_EMAIL_FROM') or email_user
+
+    if not email_user or not email_from:
         log.info(f'ALERT: {message}')
-        return
+        return True
+
+    if server is None:
+        log.error(f"Failed to send alert: no SMTP connection")
+        return False
 
     try:
         msg = MIMEText(message)
         msg['Subject'] = 'Trading Alert'
         msg['From']    = email_from
         msg['To']      = alert_email
-
-        server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(email_user, email_pass)
         server.sendmail(email_from, alert_email, msg.as_string())
-        server.quit()
         log.info(f"Alert sent: {message}")
-    except smtplib.SMTPAuthenticationError as e:
-        log.error(f"Failed to send alert: SMTP authentication failed: {e}")
-        log.warning(
-            'Check ALERT_EMAIL_USER and ALERT_EMAIL_PASS, '
-            'and if using Gmail enable an App Password.'
-        )
+        return True
+    except smtplib.SMTPException as e:
+        log.error(f"Failed to send alert: {e}")
+        return False
     except Exception as e:
         log.error(f"Failed to send alert: {e}")
+        return False
+
+
+def _deliver(alert_email: str, message: str) -> None:
+    """Legacy function — kept for backward compatibility."""
+    if not alert_email:
+        log.info(f"ALERT: {message}")
+        return
+    server = _get_smtp_connection()
+    _deliver_with_connection(server, alert_email, message)
+    if server:
+        try:
+            server.quit()
+        except:
+            pass

@@ -36,6 +36,12 @@ log = logging.getLogger(__name__)
 # ── Tier-specific minimum R:R ratios ─────────────────────────────────────────
 _MIN_RR: Dict[int, float] = {1: 1.5, 2: 2.0, 3: 3.5}
 
+# Minimum confidence by tier (blocks low-quality signals)
+_MIN_CONFIDENCE: Dict[int, float] = {1: 0.50, 2: 0.60, 3: 0.70}
+
+# Signal deduplication: same (ticker, strategy) within N seconds
+_DEDUP_WINDOW_SEC: float = 60.0
+
 # Risk per trade: 2% of budget (adjustable)
 _RISK_PCT: float = 0.02
 
@@ -69,6 +75,7 @@ class RiskAdapter:
 
         self._positions: Set[str]         = set()    # tickers with open pro positions
         self._last_order: Dict[str, float] = {}       # ticker → monotonic timestamp
+        self._last_signal: Dict[str, float] = {}      # (ticker, strategy) → monotonic timestamp (dedup)
 
         # Subscribe at priority=0 (after routing handlers) to track state
         bus.subscribe(EventType.FILL,     self._on_fill,     priority=0)
@@ -121,6 +128,27 @@ class RiskAdapter:
         # All checks after acquire must release on failure (try/finally with _approved flag)
         _approved = False
         try:
+            # ── Check 1b: minimum confidence by tier ─────────────────────────────
+            min_conf = _MIN_CONFIDENCE.get(tier, 0.50)
+            if confidence < min_conf:
+                log.info(
+                    "%s BLOCKED: confidence=%.2f < min %.2f for T%d",
+                    tag, confidence, min_conf, tier,
+                )
+                return
+
+            # ── Check 1c: signal deduplication (same ticker+strategy within 60s) ─
+            dedup_key = f"{ticker}:{strategy_name}"
+            now_dedup = time.monotonic()
+            last_sig_time = self._last_signal.get(dedup_key, 0.0)
+            if now_dedup - last_sig_time < _DEDUP_WINDOW_SEC:
+                log.debug(
+                    "%s BLOCKED: duplicate signal within %.0fs",
+                    tag, _DEDUP_WINDOW_SEC,
+                )
+                return
+            self._last_signal[dedup_key] = now_dedup
+
             # ── Check 2: max concurrent positions ─────────────────────────────────
             if len(self._positions) >= self._max_positions:
                 log.info(

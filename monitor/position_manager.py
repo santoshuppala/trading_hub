@@ -87,7 +87,7 @@ class PositionManager:
     def _on_fill(self, event: Event) -> None:
         p: FillPayload = event.payload
         with self._lock:
-            if p.side == 'buy':
+            if p.side == 'BUY':
                 self._open_position(p, event)
             else:
                 self._close_position(p, event)
@@ -143,7 +143,7 @@ class PositionManager:
             type=EventType.POSITION,
             payload=PositionPayload(
                 ticker=ticker,
-                action='opened',
+                action='OPENED',
                 position=PositionSnapshot(
                     entry_price=pos['entry_price'],
                     entry_time=pos['entry_time'],
@@ -194,7 +194,7 @@ class PositionManager:
 
         # Partial exit: qty sold is less than total position
         remaining = pos['quantity'] - qty
-        if remaining > 0 and reason == 'partial_sell':
+        if remaining > 0 and reason == 'PARTIAL_SELL':
             pos['quantity']     = remaining
             pos['partial_done'] = True
             # Move stop to breakeven only if it's currently below entry (don't lower a trailing stop)
@@ -216,7 +216,7 @@ class PositionManager:
                 type=EventType.POSITION,
                 payload=PositionPayload(
                     ticker=ticker,
-                    action='partial_exit',
+                    action='PARTIAL_EXIT',
                     position=PositionSnapshot(
                         entry_price=pos['entry_price'],
                         entry_time=pos.get('entry_time', ''),
@@ -259,7 +259,7 @@ class PositionManager:
             type=EventType.POSITION,
             payload=PositionPayload(
                 ticker=ticker,
-                action='closed',
+                action='CLOSED',
                 position=None,
                 pnl=pnl,
             ),

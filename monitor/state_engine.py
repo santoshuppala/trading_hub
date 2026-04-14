@@ -84,11 +84,11 @@ class StateEngine:
         p: PositionPayload = event.payload
 
         with self._lock:
-            if p.action == 'opened' and p.position is not None:
+            if p.action == 'OPENED' and p.position is not None:
                 self._positions[p.ticker] = copy.deepcopy(p.position)
                 log.debug(f"[StateEngine] Opened {p.ticker}")
 
-            elif p.action == 'partial_exit' and p.position is not None:
+            elif p.action == 'PARTIAL_EXIT' and p.position is not None:
                 self._positions[p.ticker] = copy.deepcopy(p.position)
                 if p.pnl is not None:
                     self._trade_log.append({
@@ -98,7 +98,7 @@ class StateEngine:
                     })
                 log.debug(f"[StateEngine] Partial exit {p.ticker} pnl={p.pnl}")
 
-            elif p.action == 'closed':
+            elif p.action == 'CLOSED':
                 self._positions.pop(p.ticker, None)
                 if p.pnl is not None:
                     self._trade_log.append({

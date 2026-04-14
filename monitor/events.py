@@ -61,30 +61,41 @@ ET = ZoneInfo('America/New_York')
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class Side(str, Enum):
-    BUY  = 'buy'
-    SELL = 'sell'
+    BUY  = 'BUY'
+    SELL = 'SELL'
 
     def __str__(self) -> str:
         return self.value
 
 
 class SignalAction(str, Enum):
-    BUY          = 'buy'
-    SELL_STOP    = 'sell_stop'
-    SELL_TARGET  = 'sell_target'
-    SELL_RSI     = 'sell_rsi'
-    SELL_VWAP    = 'sell_vwap'
-    PARTIAL_SELL = 'partial_sell'
-    HOLD         = 'hold'
+    BUY          = 'BUY'
+    SELL_STOP    = 'SELL_STOP'
+    SELL_TARGET  = 'SELL_TARGET'
+    SELL_RSI     = 'SELL_RSI'
+    SELL_VWAP    = 'SELL_VWAP'
+    PARTIAL_SELL = 'PARTIAL_SELL'
+    PARTIAL_DONE = 'PARTIAL_DONE'
+    HOLD         = 'HOLD'
 
     def __str__(self) -> str:
         return self.value
 
+    @classmethod
+    def _missing_(cls, value):
+        """Accept lowercase/mixed-case strings: 'partial_sell' → PARTIAL_SELL."""
+        if isinstance(value, str):
+            upper = value.upper()
+            for member in cls:
+                if member.value == upper:
+                    return member
+        return None
+
 
 class PositionAction(str, Enum):
-    OPENED       = 'opened'
-    PARTIAL_EXIT = 'partial_exit'
-    CLOSED       = 'closed'
+    OPENED       = 'OPENED'
+    PARTIAL_EXIT = 'PARTIAL_EXIT'
+    CLOSED       = 'CLOSED'
 
     def __str__(self) -> str:
         return self.value
@@ -400,7 +411,7 @@ class FillPayload:
     Consumers : Position Manager (open/close positions), State Engine, Observability
     """
     ticker:      str
-    side:        Side   # 'buy' | 'sell'
+    side:        Side   # 'BUY' | 'SELL'
     qty:         int    # shares actually filled > 0
     fill_price:  float  # average fill price > 0
     order_id:    str    # broker order ID

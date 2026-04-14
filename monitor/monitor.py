@@ -322,13 +322,19 @@ class RealTimeMonitor:
             if qty <= 0 or avg_entry <= 0:
                 continue
 
+            stop_price = round(avg_entry * 0.97, 4)
+            target_price = round(avg_entry * 1.05, 4)
             self.positions[ticker] = {
-                'entry_price': avg_entry,
-                'qty':         qty,
-                'stop':        round(avg_entry * 0.97, 4),
-                'target':      round(avg_entry * 1.05, 4),
-                'entry_time':  'alpaca_restored',
-                'reason':      'alpaca_reconciliation',
+                'entry_price':  avg_entry,
+                'qty':          qty,
+                'quantity':     qty,
+                'stop_price':   stop_price,
+                'target_price': target_price,
+                'half_target':  round((avg_entry + target_price) / 2, 4),
+                'partial_done': False,
+                'entry_time':   'alpaca_restored',
+                'order_id':     'alpaca_reconciliation',
+                'atr_value':    round((target_price - stop_price) / 2, 4),
             }
             self._reclaimed_today.add(ticker)
             log.warning(

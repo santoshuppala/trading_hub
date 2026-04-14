@@ -1,4 +1,5 @@
 import logging
+import os
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -6,6 +7,12 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo('America/New_York')
 log = logging.getLogger(__name__)
+
+try:
+    from pop_screener.ticker_discovery import TickerDiscovery
+    _HAS_DISCOVERY = True
+except ImportError:
+    _HAS_DISCOVERY = False
 
 
 class MomentumScreener:
@@ -47,6 +54,18 @@ class MomentumScreener:
         """
         self._data_client = data_client
 
+        # Dynamic ticker discovery from news/social
+        self._discovery = None
+        if _HAS_DISCOVERY:
+            try:
+                self._discovery = TickerDiscovery(
+                    benzinga_key=os.getenv('BENZINGA_API_KEY') or os.getenv('BENZENGA_API_KEY', ''),
+                    stocktwits_token=os.getenv('STOCKTWITS_TOKEN', ''),
+                )
+                log.info("[Screener] TickerDiscovery enabled (Benzinga + StockTwits)")
+            except Exception as e:
+                log.warning("[Screener] TickerDiscovery init failed: %s", e)
+
     def refresh(self, base_tickers, current_tickers, last_refresh):
         """
         Fetch and filter momentum stocks.
@@ -69,6 +88,16 @@ class MomentumScreener:
                 return current_tickers, last_refresh
 
         candidates = self._fetch_momentum_candidates(base_tickers)
+
+        # Discover trending tickers from news/social (Benzinga + StockTwits)
+        if self._discovery:
+            try:
+                discovered = self._discovery.discover(exclude_tickers=set(base_tickers))
+                if discovered:
+                    candidates = set(candidates) | discovered
+                    log.info("[Screener] News/social discovery added %d tickers", len(discovered))
+            except Exception as e:
+                log.warning("[Screener] Ticker discovery error: %s", e)
 
         # Filter: valid US equity symbols only
         candidates = [

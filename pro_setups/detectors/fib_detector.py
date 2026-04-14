@@ -21,7 +21,7 @@ class FibDetector(BaseDetector):
     name:            str   = 'fib'
     MIN_BARS:        int   = 30
     _LOOKBACK:       int   = 40
-    _PROXIMITY_PCT:  float = 0.004   # within 0.4% of fib level
+    _PROXIMITY_PCT:  float = 0.0025  # within 0.25% of fib level (was 0.4%, too noisy)
     _PRIMARY_LEVELS: tuple = ('61.8', '38.2')
 
     def _detect(

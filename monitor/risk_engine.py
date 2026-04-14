@@ -112,7 +112,7 @@ class RiskEngine:
     def _on_signal(self, event: Event) -> None:
         p: SignalPayload = event.payload
 
-        if p.action == 'buy':
+        if p.action == 'BUY':
             self._handle_buy(p, event)
         else:
             # Sell signals bypass all risk checks — exits must always execute.
@@ -193,7 +193,7 @@ class RiskEngine:
                 type=EventType.ORDER_REQ,
                 payload=OrderRequestPayload(
                     ticker=ticker,
-                    side='buy',
+                    side='BUY',
                     qty=qty,
                     price=effective_entry,
                     reason='VWAP reclaim',
@@ -224,7 +224,7 @@ class RiskEngine:
             return
 
         # Partial exit sells half; guard against qty=1 (can't split)
-        if p.action == 'partial_sell':
+        if p.action == 'PARTIAL_SELL':
             sell_qty = qty // 2
             if sell_qty <= 0:
                 log.info(f"[RiskEngine] Skipping partial sell for {ticker}: qty={qty} too small.")
@@ -237,7 +237,7 @@ class RiskEngine:
             type=EventType.ORDER_REQ,
             payload=OrderRequestPayload(
                 ticker=ticker,
-                side='sell',
+                side='SELL',
                 qty=sell_qty,
                 price=p.current_price,
                 reason=p.action,

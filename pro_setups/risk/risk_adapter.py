@@ -29,6 +29,7 @@ from typing import Dict, Optional, Set
 
 from monitor.event_bus import EventBus, EventType, Event
 from monitor.events import OrderRequestPayload, Side, PositionAction
+from monitor.sector_map import get_sector, count_sector_positions
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +156,14 @@ class RiskAdapter:
                     "%s BLOCKED: max_positions=%d reached (open: %s)",
                     tag, self._max_positions, sorted(self._positions),
                 )
+                return
+
+            # ── Check 2b: sector concentration limit (max 2 per sector) ──────────
+            _MAX_PER_SECTOR = 2
+            sector = get_sector(ticker)
+            sector_counts = count_sector_positions(self._positions)
+            if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
+                log.info("%s BLOCKED: sector %s already has %d positions", tag, sector, sector_counts[sector])
                 return
 
             # ── Check 3: per-ticker cooldown ──────────────────────────────────────

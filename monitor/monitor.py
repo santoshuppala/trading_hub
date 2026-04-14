@@ -282,6 +282,46 @@ class RealTimeMonitor:
             f"redpanda={rp_brokers}"
         )
 
+    # ── ATR lookup for reconciliation ────────────────────────────────────────
+
+    @staticmethod
+    def _fetch_last_atr(ticker: str) -> Optional[float]:
+        """
+        Best-effort fetch of the last known ATR for *ticker* from event_store.
+
+        Uses a direct psycopg2 connection so it works in the synchronous
+        __init__ context (the asyncpg pool may not be ready yet).
+        Returns None if the DB is unavailable or no ATR is recorded.
+        """
+        try:
+            import psycopg2
+            from config import DATABASE_URL
+        except Exception:
+            return None
+
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT (event_payload->>'atr_value')::FLOAT
+                          FROM trading.event_store
+                         WHERE event_type = 'StrategySignal'
+                           AND event_payload->>'ticker' = %s
+                         ORDER BY event_time DESC
+                         LIMIT 1
+                        """,
+                        (ticker,),
+                    )
+                    row = cur.fetchone()
+                    return row[0] if row and row[0] else None
+            finally:
+                conn.close()
+        except Exception as exc:
+            log.debug("[reconcile] ATR lookup failed for %s: %s", ticker, exc)
+            return None
+
     # ── Startup reconciliation ───────────────────────────────────────────────
 
     def _sync_broker_positions(self, trading_client) -> None:
@@ -322,8 +362,22 @@ class RealTimeMonitor:
             if qty <= 0 or avg_entry <= 0:
                 continue
 
-            stop_price = round(avg_entry * 0.97, 4)
-            target_price = round(avg_entry * 1.05, 4)
+            # Try ATR-based stop from event_store; fall back to fixed 3%
+            atr = self._fetch_last_atr(ticker)
+            if atr and atr > 0:
+                stop_price   = round(avg_entry - 2.0 * atr, 4)
+                target_price = round(avg_entry + 3.0 * atr, 4)
+                log.warning(
+                    "Orphaned %s: ATR-based stop $%.2f (ATR=%.2f)",
+                    ticker, stop_price, atr,
+                )
+            else:
+                stop_price   = round(avg_entry * 0.97, 4)
+                target_price = round(avg_entry * 1.05, 4)
+                log.warning(
+                    "Orphaned %s: default 3%% stop $%.2f (no ATR available)",
+                    ticker, stop_price,
+                )
             self.positions[ticker] = {
                 'entry_price':  avg_entry,
                 'qty':          qty,

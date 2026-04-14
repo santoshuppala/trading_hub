@@ -39,6 +39,7 @@ from config import (
     DB_ENABLED, DATABASE_URL,
 )
 from monitor.position_registry import registry
+from monitor.event_bus import EventType, Event
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
@@ -171,6 +172,39 @@ def _fetch_filled_orders(api_key, api_secret, paper, date_str=None):
         pass  # best-effort; don't crash the monitor
 
     return filled_orders
+
+
+class KillSwitchGuard:
+    """Check kill switch on every FILL/POSITION event -- fires within ms, not 60s."""
+
+    def __init__(self, bus, max_daily_loss, monitor, log):
+        self.max_daily_loss = max_daily_loss
+        self.monitor = monitor
+        self.halted = False
+        self._log = log
+        bus.subscribe(EventType.FILL, self._on_fill, priority=0)
+        bus.subscribe(EventType.POSITION, self._on_position, priority=0)
+
+    def _on_fill(self, event):
+        self._check()
+
+    def _on_position(self, event):
+        if hasattr(event.payload, 'action') and event.payload.action == 'CLOSED':
+            self._check()
+
+    def _check(self):
+        if self.halted:
+            return
+        trades = self.monitor.trade_log
+        total_pnl = sum(t['pnl'] for t in trades)
+        if total_pnl <= self.max_daily_loss:
+            self.halted = True
+            wins = sum(1 for t in trades if t['is_win'])
+            self._log.error(
+                f"KILL SWITCH (immediate): daily P&L ${total_pnl:+.2f} "
+                f"breached ${self.max_daily_loss:+.2f} | "
+                f"trades={len(trades)} wins={wins} losses={len(trades) - wins}"
+            )
 
 
 def main():
@@ -522,7 +556,54 @@ def main():
     except ImportError:
         log.warning("RVOL engine not available — using legacy calculation")
 
+    # ── Preflight position & order audit ────────────────────────────────
+    if ALPACA_API_KEY and ALPACA_SECRET:
+        try:
+            import requests as _req
+            base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+            _headers = {'APCA-API-KEY-ID': ALPACA_API_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
+
+            # Fetch open positions
+            r = _req.get(f'{base}/v2/positions', headers=_headers, timeout=10)
+            pf_positions = r.json() if r.status_code == 200 else []
+
+            # Fetch open orders
+            r = _req.get(f'{base}/v2/orders', headers=_headers, params={'status': 'open', 'limit': 500}, timeout=10)
+            pf_orders = r.json() if r.status_code == 200 else []
+
+            log.info("=" * 60)
+            log.info("PREFLIGHT POSITION & ORDER AUDIT")
+            log.info("=" * 60)
+            log.info(f"  Open positions: {len(pf_positions)}")
+            log.info(f"  Open orders:    {len(pf_orders)}")
+
+            if pf_positions:
+                pos_summary = [f"{p['symbol']}({p['qty']})" for p in pf_positions]
+                log.info(f"  Positions: {', '.join(pos_summary)}")
+
+            if pf_orders:
+                for o in pf_orders:
+                    log.info(f"  Stale order: {o.get('side','?').upper()} {o.get('symbol','?')}({o.get('qty','?')}) @ ${o.get('limit_price', o.get('stop_price', 'MKT'))}")
+
+                # Cancel all stale orders from previous session
+                log.info(f"  Cancelling {len(pf_orders)} stale orders from previous session...")
+                try:
+                    _req.delete(f'{base}/v2/orders', headers=_headers, timeout=10)
+                    log.info("  Stale orders cancelled successfully")
+                except Exception as cancel_err:
+                    log.warning(f"  Failed to cancel stale orders: {cancel_err}")
+
+            if not pf_positions and not pf_orders:
+                log.info("  Clean slate — no positions or orders carried over")
+            elif pf_positions and not pf_orders:
+                log.info(f"  {len(pf_positions)} swing position(s) carried over — stops will be monitored")
+
+            log.info("=" * 60)
+        except Exception as exc:
+            log.warning(f"Preflight audit failed (non-fatal): {exc}")
+
     monitor.start()
+    kill_guard = KillSwitchGuard(monitor._bus, MAX_DAILY_LOSS, monitor, log)
     log.info("Monitor running. New entries stop at 3:00 PM ET, exits until 4:00 PM ET.")
 
     # ── Trading halted flag (daily loss kill switch) ──────────────────────────
@@ -546,7 +627,7 @@ def main():
             total_pnl  = sum(t['pnl'] for t in trades)
 
             # ── DAILY LOSS KILL SWITCH ────────────────────────────────────────
-            if not trading_halted and total_pnl <= MAX_DAILY_LOSS:
+            if not trading_halted and (kill_guard.halted or total_pnl <= MAX_DAILY_LOSS):
                 trading_halted = True
                 log.error(
                     f"KILL SWITCH ACTIVATED: daily P&L ${total_pnl:+.2f} "

@@ -114,7 +114,13 @@ class StrategyEngine:
         # ── EOD gate ─────────────────────────────────────────────────────────
         if (hour, minute) >= _FORCE_CLOSE:
             if ticker in self._positions:
-                self._emit_eod_close(ticker, df, event)
+                pos = self._positions[ticker]
+                # VWAP positions: full close (existing behavior)
+                if pos.get('strategy') == 'vwap_reclaim' or not pos.get('strategy'):
+                    self._emit_eod_close(ticker, df, event)
+                # Pro/Pop swing positions: reduce to half size for overnight gap protection
+                elif not pos.get('partial_done') and pos.get('quantity', 0) >= 2:
+                    self._emit_partial_sell(ticker, df, event)
             return  # no new entries after 15:00
 
         # ── Trading window gate ───────────────────────────────────────────────
@@ -267,6 +273,48 @@ class StrategyEngine:
             payload=SignalPayload(
                 ticker=ticker,
                 action='SELL_STOP',
+                current_price=current_price,
+                ask_price=current_price,
+                atr_value=atr_value,
+                rsi_value=50.0,          # neutral placeholder
+                rvol=1.0,
+                vwap=current_price,      # placeholder
+                stop_price=pos['stop_price'],
+                target_price=pos['target_price'],
+                half_target=pos['half_target'],
+                reclaim_candle_low=current_price,
+            ),
+            correlation_id=parent.event_id,
+        ))
+
+    # ── Overnight position sizing reduction ────────────────────────────────
+
+    def _emit_partial_sell(self, ticker: str, df, parent: Event) -> None:
+        """Reduce swing position to half size after 3:00 PM ET for overnight gap protection."""
+        pos = self._positions[ticker]
+        qty = pos.get('quantity', 0)
+        sell_qty = qty // 2
+
+        if sell_qty < 1:
+            return
+
+        try:
+            current_price = float(df['close'].iloc[-1])
+        except Exception:
+            current_price = pos['entry_price']
+
+        log.info(
+            f"[StrategyEngine] Overnight size reduction: {ticker} "
+            f"selling {sell_qty}/{qty} shares @ ${current_price:.2f}"
+        )
+
+        atr_value = pos.get('atr_value', 1.0) or 1.0
+
+        self._bus.emit(Event(
+            type=EventType.SIGNAL,
+            payload=SignalPayload(
+                ticker=ticker,
+                action='PARTIAL_SELL',
                 current_price=current_price,
                 ask_price=current_price,
                 atr_value=atr_value,

@@ -124,7 +124,7 @@ STOCKTWITS_TOKEN    = os.getenv('STOCKTWITS_TOKEN', '')  # optional — public A
 # Set DB_ENABLED=false to run without the database (all events still flow normally,
 # just not persisted to TimescaleDB).
 DB_ENABLED     = os.getenv('DB_ENABLED', 'true').lower() == 'true'
-DATABASE_URL   = os.getenv('DATABASE_URL', 'postgresql://trading:trading_secret@localhost:5432/trading_hub')
+DATABASE_URL   = os.getenv('DATABASE_URL', 'postgresql://trading:trading_secret@localhost:5432/tradinghub')
 
 # ── Data source ────────────────────────────────────────────────────────────────
 # 'tradier' — Tradier REST API (recommended; commission-free data, no SDK)

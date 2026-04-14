@@ -39,7 +39,8 @@ def get_engine():
 @st.cache_data(ttl=60)
 def run_query(query):
     engine = get_engine()
-    return pd.read_sql(query, engine)
+    with engine.connect() as conn:
+        return pd.read_sql_query(query, conn)
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -373,6 +374,292 @@ st.dataframe(
     width='stretch',
     height=400,
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADVANCED ANALYTICS TABS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+tab_perf, tab_attr, tab_compliance = st.tabs([
+    "Performance Metrics", "P&L Attribution", "Compliance & Audit"
+])
+
+# ── TAB 1: Performance Metrics ───────────────────────────────────────────────
+with tab_perf:
+    st.subheader("Performance Metrics")
+
+    if total_trades >= 2:
+        returns = trades_df['pnl'].values
+        import numpy as np
+
+        # Sharpe (annualized)
+        rf_daily = 0.045 / 252
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns, ddof=1) if len(returns) > 1 else 1
+        sharpe = (mean_ret - rf_daily) / std_ret * np.sqrt(252) if std_ret > 0 else 0
+
+        # Sortino (downside only)
+        downside = returns[returns < 0]
+        down_std = np.std(downside, ddof=1) if len(downside) > 1 else 1
+        sortino = (mean_ret - rf_daily) / down_std * np.sqrt(252) if down_std > 0 else 0
+
+        # Calmar
+        cum = np.cumsum(returns)
+        running_max = np.maximum.accumulate(cum)
+        drawdowns = cum - running_max
+        max_dd = abs(drawdowns.min()) if len(drawdowns) > 0 else 1
+        annual_ret = mean_ret * 252
+        calmar = annual_ret / max_dd if max_dd > 0 else 0
+
+        # Recovery factor
+        recovery = total_pnl / max_dd if max_dd > 0 else 0
+
+        # Expected value per trade
+        ev = mean_ret
+
+        # Display metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Sharpe Ratio", f"{sharpe:.2f}")
+        m2.metric("Sortino Ratio", f"{sortino:.2f}")
+        m3.metric("Calmar Ratio", f"{calmar:.2f}")
+        m4.metric("Recovery Factor", f"{recovery:.2f}")
+
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Profit Factor", f"{profit_factor:.2f}")
+        m6.metric("Expected Value", f"${ev:.2f}/trade")
+        m7.metric("Max Drawdown", f"${max_dd:.2f}")
+        m8.metric("Avg Hold Time", f"{trades_df['hold_min'].mean():.1f} min")
+
+        # Drawdown chart
+        st.subheader("Drawdown Curve")
+        dd_df = pd.DataFrame({
+            'Trade #': range(1, len(drawdowns) + 1),
+            'Drawdown': drawdowns,
+        })
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=dd_df['Trade #'], y=dd_df['Drawdown'],
+            fill='tozeroy', fillcolor='rgba(239,85,59,0.2)',
+            line=dict(color='#EF553B', width=1),
+            hovertemplate='Trade #%{x}<br>Drawdown: $%{y:.2f}<extra></extra>',
+        ))
+        fig.update_layout(height=250, margin=dict(l=20, r=20, t=10, b=20),
+                          yaxis_title="Drawdown ($)")
+        st.plotly_chart(fig, width='stretch')
+
+        # Rolling Sharpe (5-trade window)
+        if len(returns) >= 10:
+            st.subheader("Rolling Sharpe (10-trade window)")
+            rolling_mean = pd.Series(returns).rolling(10).mean()
+            rolling_std = pd.Series(returns).rolling(10).std()
+            rolling_sharpe = (rolling_mean / rolling_std * np.sqrt(252)).fillna(0)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(range(1, len(rolling_sharpe) + 1)),
+                y=rolling_sharpe,
+                mode='lines', line=dict(color='#636EFA', width=2),
+            ))
+            fig.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig.add_hline(y=1.0, line_dash="dot", line_color="green", annotation_text="Sharpe=1")
+            fig.update_layout(height=250, margin=dict(l=20, r=20, t=10, b=20),
+                              yaxis_title="Rolling Sharpe")
+            st.plotly_chart(fig, width='stretch')
+
+        # Win rate by exit reason
+        st.subheader("Win Rate by Exit Strategy")
+        exit_perf = trades_df.groupby('exit_reason').agg(
+            trades=('pnl', 'count'),
+            wins=('outcome', lambda x: (x == 'Win').sum()),
+            total_pnl=('pnl', 'sum'),
+            avg_pnl=('pnl', 'mean'),
+        )
+        exit_perf['win_rate'] = (exit_perf['wins'] / exit_perf['trades'] * 100).round(1)
+        exit_perf['profit_factor'] = exit_perf.apply(
+            lambda r: abs(trades_df.loc[
+                (trades_df['exit_reason'] == r.name) & (trades_df['pnl'] > 0), 'pnl'
+            ].sum() / trades_df.loc[
+                (trades_df['exit_reason'] == r.name) & (trades_df['pnl'] <= 0), 'pnl'
+            ].sum()) if trades_df.loc[
+                (trades_df['exit_reason'] == r.name) & (trades_df['pnl'] <= 0), 'pnl'
+            ].sum() != 0 else 0, axis=1
+        ).round(2)
+        st.dataframe(
+            exit_perf[['trades', 'win_rate', 'total_pnl', 'avg_pnl', 'profit_factor']].sort_values('total_pnl', ascending=False),
+            width='stretch',
+        )
+    else:
+        st.info("Need at least 2 trades for performance metrics")
+
+# ── TAB 2: P&L Attribution ───────────────────────────────────────────────────
+with tab_attr:
+    st.subheader("P&L Attribution")
+
+    # Load SPY data for attribution
+    spy_df = run_query(f"""
+        SELECT event_time as ts,
+               (event_payload->>'close')::FLOAT as close
+        FROM event_store
+        WHERE event_type = 'BarReceived'
+          AND event_payload->>'ticker' = 'SPY'
+          AND event_time::DATE = '{selected_date}'
+        ORDER BY event_time
+    """)
+
+    if not spy_df.empty and total_trades > 0:
+        import numpy as np
+
+        attr_rows = []
+        for _, trade in trades_df.iterrows():
+            trade_ret = trade['pnl'] / (trade['entry_price'] * (trade['qty'] or 1)) if trade['entry_price'] and trade['qty'] else 0
+
+            # Find SPY return over same period
+            mask = (spy_df['ts'] >= trade['entry_ts']) & (spy_df['ts'] <= trade['exit_ts'])
+            spy_slice = spy_df[mask]
+            if len(spy_slice) >= 2:
+                spy_ret = (float(spy_slice['close'].iloc[-1]) - float(spy_slice['close'].iloc[0])) / float(spy_slice['close'].iloc[0])
+            else:
+                spy_ret = 0
+
+            beta_contribution = spy_ret  # beta=1.0 assumption
+            alpha = trade_ret - beta_contribution
+
+            # Factor decomposition
+            exit_r = str(trade.get('exit_reason', ''))
+            is_momentum = exit_r in ('SELL_TARGET', 'SELL_RSI', 'profit_target')
+            is_mean_rev = exit_r in ('SELL_VWAP', 'SELL_STOP')
+
+            factor_momentum = alpha * 0.4 if is_momentum else 0
+            factor_mean_rev = alpha * 0.3 if is_mean_rev else 0
+            residual = alpha - factor_momentum - factor_mean_rev
+
+            attr_rows.append({
+                'ticker': trade['ticker'],
+                'pnl': trade['pnl'],
+                'trade_return': round(trade_ret * 100, 3),
+                'spy_return': round(spy_ret * 100, 3),
+                'beta_pnl': round(beta_contribution * trade['entry_price'] * (trade['qty'] or 1), 2),
+                'alpha_pnl': round(alpha * trade['entry_price'] * (trade['qty'] or 1), 2),
+                'momentum_pnl': round(factor_momentum * trade['entry_price'] * (trade['qty'] or 1), 2),
+                'mean_rev_pnl': round(factor_mean_rev * trade['entry_price'] * (trade['qty'] or 1), 2),
+                'residual_pnl': round(residual * trade['entry_price'] * (trade['qty'] or 1), 2),
+            })
+
+        attr_df = pd.DataFrame(attr_rows)
+
+        # Summary
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Alpha P&L", f"${attr_df['alpha_pnl'].sum():+.2f}")
+        a2.metric("Beta P&L", f"${attr_df['beta_pnl'].sum():+.2f}")
+        a3.metric("Momentum Factor", f"${attr_df['momentum_pnl'].sum():+.2f}")
+        a4.metric("Mean Rev Factor", f"${attr_df['mean_rev_pnl'].sum():+.2f}")
+
+        # Attribution waterfall
+        st.subheader("Return Decomposition")
+        components = {
+            'Beta (Market)': attr_df['beta_pnl'].sum(),
+            'Momentum': attr_df['momentum_pnl'].sum(),
+            'Mean Reversion': attr_df['mean_rev_pnl'].sum(),
+            'Residual Alpha': attr_df['residual_pnl'].sum(),
+        }
+        fig = go.Figure(go.Waterfall(
+            x=list(components.keys()) + ['Total'],
+            y=list(components.values()) + [sum(components.values())],
+            measure=['relative'] * len(components) + ['total'],
+            connector=dict(line=dict(color='gray', dash='dot')),
+            increasing=dict(marker_color='#00CC96'),
+            decreasing=dict(marker_color='#EF553B'),
+            totals=dict(marker_color='#636EFA'),
+        ))
+        fig.update_layout(height=350, margin=dict(l=20, r=20, t=10, b=20),
+                          yaxis_title="P&L ($)")
+        st.plotly_chart(fig, width='stretch')
+
+        # Alpha by ticker
+        st.subheader("Alpha by Ticker")
+        ticker_alpha = attr_df.groupby('ticker')['alpha_pnl'].sum().sort_values()
+        fig = go.Figure(go.Bar(
+            y=ticker_alpha.index, x=ticker_alpha.values, orientation='h',
+            marker_color=['#00CC96' if v > 0 else '#EF553B' for v in ticker_alpha.values],
+        ))
+        fig.update_layout(height=max(250, len(ticker_alpha) * 20),
+                          margin=dict(l=20, r=20, t=10, b=20), xaxis_title="Alpha P&L ($)")
+        st.plotly_chart(fig, width='stretch')
+
+        # Full table
+        st.subheader("Trade-Level Attribution")
+        st.dataframe(attr_df.style.format({
+            'pnl': '${:.2f}', 'trade_return': '{:.3f}%', 'spy_return': '{:.3f}%',
+            'beta_pnl': '${:.2f}', 'alpha_pnl': '${:.2f}',
+            'momentum_pnl': '${:.2f}', 'mean_rev_pnl': '${:.2f}', 'residual_pnl': '${:.2f}',
+        }), width='stretch', height=300)
+    else:
+        st.info("Need SPY bar data in event_store for P&L attribution")
+
+# ── TAB 3: Compliance & Audit ────────────────────────────────────────────────
+with tab_compliance:
+    st.subheader("Compliance & Audit Trail")
+
+    # Trade audit: reconstruct signal → fill → close chain
+    st.subheader("Event Chain Audit")
+    audit_df = run_query(f"""
+        SELECT
+            event_time as ts,
+            event_type,
+            event_payload ->> 'ticker' as ticker,
+            CASE event_type
+                WHEN 'StrategySignal' THEN (event_payload ->> 'action')
+                WHEN 'OrderRequested' THEN (event_payload ->> 'side') || ' ' || (event_payload ->> 'qty')
+                WHEN 'FillExecuted' THEN (event_payload ->> 'side') || ' @ $' || (event_payload ->> 'fill_price')
+                WHEN 'PositionOpened' THEN 'OPENED'
+                WHEN 'PositionClosed' THEN 'CLOSED pnl=$' || (event_payload ->> 'pnl')
+                WHEN 'RiskBlocked' THEN 'BLOCKED: ' || (event_payload ->> 'reason')
+                ELSE ''
+            END as detail,
+            correlation_id::TEXT
+        FROM event_store
+        WHERE event_time::DATE = '{selected_date}'
+        ORDER BY event_time DESC
+        LIMIT 500
+    """)
+
+    if not audit_df.empty:
+        audit_df['ts'] = pd.to_datetime(audit_df['ts']).dt.strftime('%H:%M:%S')
+        st.dataframe(audit_df, width='stretch', height=400)
+    else:
+        st.info("No events in event_store for this date")
+
+    # Daily compliance summary
+    st.subheader("Daily Compliance Summary")
+    c1, c2, c3 = st.columns(3)
+
+    risk_blocks = run_query(f"""
+        SELECT COUNT(*) as cnt FROM event_store
+        WHERE event_type = 'RiskBlocked' AND event_time::DATE = '{selected_date}'
+    """)
+    c1.metric("Risk Blocks", int(risk_blocks['cnt'].iloc[0]) if not risk_blocks.empty else 0)
+
+    events_count = run_query(f"""
+        SELECT COUNT(*) as cnt FROM event_store
+        WHERE event_time::DATE = '{selected_date}'
+    """)
+    c2.metric("Total Events", int(events_count['cnt'].iloc[0]) if not events_count.empty else 0)
+
+    c3.metric("Tickers Traded", len(trades_df['ticker'].unique()))
+
+    # Event type distribution
+    st.subheader("Event Distribution")
+    event_dist = run_query(f"""
+        SELECT event_type, COUNT(*) as count
+        FROM event_store
+        WHERE event_time::DATE = '{selected_date}'
+        GROUP BY event_type
+        ORDER BY count DESC
+    """)
+    if not event_dist.empty:
+        fig = px.bar(event_dist, x='event_type', y='count',
+                     color='count', color_continuous_scale='Blues')
+        fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20))
+        st.plotly_chart(fig, width='stretch')
 
 # ── Footer ───────────────────────────────────────────────────────────────────
 st.markdown("---")

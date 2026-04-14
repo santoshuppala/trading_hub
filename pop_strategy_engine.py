@@ -514,7 +514,8 @@ class PopStrategyEngine:
             last_bar = market_slice.bars[-1]
             bar_range_pct = (last_bar.high - last_bar.low) / last_bar.open if last_bar.open > 0 else 0
             # Skip if bar range < 0.3% AND volume not elevated (no pop candidate)
-            if bar_range_pct < 0.003 and market_slice.rvol < 1.5 and abs(market_slice.gap_size) < 0.02:
+            last_rvol = market_slice.rvol_series[-1] if market_slice.rvol_series else 1.0
+            if bar_range_pct < 0.003 and last_rvol < 1.5 and abs(market_slice.gap_size) < 0.02:
                 return
 
         # 2. External data

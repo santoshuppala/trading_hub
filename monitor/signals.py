@@ -246,10 +246,24 @@ class SignalAnalyzer:
         vwap_breakdown = _detect_vwap_breakdown(closes_list, vwaps_list, rsi_value)
         reclaim_candle_low = ts(low.iloc[-2])
 
-        # RVOL
-        hist_df = rvol_cache.get(ticker) if rvol_cache else None
-        cum_volume = float(volume.sum())
-        rvol = get_rvol(hist_df, cum_volume, len(volume))
+        # RVOL — use canonical RVOLEngine if available, else fallback
+        try:
+            from monitor.rvol import _global_rvol_engine
+            if _global_rvol_engine is not None:
+                # Lazy seed from rvol_cache if engine hasn't seen this ticker
+                hist_df = rvol_cache.get(ticker) if rvol_cache else None
+                _global_rvol_engine.seed_from_bar_payload(ticker, hist_df)
+                # Update with this bar's volume
+                last_vol = float(volume.iloc[-1]) if len(volume) > 0 else 0
+                result = _global_rvol_engine.update(ticker, last_vol)
+                rvol = result.rvol_smooth
+            else:
+                raise ImportError
+        except (ImportError, Exception):
+            # Fallback to old calculation
+            hist_df = rvol_cache.get(ticker) if rvol_cache else None
+            cum_volume = float(volume.sum())
+            rvol = get_rvol(hist_df, cum_volume, len(volume))
 
         return {
             'action': None,

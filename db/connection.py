@@ -36,7 +36,7 @@ async def init_db(dsn: str | None = None) -> asyncpg.Pool:
     if _pool is not None:
         return _pool
 
-    url = dsn or os.getenv("DATABASE_URL", "postgresql://trading:trading_secret@localhost:5432/trading_hub")
+    url = dsn or os.getenv("DATABASE_URL", "postgresql://trading:trading_secret@localhost:5432/tradinghub")
 
     log.info("Connecting to TimescaleDB: %s", _mask_dsn(url))
     _pool = await asyncpg.create_pool(

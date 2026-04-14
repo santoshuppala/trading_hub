@@ -55,7 +55,21 @@ def compute_ema(series: pd.Series, period: int) -> pd.Series:
 
 
 def compute_rvol(df: pd.DataFrame, rvol_df: Optional[pd.DataFrame]) -> float:
-    """Relative volume: current-session avg / historical avg."""
+    """
+    Relative volume: uses canonical RVOLEngine when available,
+    falls back to simple ratio for backward compatibility.
+    """
+    try:
+        from monitor.rvol import _global_rvol_engine
+        if _global_rvol_engine is not None:
+            # Get ticker from df index name or use generic
+            ticker = getattr(df, 'name', None) or 'UNKNOWN'
+            if isinstance(ticker, str) and ticker != 'UNKNOWN':
+                return _global_rvol_engine.get_rvol(ticker)
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: simple ratio
     if rvol_df is None or len(rvol_df) == 0:
         return 1.0
     hist_avg = float(rvol_df['volume'].mean())

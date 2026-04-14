@@ -55,6 +55,14 @@ EVENT_TYPE_MAP = {
 
 _NOW = lambda: datetime.now(timezone.utc)
 
+def _ensure_aware(dt):
+    """Convert naive datetime to UTC-aware. Pass through if already aware."""
+    if dt is None:
+        return _NOW()
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        return dt
+    return dt.replace(tzinfo=timezone.utc)
+
 
 class EventSourcingSubscriber:
     """
@@ -146,10 +154,11 @@ class EventSourcingSubscriber:
                 "event_version":      1,
 
                 # Complete Timestamp Trail (CRITICAL)
-                "event_time":         event.timestamp,      # When it actually happened
-                "received_time":      _NOW(),                # When system received it (distinct from event_time)
-                "queued_time":        None,                 # Will be set if it was queued
-                "processed_time":     _NOW(),               # When we're processing it now
+                # All timestamps must be timezone-aware (asyncpg/PG17 strict mode)
+                "event_time":         _ensure_aware(event.timestamp),
+                "received_time":      _NOW(),
+                "queued_time":        None,
+                "processed_time":     _NOW(),
 
                 # Aggregate (entity that changed)
                 "aggregate_id":       aggregate_id,

@@ -319,13 +319,27 @@ class OptionsEngine:
             rsi_value = 50.0
             rvol = 1.0
 
+        # ── Pre-filter: skip expensive chain API call if no strategy possible ─
+        # The selector needs ATR/RSI/RVOL to pass basic thresholds.
+        # If none can pass, don't waste an API call on _estimate_iv().
+        atr_ratio = atr_value / spot if spot > 0 else 0
+        has_pos = p.ticker in self._positions
+        from options.selector import (
+            ATR_MOD_THRESHOLD, RSI_NEUTRAL_LOW, RSI_NEUTRAL_HIGH, IV_RANK_HIGH,
+        )
+        might_trade = (
+            atr_ratio > ATR_MOD_THRESHOLD                          # straddle/strangle
+            or (RSI_NEUTRAL_LOW <= rsi_value <= RSI_NEUTRAL_HIGH)  # iron condor/butterfly
+            or has_pos                                              # calendar spread
+        )
+        if not might_trade:
+            return
+
         iv_estimate = self._estimate_iv(p.ticker, spot)
 
         # Update IV tracker
         self._iv_tracker.update(p.ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(p.ticker)
-
-        has_pos = p.ticker in self._positions
 
         strategy_type = self._selector.select_from_bar(
             atr_value=atr_value,

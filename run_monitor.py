@@ -56,6 +56,75 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def _fetch_account_snapshot(api_key, api_secret, paper):
+    """Fetch equity, last_equity (previous close), and cash from Alpaca account API."""
+    import requests as _req
+    base = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+    r = _req.get(
+        f'{base}/v2/account',
+        headers={'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret},
+        timeout=10,
+    )
+    r.raise_for_status()
+    acct = r.json()
+    return {
+        'equity':       float(acct.get('equity', 0)),
+        'last_equity':  float(acct.get('last_equity', 0)),   # previous close equity
+        'cash':         float(acct.get('cash', 0)),
+        'buying_power': float(acct.get('buying_power', 0)),
+        'portfolio_value': float(acct.get('portfolio_value', 0)),
+        'status':       acct.get('status', '?'),
+    }
+
+
+def _fetch_daily_fees(api_key, api_secret, paper, date_str=None):
+    """Fetch total regulatory + commission fees from Alpaca account activities for a given date.
+
+    Returns dict with 'total_fees', 'fee_count', and 'fee_details' list.
+    Alpaca activity types: FEE (regulatory), CFEE (commission).
+    """
+    import requests as _req
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if date_str is None:
+        date_str = datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
+
+    base = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+    headers = {'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret}
+
+    total_fees = 0.0
+    fee_details = []
+
+    for activity_type in ('FEE', 'CFEE'):
+        try:
+            r = _req.get(
+                f'{base}/v2/account/activities/{activity_type}',
+                headers=headers,
+                params={'date': date_str, 'direction': 'desc', 'page_size': 100},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                activities = r.json()
+                for act in activities:
+                    amount = abs(float(act.get('net_amount', 0) or act.get('qty', 0) or 0))
+                    total_fees += amount
+                    fee_details.append({
+                        'type': activity_type,
+                        'amount': amount,
+                        'symbol': act.get('symbol', ''),
+                        'description': act.get('description', ''),
+                    })
+        except Exception:
+            pass  # fees are best-effort; don't crash the monitor
+
+    return {
+        'total_fees': round(total_fees, 4),
+        'fee_count':  len(fee_details),
+        'fee_details': fee_details,
+    }
+
+
 def main():
     import asyncio
     import hashlib
@@ -363,6 +432,26 @@ def main():
         log.error("PRE-MARKET CHECK: CRITICAL FAILURES DETECTED — review above")
     log.info("=" * 60)
 
+    # ── Session equity baseline (ground truth from Alpaca) ──────────────────
+    session_start_equity = None
+    session_prev_close_equity = None
+    if ALPACA_API_KEY and ALPACA_SECRET:
+        try:
+            snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+            session_start_equity = snap['equity']
+            session_prev_close_equity = snap['last_equity']
+            log.info("=" * 60)
+            log.info("SESSION EQUITY BASELINE (Alpaca Ground Truth)")
+            log.info("=" * 60)
+            log.info(f"  {'Previous Close Equity':<25} ${session_prev_close_equity:>12,.2f}")
+            log.info(f"  {'Current Equity':<25} ${session_start_equity:>12,.2f}")
+            log.info(f"  {'Cash':<25} ${snap['cash']:>12,.2f}")
+            log.info(f"  {'Buying Power':<25} ${snap['buying_power']:>12,.2f}")
+            log.info(f"  {'Portfolio Value':<25} ${snap['portfolio_value']:>12,.2f}")
+            log.info("=" * 60)
+        except Exception as exc:
+            log.warning(f"Could not fetch equity baseline (non-fatal): {exc}")
+
     # ── Activity Logger (every event → TimescaleDB for analysis) ────────────
     activity_logger = None
     if DB_ENABLED_RUNTIME and db_writer:
@@ -372,6 +461,18 @@ def main():
         log.info("ActivityLogger active → all signals/fills/blocks logged to TimescaleDB")
     else:
         log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
+
+    # ── Initialize canonical RVOL engine ────────────────────────────────────
+    try:
+        from monitor.rvol import init_global_rvol_engine
+        rvol_engine = init_global_rvol_engine()
+        # Seed profiles from data client (non-blocking, best-effort)
+        try:
+            rvol_engine.seed_profiles(monitor.tickers, monitor._data)
+        except Exception as seed_err:
+            log.warning(f"RVOL profile seeding failed (will lazy-seed): {seed_err}")
+    except ImportError:
+        log.warning("RVOL engine not available — using legacy calculation")
 
     monitor.start()
     log.info("Monitor running. New entries stop at 3:00 PM ET, exits until 4:00 PM ET.")
@@ -458,9 +559,17 @@ def main():
                         )
                     except Exception:
                         pass  # health logging must never crash the monitor
-            # Hourly summary
+            # Hourly summary (with equity ground truth when available)
             if now.minute == 0 and trades:
-                log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}")
+                hourly_extra = ""
+                if ALPACA_API_KEY and ALPACA_SECRET and session_start_equity is not None:
+                    try:
+                        hr_snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                        equity_pnl = hr_snap['equity'] - session_start_equity
+                        hourly_extra = f" | Equity PnL: ${equity_pnl:+.2f} (Alpaca)"
+                    except Exception:
+                        pass
+                log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}{hourly_extra}")
             time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
@@ -497,11 +606,12 @@ def main():
         # Only cancel stale open ORDERS (prevents wash trade issues next morning).
         try:
             from alpaca.trading.client import TradingClient
-            from config import APCA_API_KEY_ID, APCA_API_SECRET_KEY, PAPER_TRADING
+            from config import APCA_API_KEY_ID, APCA_API_SECRET_KEY
+            _paper = PAPER_TRADING  # use module-level import, don't re-import locally
             eod_client = TradingClient(
                 api_key=APCA_API_KEY_ID,
                 secret_key=APCA_API_SECRET_KEY,
-                paper=PAPER_TRADING,
+                paper=_paper,
             )
             # Cancel all open orders (prevents wash trade errors on next session)
             try:
@@ -557,6 +667,16 @@ def main():
 
         if not trades:
             log.info("  No trades executed today.")
+            # Still log equity change even with no trades (positions, fees, dividends)
+            if ALPACA_API_KEY and ALPACA_SECRET:
+                try:
+                    eod_snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    baseline = session_prev_close_equity or session_start_equity
+                    if baseline:
+                        equity_pnl = round(eod_snap['equity'] - baseline, 2)
+                        log.info(f"  Equity change (Alpaca): ${equity_pnl:+.2f} (no trades — unrealized/fees/dividends)")
+                except Exception:
+                    pass
             log.info(bar)
         else:
             wins       = [t for t in trades if t['is_win']]
@@ -575,12 +695,77 @@ def main():
             log.info(f"  {'Total Trades':<20} {len(trades)}")
             log.info(f"  {'Wins / Losses':<20} {len(wins)} / {len(losses)}")
             log.info(f"  {'Win Rate':<20} {win_rate:.1f}%")
-            log.info(f"  {'Total PnL':<20} ${total_pnl:+.2f}")
+            log.info(f"  {'Total PnL (trades)':<20} ${total_pnl:+.2f}")
             log.info(f"  {'Avg Win':<20} ${avg_win:+.2f}")
             log.info(f"  {'Avg Loss':<20} ${avg_loss:+.2f}")
             log.info(f"  {'Profit Factor':<20} {pf:.2f}x")
             log.info(f"  {'Best Trade':<20} {best['ticker']} ${best['pnl']:+.2f} ({best['reason']})")
             log.info(f"  {'Worst Trade':<20} {worst['ticker']} ${worst['pnl']:+.2f} ({worst['reason']})")
+
+            # ── P&L RECONCILIATION (Alpaca ground truth) ─────────────
+            log.info("")
+            log.info("  " + "-" * (W - 2))
+            log.info("  P&L RECONCILIATION vs Alpaca Ground Truth")
+            log.info("  " + "-" * (W - 2))
+
+            eod_equity = None
+            eod_fees = None
+            if ALPACA_API_KEY and ALPACA_SECRET:
+                # 1. Fetch ending equity snapshot
+                try:
+                    eod_snap = _fetch_account_snapshot(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    eod_equity = eod_snap['equity']
+                    log.info(f"  {'Ending Equity':<25} ${eod_equity:>12,.2f}")
+                    if session_prev_close_equity is not None:
+                        log.info(f"  {'Prev Close Equity':<25} ${session_prev_close_equity:>12,.2f}")
+                    if session_start_equity is not None:
+                        log.info(f"  {'Session Start Equity':<25} ${session_start_equity:>12,.2f}")
+                except Exception as exc:
+                    log.warning(f"  Could not fetch ending equity: {exc}")
+
+                # 2. Fetch daily fees/commissions
+                try:
+                    fee_data = _fetch_daily_fees(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    eod_fees = fee_data['total_fees']
+                    log.info(f"  {'Alpaca Fees/Reg':<25} ${eod_fees:>12,.4f}  ({fee_data['fee_count']} charges)")
+                except Exception as exc:
+                    log.warning(f"  Could not fetch fees: {exc}")
+                    eod_fees = 0.0
+
+                # 3. Compute equity-based P&L (ground truth)
+                log.info("")
+                baseline = session_prev_close_equity or session_start_equity
+                if eod_equity is not None and baseline is not None:
+                    equity_pnl = round(eod_equity - baseline, 2)
+                    fee_adjusted_pnl = round(total_pnl - (eod_fees or 0.0), 2)
+                    discrepancy = round(equity_pnl - fee_adjusted_pnl, 2)
+
+                    log.info(f"  {'Trade-log PnL':<25} ${total_pnl:>+12.2f}  (sum of closed trades)")
+                    log.info(f"  {'Fees Deducted':<25} ${-(eod_fees or 0.0):>+12.4f}")
+                    log.info(f"  {'Fee-Adjusted PnL':<25} ${fee_adjusted_pnl:>+12.2f}  (trades - fees)")
+                    log.info(f"  {'Equity-Based PnL':<25} ${equity_pnl:>+12.2f}  (Alpaca ground truth)")
+                    log.info(f"  {'Discrepancy':<25} ${discrepancy:>+12.2f}  (equity - fee-adjusted)")
+
+                    if abs(discrepancy) > 0.01:
+                        log.warning(
+                            f"  ** P&L DISCREPANCY: ${discrepancy:+.2f} **"
+                        )
+                        log.warning(
+                            f"  ** Equity says ${equity_pnl:+.2f} but trades-fees says ${fee_adjusted_pnl:+.2f} **"
+                        )
+                        # TODO(santosh): Possible causes to validate manually:
+                        #   - Unrealized P&L on positions held overnight (open positions change equity)
+                        #   - Dividends or corporate actions credited/debited intraday
+                        #   - Interest on cash balance (margin accounts)
+                        #   - Fees not captured by FEE/CFEE activity types
+                        #   - Partial fills where monitor qty != broker qty
+                        #   - Rounding differences across many small trades
+                        #   - Positions opened by other engines (Pop/Pro/Options) on same account
+                        log.warning("  ** Review above causes — see TODO comments in run_monitor.py **")
+                    else:
+                        log.info("  P&L RECONCILED — trade-log matches Alpaca equity (within $0.01)")
+                else:
+                    log.warning("  Could not reconcile — equity baseline or ending equity unavailable")
 
             # ── Exit reason breakdown ─────────────────────────────────
             log.info("")

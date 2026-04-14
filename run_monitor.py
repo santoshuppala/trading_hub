@@ -125,6 +125,54 @@ def _fetch_daily_fees(api_key, api_secret, paper, date_str=None):
     }
 
 
+def _fetch_filled_orders(api_key, api_secret, paper, date_str=None):
+    """Fetch all filled orders from Alpaca for a given date.
+
+    Returns list of dicts with ticker, side, qty, filled_avg_price, filled_at.
+    Used to detect orphaned/missed trades not captured in the monitor's trade_log.
+    """
+    import requests as _req
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if date_str is None:
+        date_str = datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
+
+    base = 'https://paper-api.alpaca.markets' if paper else 'https://api.alpaca.markets'
+    headers = {'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret}
+
+    filled_orders = []
+    try:
+        r = _req.get(
+            f'{base}/v2/orders',
+            headers=headers,
+            params={
+                'status': 'closed',
+                'after': f'{date_str}T00:00:00Z',
+                'until': f'{date_str}T23:59:59Z',
+                'limit': 500,
+                'direction': 'asc',
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            for order in r.json():
+                if order.get('status') == 'filled' and order.get('filled_qty'):
+                    filled_orders.append({
+                        'id':         order.get('id', ''),
+                        'ticker':     order.get('symbol', ''),
+                        'side':       order.get('side', '').upper(),
+                        'qty':        int(float(order.get('filled_qty', 0))),
+                        'fill_price': float(order.get('filled_avg_price', 0)),
+                        'filled_at':  order.get('filled_at', ''),
+                        'order_type': order.get('type', ''),
+                    })
+    except Exception:
+        pass  # best-effort; don't crash the monitor
+
+    return filled_orders
+
+
 def main():
     import asyncio
     import hashlib
@@ -766,6 +814,119 @@ def main():
                         log.info("  P&L RECONCILED — trade-log matches Alpaca equity (within $0.01)")
                 else:
                     log.warning("  Could not reconcile — equity baseline or ending equity unavailable")
+
+                # 4. Orphaned / missed trade audit (compare Alpaca fills vs trade_log)
+                log.info("")
+                log.info("  " + "-" * (W - 2))
+                log.info("  ORPHANED / MISSED TRADE AUDIT")
+                log.info("  " + "-" * (W - 2))
+                try:
+                    alpaca_fills = _fetch_filled_orders(ALPACA_API_KEY, ALPACA_SECRET, PAPER_TRADING)
+                    alpaca_sells = [f for f in alpaca_fills if f['side'] == 'SELL']
+                    alpaca_buys  = [f for f in alpaca_fills if f['side'] == 'BUY']
+
+                    log.info(f"  Alpaca filled orders today: {len(alpaca_fills)} ({len(alpaca_buys)} buys, {len(alpaca_sells)} sells)")
+                    log.info(f"  Monitor trade_log entries:  {len(trades)}")
+
+                    # Build monitor sell map: ticker -> list of (qty, exit_price)
+                    monitor_sells = {}
+                    for t in trades:
+                        tk = t['ticker']
+                        monitor_sells.setdefault(tk, [])
+                        monitor_sells[tk].append({
+                            'qty': t['qty'],
+                            'price': t['exit_price'],
+                        })
+
+                    # Build Alpaca sell map: ticker -> list of (qty, fill_price)
+                    broker_sells = {}
+                    for f in alpaca_sells:
+                        tk = f['ticker']
+                        broker_sells.setdefault(tk, [])
+                        broker_sells[tk].append({
+                            'qty': f['qty'],
+                            'price': f['fill_price'],
+                            'filled_at': f['filled_at'],
+                            'order_id': f['id'],
+                        })
+
+                    # Compare total sell qty per ticker
+                    all_sell_tickers = set(list(monitor_sells.keys()) + list(broker_sells.keys()))
+                    orphaned_found = False
+                    orphaned_pnl_impact = 0.0
+
+                    for tk in sorted(all_sell_tickers):
+                        m_qty = sum(s['qty'] for s in monitor_sells.get(tk, []))
+                        b_qty = sum(s['qty'] for s in broker_sells.get(tk, []))
+
+                        if m_qty != b_qty:
+                            orphaned_found = True
+                            diff = b_qty - m_qty
+                            # Estimate missed P&L: find corresponding buy for this ticker
+                            buy_prices = [f['fill_price'] for f in alpaca_buys if f['ticker'] == tk]
+                            avg_buy = sum(buy_prices) / len(buy_prices) if buy_prices else 0
+                            sell_prices = [s['price'] for s in broker_sells.get(tk, [])]
+                            avg_sell = sum(sell_prices) / len(sell_prices) if sell_prices else 0
+                            est_missed_pnl = round((avg_sell - avg_buy) * abs(diff), 2) if avg_buy else 0
+
+                            if diff > 0:
+                                log.warning(
+                                    f"  MISSED SELL: {tk} — Alpaca sold {b_qty} shares, "
+                                    f"monitor logged {m_qty} (missed {diff} shares, "
+                                    f"est. PnL impact: ${est_missed_pnl:+.2f})"
+                                )
+                            else:
+                                log.warning(
+                                    f"  PHANTOM SELL: {tk} — monitor logged {m_qty} shares sold, "
+                                    f"but Alpaca only filled {b_qty} (phantom {abs(diff)} shares)"
+                                )
+                            orphaned_pnl_impact += est_missed_pnl
+
+                    # Check for buys at Alpaca with no corresponding monitor entry
+                    monitor_buy_tickers = set(t['ticker'] for t in trades)
+                    # Also include open positions the monitor knows about
+                    monitor_open_tickers = set(monitor.positions.keys()) if hasattr(monitor, 'positions') else set()
+                    known_tickers = monitor_buy_tickers | monitor_open_tickers
+
+                    orphan_buys = {}
+                    for f in alpaca_buys:
+                        tk = f['ticker']
+                        orphan_buys.setdefault(tk, [])
+                        orphan_buys[tk].append(f)
+
+                    for tk, buys in sorted(orphan_buys.items()):
+                        b_buy_qty = sum(b['qty'] for b in buys)
+                        # Check if monitor has any record of buying this ticker
+                        m_buy_qty = sum(
+                            s['qty'] for s in monitor_sells.get(tk, [])
+                        )
+                        # Also check open positions
+                        open_qty = 0
+                        if hasattr(monitor, 'positions') and tk in monitor.positions:
+                            open_qty = monitor.positions[tk].get('quantity', 0)
+                        m_total = m_buy_qty + open_qty
+
+                        if b_buy_qty > m_total and tk not in monitor_sells:
+                            orphaned_found = True
+                            log.warning(
+                                f"  ORPHANED BUY: {tk} — Alpaca bought {b_buy_qty} shares, "
+                                f"monitor has no record (not in trade_log or open positions)"
+                            )
+
+                    if orphaned_found:
+                        if orphaned_pnl_impact != 0:
+                            log.warning(f"  Estimated orphaned trade PnL impact: ${orphaned_pnl_impact:+.2f}")
+                        # TODO(santosh): Orphaned trades to investigate:
+                        #   - Check if broker filled an order but monitor missed the FILL event
+                        #   - Check if position was opened by Pop/Pro/Options engine on same account
+                        #   - Check for wash-trade cancel/resubmit that created duplicate fills
+                        #   - Review logs around the fill time for errors/timeouts
+                        log.warning("  ** Orphaned trades detected — review logs for missed fills **")
+                    else:
+                        log.info("  No orphaned or missed trades — monitor and Alpaca fills match")
+
+                except Exception as exc:
+                    log.warning(f"  Orphaned trade audit failed (non-fatal): {exc}")
 
             # ── Exit reason breakdown ─────────────────────────────────
             log.info("")

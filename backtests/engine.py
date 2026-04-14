@@ -27,6 +27,12 @@ from backtests.adapters.pro_adapter import ProBacktestAdapter
 from monitor.event_bus import Event, EventType
 from monitor.events import BarPayload
 
+try:
+    from backtests.adapters.options_adapter import OptionsBacktestAdapter
+    _HAS_OPTIONS_ADAPTER = True
+except ImportError:
+    _HAS_OPTIONS_ADAPTER = False
+
 log = logging.getLogger(__name__)
 ET = ZoneInfo('America/New_York')
 
@@ -125,11 +131,13 @@ class BacktestEngine:
             except Exception as e:
                 log.warning(f"[BacktestEngine] Failed to init ProSetupEngine: {e}")
 
-        # TODO: Pop and Options adapters
-        # if 'pop' in self.engines_to_run:
-        #     adapter = PopBacktestAdapter(...)
-        # if 'options' in self.engines_to_run:
-        #     adapter = OptionsBacktestAdapter(...)
+        if 'options' in self.engines_to_run and _HAS_OPTIONS_ADAPTER:
+            try:
+                adapter = OptionsBacktestAdapter(self.bus.bus, self.fill_simulator)
+                self.adapters.append(adapter)
+                log.info("[BacktestEngine] Initialized OptionsEngine adapter")
+            except Exception as e:
+                log.warning(f"[BacktestEngine] Failed to init OptionsEngine: {e}")
 
     def _load_all_data(self) -> None:
         """Load RVOL baselines and intraday bars."""
@@ -196,6 +204,23 @@ class BacktestEngine:
                 # Process fill simulation
                 self.fill_simulator.process_bar(ticker, bar, is_eod=is_eod)
 
+                # Update options chain with current bar data
+                if len(rolling_windows[ticker]) >= 14:
+                    try:
+                        spot = float(bar['close']) if isinstance(bar, dict) else float(bar.close)
+                        rw = rolling_windows[ticker]
+                        # Simple ATR: average true range over last 14 bars
+                        if len(rw) >= 14:
+                            tr = rw['high'].iloc[-14:] - rw['low'].iloc[-14:]
+                            atr = float(tr.mean())
+                        else:
+                            atr = 0.5
+                        for adapter in self.adapters:
+                            if hasattr(adapter, 'update_bar'):
+                                adapter.update_bar(ticker, atr, spot)
+                    except Exception:
+                        pass
+
                 # Skip emissions until we have enough data (30-bar minimum)
                 if len(rolling_windows[ticker]) < 30:
                     continue
@@ -203,7 +228,6 @@ class BacktestEngine:
                 # Emit BAR event
                 payload = BarPayload(
                     ticker=ticker,
-                    timestamp=timestamp,
                     df=rolling_windows[ticker].copy(),
                     rvol_df=self.rvol_baselines.get(ticker),
                 )

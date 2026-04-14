@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class OptionContract:
-    """Synthetic option contract."""
+    """Synthetic option contract, compatible with options.chain.OptionContract fields."""
     symbol: str
     right: str  # 'C' for call, 'P' for put
     strike: float
@@ -32,6 +32,27 @@ class OptionContract:
     theta: float
     gamma: float
     vega: float
+
+    @property
+    def option_type(self) -> str:
+        """Alias for compatibility with options.chain.OptionContract."""
+        return 'call' if self.right == 'C' else 'put'
+
+    @property
+    def expiry_date(self):
+        """Alias for compatibility with options.chain.OptionContract."""
+        from datetime import date
+        return date.fromisoformat(self.expiration)
+
+    @property
+    def dte(self) -> int:
+        """Days to expiration."""
+        from datetime import date
+        return max((date.fromisoformat(self.expiration) - date.today()).days, 0)
+
+    @property
+    def underlying(self) -> str:
+        return self.symbol
 
 
 class SyntheticOptionChainClient:
@@ -208,6 +229,50 @@ class SyntheticOptionChainClient:
             gamma=gamma,
             vega=vega,
         )
+
+    def find_otm(
+        self,
+        contracts: List[OptionContract],
+        option_type: str,
+        underlying_price: float,
+        otm_pct: float = 0.03,
+    ) -> Optional[OptionContract]:
+        """Find contract approximately otm_pct OTM from underlying price."""
+        if not contracts:
+            return None
+        right = 'C' if option_type == 'call' else 'P'
+        if option_type == 'call':
+            target = underlying_price * (1 + otm_pct)
+        else:
+            target = underlying_price * (1 - otm_pct)
+        candidates = [c for c in contracts if c.right == right]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda c: abs(c.strike - target))
+
+    def find_leaps(
+        self,
+        ticker: str,
+        option_type: str,
+        target_delta: float,
+        min_dte: int = 300,
+    ) -> Optional[OptionContract]:
+        """Generate a LEAPS contract."""
+        contracts = self.get_chain(ticker, min_dte=min_dte, max_dte=min_dte + 365)
+        if not contracts:
+            return None
+        return self.find_by_delta(contracts, option_type, target_delta, tolerance=0.15)
+
+    def get_quote(self, symbol: str) -> Optional[tuple]:
+        """Get quote for a specific contract. Returns (bid, ask) or None."""
+        # In backtesting, we regenerate the contract on the fly
+        # For simplicity, return a reasonable bid/ask based on last known spot
+        for ticker, (atr, spot) in self.bar_state.items():
+            contracts = self.get_chain(ticker, min_dte=1, max_dte=500)
+            for c in contracts:
+                if c.symbol == symbol:
+                    return (c.bid, c.ask)
+        return None
 
     @staticmethod
     def _norm_cdf(x: float) -> float:

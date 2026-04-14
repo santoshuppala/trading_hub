@@ -44,7 +44,9 @@ class LongCall(BaseOptionsStrategy):
 
             premium = (call.ask + call.bid) / 2.0
             max_risk = premium * 100  # cost of 1 contract
-            max_reward = max(underlying_price - call.strike - premium, 0) * 100 * 10  # capped at 10x
+            # Reward estimate: 3x premium (conservative for risk management)
+            # Actual reward is theoretically unlimited for long calls
+            max_reward = max_risk * 3.0
 
             return OptionsTradeSpec(
                 strategy_type=self.STRATEGY_TYPE,
@@ -102,7 +104,8 @@ class LongPut(BaseOptionsStrategy):
 
             premium = (put.ask + put.bid) / 2.0
             max_risk = premium * 100  # cost of 1 contract
-            max_reward = max(put.strike - underlying_price - premium, 0) * 100 * 10  # capped at 10x
+            # Reward estimate: 3x premium (conservative for risk management)
+            max_reward = max_risk * 3.0
 
             return OptionsTradeSpec(
                 strategy_type=self.STRATEGY_TYPE,

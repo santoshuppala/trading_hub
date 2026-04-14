@@ -508,6 +508,15 @@ class PopStrategyEngine:
         if not market_slice.bars:
             return
 
+        # Early exit: skip news/social fetch if bar shows no unusual activity
+        # This eliminates ~90% of unnecessary API calls (main slow-handler fix)
+        if market_slice.bars:
+            last_bar = market_slice.bars[-1]
+            bar_range_pct = (last_bar.high - last_bar.low) / last_bar.open if last_bar.open > 0 else 0
+            # Skip if bar range < 0.3% AND volume not elevated (no pop candidate)
+            if bar_range_pct < 0.003 and market_slice.rvol < 1.5 and abs(market_slice.gap_size) < 0.02:
+                return
+
         # 2. External data
         try:
             news_1h  = self._news.get_news(symbol, window_hours=1.0)

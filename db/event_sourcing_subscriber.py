@@ -29,7 +29,7 @@ from monitor.event_bus import Event, EventType
 from monitor.events import (
     BarPayload, SignalPayload, OrderRequestPayload, FillPayload,
     PositionPayload, RiskBlockPayload, PopSignalPayload,
-    ProStrategySignalPayload,
+    ProStrategySignalPayload, OptionsSignalPayload,
 )
 
 from .writer import DBWriter
@@ -49,6 +49,8 @@ EVENT_TYPE_MAP = {
     EventType.POP_SIGNAL:           'PopStrategySignal',
     EventType.PRO_STRATEGY_SIGNAL:  'ProStrategySignal',
     EventType.HEARTBEAT:            'HeartbeatEmitted',
+    EventType.OPTIONS_SIGNAL:       'OptionsSignal',
+    EventType.QUOTE:                'QuoteReceived',
 }
 
 _NOW = lambda: datetime.now(timezone.utc)
@@ -75,6 +77,7 @@ class EventSourcingSubscriber:
         self._writer    = writer
         self._session_id = session_id
         self._event_seq = 0  # Local sequence counter for ordering
+        self._aggregate_versions: Dict[str, int] = {}  # aggregate_id → version counter
 
     def register(self) -> None:
         """Subscribe to all event types at LOW priority (priority=10)."""
@@ -88,6 +91,8 @@ class EventSourcingSubscriber:
             EventType.POP_SIGNAL:           self._on_pop_signal,
             EventType.PRO_STRATEGY_SIGNAL:  self._on_pro_strategy_signal,
             EventType.HEARTBEAT:            self._on_heartbeat,
+            EventType.OPTIONS_SIGNAL:       self._on_options_signal,
+            EventType.QUOTE:                self._on_quote,
         }
         for event_type, handler in handlers.items():
             self._bus.subscribe(event_type, handler, priority=10)
@@ -128,6 +133,10 @@ class EventSourcingSubscriber:
         try:
             self._event_seq += 1
 
+            # Increment aggregate version (tracks entity lifecycle)
+            agg_ver = self._aggregate_versions.get(aggregate_id, 0) + 1
+            self._aggregate_versions[aggregate_id] = agg_ver
+
             # Build the immutable event record
             row: Dict[str, Any] = {
                 # Event Identity
@@ -138,14 +147,14 @@ class EventSourcingSubscriber:
 
                 # Complete Timestamp Trail (CRITICAL)
                 "event_time":         event.timestamp,      # When it actually happened
-                "received_time":      event.timestamp,      # System reception time (approx same)
+                "received_time":      _NOW(),                # When system received it (distinct from event_time)
                 "queued_time":        None,                 # Will be set if it was queued
                 "processed_time":     _NOW(),               # When we're processing it now
 
                 # Aggregate (entity that changed)
                 "aggregate_id":       aggregate_id,
                 "aggregate_type":     aggregate_type,
-                "aggregate_version":  1,
+                "aggregate_version":  agg_ver,
 
                 # Event Payload (complete, immutable data)
                 "event_payload":      json.dumps(event_payload),
@@ -439,6 +448,63 @@ class EventSourcingSubscriber:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _on_options_signal(self, event: Event) -> None:
+        """Options engine signal — captures full strategy spec for ML analysis."""
+        try:
+            p: OptionsSignalPayload = event.payload
+            legs = None
+            if hasattr(p, "legs_json") and p.legs_json:
+                legs = json.loads(p.legs_json) if isinstance(p.legs_json, str) else p.legs_json
+
+            payload = {
+                "ticker":            p.ticker,
+                "strategy_type":     str(p.strategy_type),
+                "underlying_price":  float(p.underlying_price),
+                "expiry_date":       p.expiry_date,
+                "net_debit":         float(p.net_debit),
+                "max_risk":          float(p.max_risk),
+                "max_reward":        float(p.max_reward),
+                "atr_value":         _safe_float(p.atr_value),
+                "rvol":              _safe_float(p.rvol),
+                "rsi_value":         _safe_float(p.rsi_value),
+                "legs":              legs,
+                "source":            p.source,
+            }
+
+            self._write_event(
+                event_type="OptionsSignal",
+                aggregate_type="Signal",
+                aggregate_id=f"signal_options_{p.ticker}_{event.timestamp.isoformat()}",
+                event_payload=payload,
+                event=event,
+                source_system="OptionsEngine",
+            )
+        except Exception as exc:
+            log.debug("EventSourcingSubscriber._on_options_signal error: %s", exc)
+
+    def _on_quote(self, event: Event) -> None:
+        """Quote received — bid/ask data critical for slippage analysis."""
+        try:
+            p = event.payload
+            payload = {
+                "ticker":      getattr(p, "ticker", None),
+                "bid":         _safe_float(getattr(p, "bid", None)),
+                "ask":         _safe_float(getattr(p, "ask", None)),
+                "spread_pct":  _safe_float(getattr(p, "spread_pct", None)),
+            }
+
+            self._write_event(
+                event_type="QuoteReceived",
+                aggregate_type="Quote",
+                aggregate_id=f"quote_{payload['ticker']}_{event.timestamp.isoformat()}",
+                event_payload=payload,
+                event=event,
+                source_system="RiskEngine",
+            )
+        except Exception as exc:
+            log.debug("EventSourcingSubscriber._on_quote error: %s", exc)
+
 
 def _safe_float(v: Any) -> float | None:
     try:

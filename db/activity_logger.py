@@ -139,12 +139,12 @@ class ActivityLogger:
         detectors = None
         if hasattr(p, 'detector_signals') and p.detector_signals:
             det = p.detector_signals
-            detectors = json.loads(det) if isinstance(det, str) else det
+            detectors = det if isinstance(det, str) else json.dumps(det)
 
         features = None
         if hasattr(p, 'features_json') and p.features_json:
-            feat = p.features_json
-            features = json.loads(feat) if isinstance(feat, str) else feat
+            # Keep as JSON string for JSONB column
+            features = p.features_json if isinstance(p.features_json, str) else json.dumps(p.features_json)
 
         row = {
             'ts':                 datetime.now(timezone.utc),

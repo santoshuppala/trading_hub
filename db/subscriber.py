@@ -199,7 +199,8 @@ class DBSubscriber:
             p: PopSignalPayload = event.payload
             features = None
             if hasattr(p, "features_json") and p.features_json:
-                features = json.loads(p.features_json) if isinstance(p.features_json, str) else p.features_json
+                # Keep as JSON string for JSONB column — psycopg2 needs str, not dict
+                features = p.features_json if isinstance(p.features_json, str) else json.dumps(p.features_json)
             row = {
                 "ts":                   _NOW(),
                 "symbol":               p.symbol,

@@ -1,7 +1,7 @@
 """
 Standalone monitor launcher — runs without Streamlit UI.
 Scheduled daily at 6:00 AM PST (9:00 AM ET, 30 min before open).
-Stops automatically at 4:00 PM ET after market close.
+Stops at 4:00 PM ET (market close). New entries blocked at 3:00 PM, exits monitored until close.
 """
 import os
 import signal
@@ -374,7 +374,7 @@ def main():
         log.warning("ActivityLogger disabled (DB not available) — signals will NOT be logged")
 
     monitor.start()
-    log.info("Monitor running. Will stop at 4:00 PM ET.")
+    log.info("Monitor running. New entries stop at 3:00 PM ET, exits until 4:00 PM ET.")
 
     # ── Trading halted flag (daily loss kill switch) ──────────────────────────
     trading_halted = False
@@ -383,6 +383,8 @@ def main():
         while True:
             now = datetime.now(ET)
             # Stop at 4:00 PM ET (market close)
+            # New entries blocked at 3:30 PM (handled by StrategyEngine._FORCE_CLOSE)
+            # Exits still monitored 3:30-4:00 PM so open positions can close
             if now.hour >= 16:
                 log.info("4:00 PM ET reached — stopping monitor.")
                 break
@@ -490,6 +492,61 @@ def main():
                 )
             except Exception as exc:
                 log.warning(f"DB shutdown error (non-fatal): {exc}")
+        # ── EOD POSITION AUDIT (log what's still open, don't force close) ──
+        # Pro/Pop positions may be valid swing holds — don't liquidate.
+        # Only cancel stale open ORDERS (prevents wash trade issues next morning).
+        try:
+            from alpaca.trading.client import TradingClient
+            from config import APCA_API_KEY_ID, APCA_API_SECRET_KEY, PAPER_TRADING
+            eod_client = TradingClient(
+                api_key=APCA_API_KEY_ID,
+                secret_key=APCA_API_SECRET_KEY,
+                paper=PAPER_TRADING,
+            )
+            # Cancel all open orders (prevents wash trade errors on next session)
+            try:
+                eod_client.cancel_orders()
+                log.info("EOD: cancelled all open orders (wash trade prevention)")
+            except Exception as cancel_err:
+                log.warning(f"EOD: cancel orders failed: {cancel_err}")
+
+            # Log open positions (audit trail, no close)
+            open_positions = eod_client.get_all_positions()
+            if open_positions:
+                tickers_held = [f"{p.symbol}({p.qty})" for p in open_positions]
+                log.info(
+                    f"EOD: {len(open_positions)} swing position(s) held overnight: "
+                    f"{', '.join(tickers_held)}"
+                )
+            else:
+                log.info("EOD: no open positions — clean shutdown")
+        except ImportError:
+            log.warning("EOD: alpaca-py not available — cannot audit positions")
+        except Exception as exc:
+            log.warning(f"EOD position audit error (non-fatal): {exc}")
+
+        # ── Post-session analytics (runs in background, non-blocking) ────────
+        try:
+            import subprocess
+            analytics_script = os.path.join(os.path.dirname(__file__), 'scripts', 'post_session_analytics.py')
+            if os.path.exists(analytics_script):
+                subprocess.Popen(
+                    [sys.executable, analytics_script],
+                    stdout=open(os.path.join(os.path.dirname(__file__), 'logs', 'post_session.log'), 'a'),
+                    stderr=subprocess.STDOUT,
+                )
+                log.info("Post-session analytics triggered (background)")
+        except Exception as exc:
+            log.warning(f"Post-session analytics trigger failed (non-fatal): {exc}")
+
+        # ── Close all options positions at EOD ─────────────────────────────
+        try:
+            if 'options_engine' in dir() and options_engine:
+                options_engine.close_all_positions('eod_close')
+                log.info("Options positions closed at EOD")
+        except Exception as exc:
+            log.warning(f"Options EOD close error (non-fatal): {exc}")
+
         trades = monitor.trade_log
         W = 60
         bar = "=" * W

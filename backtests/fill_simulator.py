@@ -66,19 +66,53 @@ class ClosedTrade:
     commission: float = 0.0  # per-trade cost
 
 
+# Options strategy categories for exit logic
+_CREDIT_STRATEGIES = {
+    'bull_put_spread', 'bear_call_spread', 'iron_condor', 'iron_butterfly',
+}
+_DEBIT_STRATEGIES = {
+    'long_call', 'long_put', 'bull_call_spread', 'bear_put_spread', 'butterfly_spread',
+}
+_VOLATILITY_STRATEGIES = {'long_straddle', 'long_strangle'}
+
+
 @dataclass
 class OptionsPosition:
     """Represents an open options position (single leg or multi-leg)."""
     ticker: str
-    strategy_type: str  # 'credit_spread' | 'debit_spread' | 'iron_condor' | etc.
-    net_debit: float  # cost (positive) or credit received (negative)
-    max_risk: float
-    max_reward: float
-    entry_ts: datetime
+    strategy_type: str
+    net_debit: float       # positive=paid, negative=credit received
+    max_risk: float        # always positive
+    max_reward: float      # always positive
+    entry_ts: Optional[datetime] = None
+    entry_spot: float = 0.0       # underlying price at entry
     entry_payload: Optional[Any] = None
     exit_price: Optional[float] = None
     exit_ts: Optional[datetime] = None
     exit_reason: Optional[str] = None
+    bars_held: int = 0
+    total_dte: int = 30           # DTE at entry
+    pnl: float = 0.0
+
+    @property
+    def is_credit(self) -> bool:
+        return self.strategy_type in _CREDIT_STRATEGIES
+
+    @property
+    def is_debit(self) -> bool:
+        return self.strategy_type in _DEBIT_STRATEGIES
+
+    @property
+    def profit_target_pct(self) -> float:
+        if self.is_credit:
+            return 0.50   # close at 50% of max_reward
+        elif self.strategy_type in _VOLATILITY_STRATEGIES:
+            return 0.60
+        return 0.80       # debit: close at 80%
+
+    @property
+    def stop_loss_pct(self) -> float:
+        return 0.50       # close at 50% of max_risk loss
 
 
 class FillSimulator:
@@ -197,21 +231,36 @@ class FillSimulator:
             else:
                 self.pending_pop = new_pending
 
-        # 2. Check for options entries (simplified: fill at next bar open)
+        # 2. Fill pending options entries
         new_pending_options = []
         for payload in self.pending_options:
             if payload.ticker == ticker:
+                strategy_type = str(payload.strategy_type) if hasattr(payload, 'strategy_type') else 'unknown'
+                dte = 30
+                if hasattr(payload, 'expiry_date') and payload.expiry_date:
+                    try:
+                        from datetime import date as _date
+                        exp = _date.fromisoformat(str(payload.expiry_date))
+                        dte = max((exp - _date.today()).days, 1)
+                    except (ValueError, TypeError):
+                        dte = 30
+
                 opt_pos = OptionsPosition(
                     ticker=ticker,
-                    strategy_type=payload.option_type if hasattr(payload, 'option_type') else 'unknown',
+                    strategy_type=strategy_type,
                     net_debit=payload.net_debit,
                     max_risk=payload.max_risk,
                     max_reward=payload.max_reward,
                     entry_ts=None,
+                    entry_spot=c,  # underlying price at entry
                     entry_payload=payload,
+                    total_dte=dte,
                 )
                 self.open_positions['options'].append(opt_pos)
-                log.debug(f"[FillSim] Filled options entry: {ticker}")
+                log.debug("[FillSim] Filled options entry: %s %s cost=$%.2f",
+                          ticker, strategy_type, payload.net_debit)
+                for cb in self._entry_callbacks.get('options', []):
+                    cb(ticker)
             else:
                 new_pending_options.append(payload)
         self.pending_options = new_pending_options
@@ -257,20 +306,48 @@ class FillSimulator:
 
             self.open_positions[layer_name] = remaining
 
-        # 4. Check options exit (simplified: 50% max_reward or 0% max_risk)
+        # 4. Check options exits with realistic P&L model
         options_remaining = []
         for opt_pos in self.open_positions.get('options', []):
             if opt_pos.ticker != ticker or opt_pos.exit_reason is not None:
                 options_remaining.append(opt_pos)
                 continue
-            # Options exit at close: target 50% of max_reward or loss of max_risk
-            # Simplified: exit at close
+
+            opt_pos.bars_held += 1
+
+            # Estimate current P&L based on underlying move + time decay
+            current_pnl = self._estimate_options_pnl(opt_pos, c)
+
+            # Check profit target
+            target = opt_pos.max_reward * opt_pos.profit_target_pct
+            if current_pnl >= target:
+                opt_pos.pnl = current_pnl
+                self._close_options_position(opt_pos, 'profit_target')
+                continue
+
+            # Check stop loss
+            max_loss = opt_pos.max_risk * opt_pos.stop_loss_pct
+            if current_pnl <= -max_loss:
+                opt_pos.pnl = current_pnl
+                self._close_options_position(opt_pos, 'stop_loss')
+                continue
+
+            # Check DTE (close at 10 DTE equivalent in bars: ~10*6.5hrs*60min = 3900 bars)
+            # Simplified: close after holding 75% of total_dte in bars (390 bars/day)
+            bars_per_day = 390
+            dte_remaining = opt_pos.total_dte - (opt_pos.bars_held / bars_per_day)
+            if dte_remaining <= 10:
+                opt_pos.pnl = current_pnl
+                self._close_options_position(opt_pos, 'dte_close')
+                continue
+
+            # EOD close on last bar (for intraday backtest)
             if is_eod:
-                exit_price = c
-                pnl = (exit_price - opt_pos.net_debit) if opt_pos.net_debit > 0 else (opt_pos.net_debit - exit_price)
-                self._close_options_position(opt_pos, 'eod')
-            else:
-                options_remaining.append(opt_pos)
+                # Don't force close — options span multiple days
+                # Only close if this is the last session day
+                pass
+
+            options_remaining.append(opt_pos)
         self.open_positions['options'] = options_remaining
 
         # 5. EOD close
@@ -323,15 +400,77 @@ class FillSimulator:
         for cb in self._close_callbacks.get(layer, []):
             cb(pos.ticker)
 
+    def _estimate_options_pnl(self, opt_pos: OptionsPosition, current_spot: float) -> float:
+        """
+        Estimate current P&L for an options position based on underlying movement + time decay.
+
+        Simplified model (no full Black-Scholes repricing):
+        - Directional component: how much did underlying move relative to position's strikes
+        - Time decay component: linear theta decay over DTE
+        - Combined to approximate position value
+        """
+        if opt_pos.entry_spot <= 0:
+            return 0.0
+
+        move_pct = (current_spot - opt_pos.entry_spot) / opt_pos.entry_spot
+        bars_per_day = 390
+        days_held = opt_pos.bars_held / bars_per_day
+        time_decay_pct = min(days_held / max(opt_pos.total_dte, 1), 1.0)
+
+        if opt_pos.is_credit:
+            # Credit strategy profits from: time decay + underlying staying in range
+            # Loses from: large move in either direction
+            theta_gain = opt_pos.max_reward * time_decay_pct * 0.7  # 70% of linear decay
+            # Direction penalty: larger moves = more loss
+            direction_penalty = abs(move_pct) * opt_pos.max_risk * 3.0
+            return theta_gain - direction_penalty
+
+        elif opt_pos.strategy_type in _VOLATILITY_STRATEGIES:
+            # Volatility plays profit from large moves, lose from time decay
+            direction_gain = abs(move_pct) * opt_pos.max_reward * 2.0
+            theta_loss = opt_pos.max_risk * time_decay_pct * 0.5
+            return direction_gain - theta_loss
+
+        else:
+            # Debit/directional: profit from move in right direction, lose from theta
+            if opt_pos.strategy_type in ('long_call', 'bull_call_spread'):
+                direction_gain = max(move_pct, 0) * opt_pos.max_reward * 2.5
+            elif opt_pos.strategy_type in ('long_put', 'bear_put_spread'):
+                direction_gain = max(-move_pct, 0) * opt_pos.max_reward * 2.5
+            else:
+                direction_gain = abs(move_pct) * opt_pos.max_reward * 1.5
+
+            theta_loss = opt_pos.max_risk * time_decay_pct * 0.4
+            return direction_gain - theta_loss
+
     def _close_options_position(self, opt_pos: OptionsPosition, reason: str) -> None:
         """Close an options position and record the trade."""
-        pnl = 0.0  # Simplified
+        pnl = opt_pos.pnl
         opt_pos.exit_reason = reason
+
+        # Also record as ClosedTrade for unified metrics
+        trade = ClosedTrade(
+            ticker=opt_pos.ticker,
+            layer='options',
+            strategy_name=opt_pos.strategy_type,
+            entry_ts=opt_pos.entry_ts,
+            exit_ts=opt_pos.exit_ts,
+            side=PositionSide.LONG,  # options don't have simple long/short
+            entry_price=abs(opt_pos.net_debit),
+            exit_price=abs(opt_pos.net_debit) + pnl,
+            qty=1,
+            exit_reason=reason,
+            pnl=pnl,
+            pnl_pct=pnl / opt_pos.max_risk if opt_pos.max_risk > 0 else 0,
+        )
+        self.closed_trades.append(trade)
         self.closed_options.append(opt_pos)
         self.cumulative_pnl += pnl
         self.current_equity += pnl
 
-        # Call close callbacks
+        log.debug("[FillSim] Closed options %s %s: %s pnl=$%.2f",
+                  opt_pos.ticker, opt_pos.strategy_type, reason, pnl)
+
         for cb in self._close_callbacks.get('options', []):
             cb(opt_pos.ticker)
 

@@ -75,10 +75,21 @@ class SignalAction(str, Enum):
     SELL_RSI     = 'SELL_RSI'
     SELL_VWAP    = 'SELL_VWAP'
     PARTIAL_SELL = 'PARTIAL_SELL'
+    PARTIAL_DONE = 'PARTIAL_DONE'
     HOLD         = 'HOLD'
 
     def __str__(self) -> str:
         return self.value
+
+    @classmethod
+    def _missing_(cls, value):
+        """Accept lowercase/mixed-case strings: 'partial_sell' → PARTIAL_SELL."""
+        if isinstance(value, str):
+            upper = value.upper()
+            for member in cls:
+                if member.value == upper:
+                    return member
+        return None
 
 
 class PositionAction(str, Enum):

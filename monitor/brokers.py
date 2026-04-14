@@ -225,6 +225,23 @@ class AlpacaBroker(BaseBroker):
         # Idempotent client order ID — prevents duplicate sells on retry
         client_order_id = f"th-sell-{p.ticker}-{uuid.uuid4().hex[:8]}"
 
+        # Cancel any pending buy orders for this ticker to avoid wash trade rejection
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            open_orders = self._client.get_orders(
+                filter=GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN,
+                    symbols=[p.ticker],
+                )
+            )
+            for oo in open_orders:
+                if str(getattr(oo, 'side', '')).lower() == 'buy':
+                    self._client.cancel_order_by_id(str(oo.id))
+                    log.info(f"Cancelled pending BUY order {oo.id} for {p.ticker} before SELL (wash trade prevention)")
+        except Exception as cancel_err:
+            log.warning(f"Could not cancel pending orders for {p.ticker}: {cancel_err}")
+
         try:
             req   = MarketOrderRequest(
                 symbol=p.ticker,

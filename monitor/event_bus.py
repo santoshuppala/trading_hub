@@ -155,7 +155,7 @@ _WALL_CLOCK = WallClockTimeSource()
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 
-SLOW_THRESHOLD_SEC        = 0.10
+SLOW_THRESHOLD_SEC        = 0.50   # 500ms (was 100ms — too noisy with API calls in handlers)
 CIRCUIT_BREAKER_THRESHOLD = 5
 CIRCUIT_BREAKER_COOLDOWN  = 60.0
 LATENCY_WINDOW            = 100

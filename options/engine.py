@@ -2,14 +2,18 @@
 T3.7 — Options Engine
 
 Main orchestrator for options trading subsystem.
+Handles entry selection, execution, position monitoring, and exit management.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, date
+from typing import Dict, List, Optional, Tuple
 
 from monitor.event_bus import Event, EventBus, EventType
 from monitor.events import OptionsSignalPayload, SignalAction
@@ -17,41 +21,115 @@ from monitor.position_registry import registry
 
 from .broker import AlpacaOptionsBroker
 from .chain import AlpacaOptionChainClient
-from .risk import OptionsRiskGate, LAYER_NAME
+from .earnings_calendar import EarningsCalendar
+from .iv_tracker import IVTracker
+from .risk import OptionsRiskGate
 from .selector import OptionStrategySelector
 from .strategies import STRATEGY_REGISTRY
+from .strategies.base import OptionsTradeSpec
 
 log = logging.getLogger(__name__)
 
-# Minimum bars before running neutral/volatility scan
 _MIN_BARS: int = 52
+
+# ── Exit management thresholds ──────────────────────────────────────────────
+# Profit targets (fraction of max_reward to capture before closing)
+PROFIT_TARGET_CREDIT  = 0.50   # credit strategies: close at 50% of max reward
+PROFIT_TARGET_DEBIT   = 0.80   # debit strategies: close at 80% of max reward (don't be greedy)
+PROFIT_TARGET_VOLAT   = 0.60   # volatility strategies: close at 60% of max reward
+
+# Stop losses (fraction of max_risk at which to cut)
+STOP_LOSS_FRACTION    = 0.50   # close if unrealised loss >= 50% of max_risk (was 80%, too late)
+
+# DTE thresholds
+DTE_CLOSE_THRESHOLD   = 10    # close any position with <= 10 DTE (was 7, gamma risk)
+DTE_ROLL_THRESHOLD    = 14    # consider rolling at 14 DTE (credit strategies)
+
+# Theta bleed: close if position lost > X% of entry cost with DTE still remaining
+THETA_BLEED_PCT       = 0.60   # close if lost 60% of value with 15+ DTE left
+THETA_BLEED_MIN_DTE   = 15
+
+# Position monitoring interval (seconds) — checked on every BAR
+_MONITOR_COOLDOWN     = 30.0   # don't re-check same ticker faster than 30s
+
+# Strategy categories for exit logic
+_CREDIT_STRATEGIES = {
+    'bull_put_spread', 'bear_call_spread',
+    'iron_condor', 'iron_butterfly',
+}
+_DEBIT_STRATEGIES = {
+    'long_call', 'long_put',
+    'bull_call_spread', 'bear_put_spread',
+    'butterfly_spread',
+}
+_VOLATILITY_STRATEGIES = {
+    'long_straddle', 'long_strangle',
+}
+_TIME_STRATEGIES = {
+    'calendar_spread', 'diagonal_spread',
+}
+
+
+@dataclass
+class OptionsPosition:
+    """Tracked open options position with full lifecycle data."""
+    ticker:           str
+    strategy_type:    str
+    spec:             OptionsTradeSpec
+    entry_time:       float            # monotonic timestamp
+    entry_cost:       float            # net_debit (positive=paid, negative=credit)
+    max_risk:         float
+    max_reward:       float
+    expiry_date:      str              # ISO date 'YYYY-MM-DD'
+
+    # Updated on each monitoring pass
+    current_value:    float = 0.0      # current mid-market value of the position
+    current_pnl:      float = 0.0      # unrealised P&L
+    last_check_time:  float = 0.0      # monotonic timestamp of last exit check
+    portfolio_delta:  float = 0.0      # net delta of this position
+    portfolio_theta:  float = 0.0      # net theta (daily decay)
+    portfolio_vega:   float = 0.0      # net vega (IV sensitivity)
+
+    @property
+    def is_credit(self) -> bool:
+        return self.strategy_type in _CREDIT_STRATEGIES
+
+    @property
+    def is_debit(self) -> bool:
+        return self.strategy_type in _DEBIT_STRATEGIES
+
+    @property
+    def is_volatility(self) -> bool:
+        return self.strategy_type in _VOLATILITY_STRATEGIES
+
+    @property
+    def dte(self) -> int:
+        try:
+            exp = date.fromisoformat(self.expiry_date)
+            return max((exp - date.today()).days, 0)
+        except (ValueError, TypeError):
+            return 999
+
+    @property
+    def profit_target(self) -> float:
+        if self.is_credit:
+            return PROFIT_TARGET_CREDIT
+        elif self.is_volatility:
+            return PROFIT_TARGET_VOLAT
+        return PROFIT_TARGET_DEBIT
+
+    @property
+    def holding_minutes(self) -> float:
+        return (time.monotonic() - self.entry_time) / 60.0
 
 
 class OptionsEngine:
     """
-    T3.7 — Options Engine.
+    T3.7 — Options Engine with full lifecycle management.
 
-    Subscribes to:
-      - EventType.SIGNAL  (from StrategyEngine) — directional options
-      - EventType.BAR     (direct scan)         — neutral/volatility options
-
-    Pipeline (SIGNAL path):
-      SIGNAL → OptionStrategySelector.select_from_signal()
-             → selected strategy type
-             → OptionsRiskGate.check()
-             → AlpacaOptionChainClient.get_chain()
-             → strategy.build() → OptionsTradeSpec
-             → emit OPTIONS_SIGNAL (durable audit)
-             → AlpacaOptionsBroker.execute()
-
-    Pipeline (BAR path):
-      BAR → compute RSI/ATR/RVOL
-          → OptionStrategySelector.select_from_bar()
-          → same risk + chain + build + emit + execute path
-
-    Credentials: APCA_OPTIONS_KEY / APCA_OPTIONS_SECRET (separate account).
-    Budget: $10K total, $500 per trade, max 5 concurrent positions.
-    Position isolation: layer='options' in GlobalPositionRegistry.
+    Entry:  SIGNAL path (directional) + BAR path (neutral/volatility)
+    Exit:   Profit target, stop loss, DTE management, theta bleed, EOD close
+    Monitor: Greeks tracking, position valuation on every bar
     """
 
     def __init__(
@@ -79,14 +157,14 @@ class OptionsEngine:
         self._delta_spread     = delta_spread
         self._alert_email      = alert_email
 
-        # ── Option chain client (read-only, data only) ──────────────────
+        # ── Option chain client ────────────────────────────────────────
         if options_key and options_secret:
             self._chain = AlpacaOptionChainClient(options_key, options_secret)
         else:
             self._chain = None
             log.warning("[OptionsEngine] No options keys — chain client unavailable; paper mode only")
 
-        # ── Risk gate (independent) ─────────────────────────────────────
+        # ── Risk gate ──────────────────────────────────────────────────
         self._risk = OptionsRiskGate(
             max_positions=max_positions,
             trade_budget=trade_budget,
@@ -94,10 +172,16 @@ class OptionsEngine:
             order_cooldown=order_cooldown,
         )
 
-        # ── Selector ────────────────────────────────────────────────────
+        # ── IV tracker (historical IV rank/percentile) ─────────────────
+        self._iv_tracker = IVTracker()
+
+        # ── Earnings calendar (block premium selling near earnings) ───
+        self._earnings = EarningsCalendar()
+
+        # ── Selector ──────────────────────────────────────────────────
         self._selector = OptionStrategySelector()
 
-        # ── Broker (dedicated options account) ──────────────────────────
+        # ── Broker ─────────────────────────────────────────────────────
         if options_key and options_secret:
             try:
                 from alpaca.trading.client import TradingClient
@@ -113,13 +197,22 @@ class OptionsEngine:
         else:
             self._broker = None
 
-        # ── Open positions tracking (for exit management) ────────────────
-        # ticker → {'spec': OptionsTradeSpec, 'entry_time': float, 'cost': float}
-        self._positions: Dict[str, dict] = {}
+        # ── Open positions (full lifecycle tracking) ───────────────────
+        self._positions: Dict[str, OptionsPosition] = {}
         self._positions_lock = threading.Lock()
 
-        # ── Subscribe ───────────────────────────────────────────────────
-        # priority=3: runs after StrategyEngine(1), ProSetupEngine(2), PopStrategyEngine
+        # ── Portfolio-level Greeks ─────────────────────────────────────
+        self._portfolio_delta = 0.0
+        self._portfolio_theta = 0.0
+        self._portfolio_vega  = 0.0
+        self._portfolio_lock  = threading.Lock()
+
+        # ── Daily stats ────────────────────────────────────────────────
+        self._daily_entries  = 0
+        self._daily_exits    = 0
+        self._daily_pnl      = 0.0
+
+        # ── Subscribe ──────────────────────────────────────────────────
         bus.subscribe(EventType.SIGNAL, self._on_signal, priority=3)
         bus.subscribe(EventType.BAR,    self._on_bar,    priority=3)
 
@@ -131,19 +224,14 @@ class OptionsEngine:
             paper, "OK" if self._chain else "NONE", "OK" if self._broker else "NONE",
         )
 
-    # ── SIGNAL handler ────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SIGNAL HANDLER — Directional entries
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _on_signal(self, event: Event) -> None:
-        """
-        Convert an equity SIGNAL into an options trade if appropriate.
-
-        Key guard: only acts on SignalAction.BUY and SELL_* signals.
-        HOLD and PARTIAL_SELL are ignored.
-        """
-        p = event.payload   # SignalPayload
+        p = event.payload
         action = str(p.action)
 
-        # Only react to directional entry/exit signals
         if action not in (
             SignalAction.BUY.value,
             SignalAction.SELL_STOP.value,
@@ -156,8 +244,11 @@ class OptionsEngine:
         if self._chain is None:
             return
 
-        # Estimate IV from chain before selection (lightweight spot check)
         iv_estimate = self._estimate_iv(p.ticker, p.current_price)
+
+        # Update IV tracker with current reading
+        self._iv_tracker.update(p.ticker, iv_estimate)
+        iv_rank = self._iv_tracker.iv_rank(p.ticker)
 
         strategy_type = self._selector.select_from_signal(
             action=action,
@@ -166,12 +257,28 @@ class OptionsEngine:
             atr_value=p.atr_value,
             spot_price=p.current_price,
             iv_estimate=iv_estimate,
+            iv_rank=iv_rank,
         )
 
         if strategy_type is None:
             return
 
-        self._execute_strategy(
+        # Earnings safety check: block credit strategies near earnings
+        if strategy_type in _CREDIT_STRATEGIES:
+            if not self._earnings.is_earnings_safe(p.ticker, min_days=7):
+                dte = self._earnings.days_to_earnings(p.ticker)
+                log.info(
+                    "[OptionsEngine] EARNINGS BLOCK %s %s | earnings in %s days",
+                    p.ticker, strategy_type, dte,
+                )
+                return
+
+        log.info(
+            "[OptionsEngine] SIGNAL → %s %s | rvol=%.2f iv=%.2f iv_rank=%.0f",
+            p.ticker, strategy_type, p.rvol, iv_estimate, iv_rank,
+        )
+
+        self._execute_entry(
             ticker=p.ticker,
             spot_price=p.current_price,
             strategy_type=strategy_type,
@@ -182,40 +289,43 @@ class OptionsEngine:
             source_event=event,
         )
 
-    # ── BAR handler ──────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # BAR HANDLER — Exit monitoring FIRST, then neutral/volatility scan
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _on_bar(self, event: Event) -> None:
-        """
-        Independent neutral/volatility scan on every bar.
-        Only runs when SIGNAL path has not already committed to this ticker.
-        """
-        p = event.payload   # BarPayload
+        p = event.payload
         df = p.df
 
         if len(df) < _MIN_BARS:
             return
 
+        spot = float(df['close'].iloc[-1])
+
+        # ── STEP 1: Monitor existing positions for exits ──────────────
+        self._monitor_positions(p.ticker, spot)
+
+        # ── STEP 2: Scan for new neutral/volatility entries ───────────
         if self._chain is None:
             return
 
-        # Compute indicators locally (mirrors ProSetupEngine pattern)
         try:
-            # Try to import compute helpers (may not exist yet)
             from pro_setups.detectors._compute import compute_atr, compute_rsi, compute_rvol
             atr_value = compute_atr(df)
             rsi_value = compute_rsi(df)
             rvol = compute_rvol(df, p.rvol_df)
         except (ImportError, Exception):
-            # Fallback: use basic TA if helpers not available
-            atr_value = 0.5  # placeholder
-            rsi_value = 50.0  # neutral
-            rvol = 1.0  # neutral
-
-        spot = float(df['close'].iloc[-1])
+            atr_value = 0.5
+            rsi_value = 50.0
+            rvol = 1.0
 
         iv_estimate = self._estimate_iv(p.ticker, spot)
 
-        has_pos = registry.is_held(p.ticker)
+        # Update IV tracker
+        self._iv_tracker.update(p.ticker, iv_estimate)
+        iv_rank = self._iv_tracker.iv_rank(p.ticker)
+
+        has_pos = p.ticker in self._positions
 
         strategy_type = self._selector.select_from_bar(
             atr_value=atr_value,
@@ -224,12 +334,29 @@ class OptionsEngine:
             rsi=rsi_value,
             rvol=rvol,
             has_existing_position=has_pos,
+            iv_rank=iv_rank,
         )
 
         if strategy_type is None:
             return
 
-        self._execute_strategy(
+        # Earnings safety check for credit strategies
+        if strategy_type in _CREDIT_STRATEGIES:
+            if not self._earnings.is_earnings_safe(p.ticker, min_days=7):
+                dte = self._earnings.days_to_earnings(p.ticker)
+                log.info(
+                    "[OptionsEngine] EARNINGS BLOCK %s %s | earnings in %s days",
+                    p.ticker, strategy_type, dte,
+                )
+                return
+
+        log.info(
+            "[OptionsEngine] BAR → %s %s | atr_ratio=%.4f rsi=%.1f iv=%.2f iv_rank=%.0f",
+            p.ticker, strategy_type, atr_value / spot if spot > 0 else 0,
+            rsi_value, iv_estimate, iv_rank,
+        )
+
+        self._execute_entry(
             ticker=p.ticker,
             spot_price=spot,
             strategy_type=strategy_type,
@@ -240,9 +367,218 @@ class OptionsEngine:
             source_event=event,
         )
 
-    # ── Core execution path ──────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # POSITION MONITORING — Exit management on every bar
+    # ═══════════════════════════════════════════════════════════════════════════
 
-    def _execute_strategy(
+    def _monitor_positions(self, ticker: str, spot: float) -> None:
+        """Check if any open position on this ticker needs exit."""
+        # Take a snapshot under lock to avoid race conditions
+        with self._positions_lock:
+            pos = self._positions.get(ticker)
+            if pos is None:
+                return
+
+            now = time.monotonic()
+            if now - pos.last_check_time < _MONITOR_COOLDOWN:
+                return
+            pos.last_check_time = now
+
+            # Copy reference — pos is still in dict, safe to evaluate outside lock
+            # because only this thread processes this ticker's bars
+
+        self._update_position_greeks(pos)
+        exit_reason = self._evaluate_exit(pos, spot)
+
+        if exit_reason:
+            # Re-check under lock that position still exists before closing
+            with self._positions_lock:
+                if ticker not in self._positions:
+                    return
+            self._close_position(pos, exit_reason, spot)
+
+    def _evaluate_exit(self, pos: OptionsPosition, spot: float) -> Optional[str]:
+        """
+        Evaluate all exit conditions for a position. Returns exit reason or None.
+
+        Exit priority (first match wins):
+        1. DTE ≤ 7 → close to avoid gamma risk / assignment
+        2. Profit target hit → take profits
+        3. Stop loss hit → cut losses
+        4. Theta bleed → position decaying without recovery
+        """
+        # ── 1. DTE management ─────────────────────────────────────────
+        dte = pos.dte
+        if dte <= DTE_CLOSE_THRESHOLD:
+            return f"dte_expiry (DTE={dte})"
+
+        # ── 2. Get current mark-to-market ─────────────────────────────
+        close_value = self._get_position_mark(pos)
+        if close_value is None:
+            return None
+
+        pos.current_value = close_value
+
+        # P&L = what you get closing now - what you paid opening
+        # Debit entry: entry_cost=+$200, close_value=+$300 → pnl=+$100 (profit)
+        # Credit entry: entry_cost=-$140, close_value=-$80  → pnl=+$60 (kept $60 of credit)
+        # Credit entry: entry_cost=-$140, close_value=-$250 → pnl=-$110 (loss, costs more to close)
+        pos.current_pnl = close_value - pos.entry_cost
+
+        # ── 3. Profit target ──────────────────────────────────────────
+        target_pnl = pos.max_reward * pos.profit_target
+        if pos.current_pnl >= target_pnl:
+            return f"profit_target (pnl=${pos.current_pnl:.2f} >= target=${target_pnl:.2f})"
+
+        # ── 4. Stop loss ──────────────────────────────────────────────
+        max_loss = pos.max_risk * STOP_LOSS_FRACTION
+        if pos.current_pnl <= -max_loss:
+            return f"stop_loss (pnl=${pos.current_pnl:.2f} <= -${max_loss:.2f})"
+
+        # ── 5. Theta bleed (debit positions losing value over time) ───
+        if pos.is_debit and dte >= THETA_BLEED_MIN_DTE and pos.entry_cost > 0 and close_value > 0:
+            remaining_value_pct = close_value / pos.entry_cost
+            if remaining_value_pct <= (1.0 - THETA_BLEED_PCT):
+                return f"theta_bleed (only {remaining_value_pct:.0%} of value left, {dte} DTE)"
+
+        # ── 6. DTE rolling threshold (credit strategies) ──────────────
+        if pos.is_credit and dte <= DTE_ROLL_THRESHOLD:
+            if pos.current_pnl > 0:
+                return f"dte_roll_profit (DTE={dte}, pnl=${pos.current_pnl:.2f})"
+
+        return None
+
+    def _get_position_mark(self, pos: OptionsPosition) -> Optional[float]:
+        """
+        Get current mark-to-market value of the position.
+
+        Returns the NET value if you closed RIGHT NOW:
+        - Positive = you'd receive money (position is worth something to sell)
+        - Negative = you'd pay money (position costs to close)
+
+        For a long call worth $3.00 → returns +300
+        For a short put costing $2.00 to close → returns -200
+        For a bull call spread (long $3, short $1.50) → returns +150
+        For an iron condor (cost to close $0.40 credit) → returns -40
+        """
+        if not self._chain:
+            return None
+
+        close_value = 0.0
+        for leg in pos.spec.legs:
+            quote = self._chain.get_quote(leg.symbol)
+            if quote is None:
+                return None
+
+            bid, ask = quote
+
+            if leg.side.upper() == 'BUY':
+                # We own this: to close we sell at bid
+                close_value += bid * leg.qty * 100
+            else:
+                # We're short this: to close we buy at ask
+                close_value -= ask * leg.qty * 100
+
+        return close_value
+
+    def _update_position_greeks(self, pos: OptionsPosition) -> None:
+        """Update Greeks for a single position from current chain data."""
+        if not self._chain:
+            return
+
+        net_delta = 0.0
+        net_theta = 0.0
+        net_vega  = 0.0
+
+        for leg in pos.spec.legs:
+            quote = self._chain.get_quote(leg.symbol)
+            if quote is None:
+                continue
+
+            # get_quote returns (bid, ask) — we need Greeks from the contract
+            contracts = self._chain.get_chain(pos.ticker, min_dte=1, max_dte=500)
+            contract = next((c for c in contracts if c.symbol == leg.symbol), None)
+            if contract is None:
+                continue
+
+            multiplier = leg.qty * (1 if leg.side.upper() == 'BUY' else -1)
+            net_delta += contract.delta * multiplier * 100
+            net_theta += contract.theta * multiplier * 100
+            net_vega  += contract.vega * multiplier * 100
+
+        pos.portfolio_delta = net_delta
+        pos.portfolio_theta = net_theta
+        pos.portfolio_vega  = net_vega
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # POSITION CLOSE — Execute exit and clean up
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _close_position(
+        self, pos: OptionsPosition, reason: str, spot: float,
+    ) -> None:
+        """Close an open position and clean up all state."""
+        ticker = pos.ticker
+
+        log.info(
+            "[OptionsEngine] CLOSING %s %s | reason=%s | pnl=$%.2f | held=%.1fmin | dte=%d",
+            ticker, pos.strategy_type, reason,
+            pos.current_pnl, pos.holding_minutes, pos.dte,
+        )
+
+        # Execute close via broker
+        success = True
+        if self._broker:
+            success = self._broker.close_position(ticker, pos.spec.legs)
+
+        if success:
+            # Update daily stats
+            self._daily_exits += 1
+            self._daily_pnl += pos.current_pnl
+
+            # Release from risk gate
+            self._risk.release(ticker)
+
+            # Remove from positions
+            with self._positions_lock:
+                self._positions.pop(ticker, None)
+
+            # Update portfolio Greeks
+            self._recalculate_portfolio_greeks()
+
+            log.info(
+                "[OptionsEngine] CLOSED %s %s | realised_pnl=$%.2f | "
+                "daily_pnl=$%.2f | daily_trades=%d/%d",
+                ticker, pos.strategy_type, pos.current_pnl,
+                self._daily_pnl, self._daily_exits, self._daily_entries,
+            )
+        else:
+            log.error(
+                "[OptionsEngine] CLOSE FAILED %s %s | reason=%s — position remains open",
+                ticker, pos.strategy_type, reason,
+            )
+
+    def close_all_positions(self, reason: str = 'eod_close') -> None:
+        """Close all open positions (called at end of day or emergency)."""
+        with self._positions_lock:
+            tickers = list(self._positions.keys())
+
+        for ticker in tickers:
+            pos = self._positions.get(ticker)
+            if pos:
+                self._close_position(pos, reason, spot=0.0)
+
+        log.info(
+            "[OptionsEngine] ALL POSITIONS CLOSED | reason=%s | "
+            "daily_pnl=$%.2f | entries=%d exits=%d",
+            reason, self._daily_pnl, self._daily_entries, self._daily_exits,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ENTRY EXECUTION
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _execute_entry(
         self,
         ticker:        str,
         spot_price:    float,
@@ -254,34 +590,30 @@ class OptionsEngine:
         source_event:  Event,
     ) -> None:
         """
-        Steps:
-        1. Risk gate check (max_positions, cooldown, budget, registry)
-        2. Fetch option chain via AlpacaOptionChainClient
-        3. Build OptionsTradeSpec via strategy class
-        4. Risk gate acquire (reserve position)
-        5. Emit OPTIONS_SIGNAL (durable=True for Redpanda audit)
-        6. Execute via AlpacaOptionsBroker.execute()
-        7. On failure: release from risk gate
+        Full entry pipeline:
+        1. Risk gate check
+        2. Build trade spec via strategy
+        3. Risk gate verify with actual max_risk
+        4. Emit OPTIONS_SIGNAL (durable)
+        5. Acquire position in risk gate
+        6. Execute via broker
+        7. Track position for monitoring
         """
-        # Step 1: Risk gate check
+        # Step 1: Pre-check risk gate
         reject_reason = self._risk.check(ticker, max_risk=self._risk._trade_budget)
         if reject_reason:
-            log.debug(f"[OptionsEngine] {ticker} {strategy_type} BLOCKED: {reject_reason}")
+            log.debug("[OptionsEngine] %s %s BLOCKED: %s", ticker, strategy_type, reject_reason)
             return
 
-        # Step 2: Get strategy class
+        # Step 2: Get strategy class and build
         if strategy_type not in STRATEGY_REGISTRY:
-            log.warning(f"[OptionsEngine] unknown strategy type: {strategy_type}")
+            log.warning("[OptionsEngine] unknown strategy type: %s", strategy_type)
             return
 
-        strategy_class = STRATEGY_REGISTRY[strategy_type]
-        strategy = strategy_class()
-
-        # Step 3: Build trade spec
         if not self._chain:
-            log.debug(f"[OptionsEngine] no chain client available")
             return
 
+        strategy = STRATEGY_REGISTRY[strategy_type]()
         trade_spec = strategy.build(
             ticker=ticker,
             underlying_price=spot_price,
@@ -293,68 +625,114 @@ class OptionsEngine:
         )
 
         if trade_spec is None:
-            log.debug(f"[OptionsEngine] {ticker} {strategy_type} build returned None")
+            log.debug("[OptionsEngine] %s %s build returned None", ticker, strategy_type)
             return
 
-        # Step 4: Verify risk gate one more time with actual max_risk
+        # Step 3: Verify risk with actual max_risk
         reject_reason = self._risk.check(ticker, max_risk=trade_spec.max_risk)
         if reject_reason:
-            log.debug(f"[OptionsEngine] {ticker} {strategy_type} BLOCKED after build: {reject_reason}")
+            log.debug("[OptionsEngine] %s %s BLOCKED after build: %s", ticker, strategy_type, reject_reason)
             return
 
-        # Step 5: Emit OPTIONS_SIGNAL (durable)
+        # Step 4: Emit durable OPTIONS_SIGNAL
         self._emit_options_signal(
-            ticker=ticker,
-            spot_price=spot_price,
-            strategy_type=strategy_type,
-            trade_spec=trade_spec,
-            atr_value=atr_value,
-            rvol=rvol,
-            rsi_value=rsi_value,
-            source=source,
-            source_event=source_event,
+            ticker=ticker, spot_price=spot_price, strategy_type=strategy_type,
+            trade_spec=trade_spec, atr_value=atr_value, rvol=rvol,
+            rsi_value=rsi_value, source=source, source_event=source_event,
         )
 
-        # Step 6: Acquire position (lock capital)
-        self._risk.acquire(ticker, cost=trade_spec.net_debit)
+        # Step 5: Acquire position in risk gate (track max_risk, not just cost)
+        self._risk.acquire(ticker, cost=trade_spec.net_debit, max_risk=trade_spec.max_risk)
 
-        # Track position
-        with self._positions_lock:
-            self._positions[ticker] = {
-                'spec': trade_spec,
-                'entry_time': time.time(),
-                'cost': trade_spec.net_debit,
-            }
-
-        # Step 7: Execute trade
+        # Step 6: Execute trade
+        success = True
         if self._broker:
             success = self._broker.execute(trade_spec, source_event)
-            if not success:
-                log.error(f"[OptionsEngine] execution failed for {ticker}; releasing position")
-                self._risk.release(ticker)
-                with self._positions_lock:
-                    self._positions.pop(ticker, None)
+
+        if not success:
+            log.error("[OptionsEngine] execution failed for %s; releasing position", ticker)
+            self._risk.release(ticker)
+            return
+
+        # Step 7: Track position for monitoring
+        pos = OptionsPosition(
+            ticker=ticker,
+            strategy_type=strategy_type,
+            spec=trade_spec,
+            entry_time=time.monotonic(),
+            entry_cost=trade_spec.net_debit,
+            max_risk=trade_spec.max_risk,
+            max_reward=trade_spec.max_reward,
+            expiry_date=trade_spec.expiry_date,
+            current_value=abs(trade_spec.net_debit),
+            last_check_time=time.monotonic(),
+        )
+
+        with self._positions_lock:
+            self._positions[ticker] = pos
+
+        self._daily_entries += 1
+        self._recalculate_portfolio_greeks()
+
+        log.info(
+            "[OptionsEngine] ENTERED %s %s | cost=$%.2f | max_risk=$%.2f | "
+            "max_reward=$%.2f | dte=%d | positions=%d",
+            ticker, strategy_type, trade_spec.net_debit,
+            trade_spec.max_risk, trade_spec.max_reward,
+            pos.dte, len(self._positions),
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PORTFOLIO GREEKS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _recalculate_portfolio_greeks(self) -> None:
+        """Recalculate aggregate portfolio Greeks from all open positions."""
+        with self._portfolio_lock:
+            self._portfolio_delta = 0.0
+            self._portfolio_theta = 0.0
+            self._portfolio_vega  = 0.0
+
+            with self._positions_lock:
+                for pos in self._positions.values():
+                    self._portfolio_delta += pos.portfolio_delta
+                    self._portfolio_theta += pos.portfolio_theta
+                    self._portfolio_vega  += pos.portfolio_vega
+
+    @property
+    def portfolio_greeks(self) -> Dict[str, float]:
+        """Current portfolio-level Greeks summary."""
+        with self._portfolio_lock:
+            return {
+                'delta': self._portfolio_delta,
+                'theta': self._portfolio_theta,
+                'vega':  self._portfolio_vega,
+            }
+
+    @property
+    def daily_stats(self) -> Dict[str, float]:
+        """Current day's trading statistics."""
+        return {
+            'entries': self._daily_entries,
+            'exits':   self._daily_exits,
+            'pnl':     self._daily_pnl,
+            'open':    len(self._positions),
+        }
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HELPERS
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _emit_options_signal(
         self,
-        ticker:     str,
-        spot_price: float,
-        strategy_type: str,
-        trade_spec,  # OptionsTradeSpec
-        atr_value:  float,
-        rvol:       float,
-        rsi_value:  float,
-        source:     str,
-        source_event: Event,
+        ticker: str, spot_price: float, strategy_type: str,
+        trade_spec: OptionsTradeSpec, atr_value: float, rvol: float,
+        rsi_value: float, source: str, source_event: Event,
     ) -> None:
-        """Build OptionsSignalPayload, serialize legs to JSON, emit durable=True."""
         legs_list = [
             {
-                'symbol': l.symbol,
-                'side': l.side,
-                'qty': l.qty,
-                'ratio': l.ratio,
-                'limit_price': l.limit_price,
+                'symbol': l.symbol, 'side': l.side,
+                'qty': l.qty, 'ratio': l.ratio, 'limit_price': l.limit_price,
             }
             for l in trade_spec.legs
         ]
@@ -374,31 +752,28 @@ class OptionsEngine:
         )
         self._bus.emit(Event(EventType.OPTIONS_SIGNAL, payload), durable=True)
         log.info(
-            f"[OptionsEngine] emitted OPTIONS_SIGNAL | {ticker} {strategy_type} | "
-            f"${trade_spec.net_debit:.2f} debit | max_risk ${trade_spec.max_risk:.2f}"
+            "[OptionsEngine] emitted OPTIONS_SIGNAL | %s %s | $%.2f debit | max_risk $%.2f",
+            ticker, strategy_type, trade_spec.net_debit, trade_spec.max_risk,
         )
 
     def _estimate_iv(self, ticker: str, spot_price: float) -> float:
-        """
-        Quick IV estimate from the nearest ATM option.
-
-        Returns 0.25 (neutral assumption) on any API error.
-        Falls back gracefully — never blocks strategy selection.
-        """
         if not self._chain:
             return 0.25
-
         try:
             contracts = self._chain.get_chain(ticker, min_dte=self._min_dte, max_dte=self._max_dte)
             if not contracts:
                 return 0.25
-
-            # Find ATM call
             atm_call = self._chain.find_atm(contracts, 'call', spot_price)
             if atm_call and atm_call.iv > 0:
                 return atm_call.iv
-
             return 0.25
         except Exception as e:
-            log.debug(f"[OptionsEngine] IV estimate error for {ticker}: {e}")
+            log.debug("[OptionsEngine] IV estimate error for %s: %s", ticker, e)
             return 0.25
+
+    def reset_daily(self) -> None:
+        """Reset daily counters (called at start of new trading day)."""
+        self._daily_entries = 0
+        self._daily_exits   = 0
+        self._daily_pnl     = 0.0
+        log.info("[OptionsEngine] daily stats reset")

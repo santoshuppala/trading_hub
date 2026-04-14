@@ -155,8 +155,10 @@ class BarDataLoader:
                     log.warning(f"[BarDataLoader] No daily data for {ticker}")
                     continue
 
-                # Normalize columns
-                df.columns = [col.lower() for col in df.columns]
+                # Handle MultiIndex columns (yfinance >= 0.2.31)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(col).lower() for col in df.columns]
                 if 'adj close' in df.columns:
                     df.drop(columns=['adj close'], inplace=True)
 
@@ -194,21 +196,37 @@ class BarDataLoader:
         if (end_date - start_date).days > 60:
             log.warning(f"[BarDataLoader] yfinance 1m data limited to 60 days; requested {(end_date - start_date).days}")
 
+        # yfinance limits 1m data to 7 days per request — batch into chunks
+        chunk_days = 7
+
         for ticker in tickers:
             try:
-                df = yf.download(
-                    ticker,
-                    start=start_date.date(),
-                    end=(end_date + timedelta(days=1)).date(),
-                    interval=interval,
-                    progress=False,
-                )
-                if df.empty:
+                all_dfs = []
+                chunk_start = start_date
+                while chunk_start <= end_date:
+                    chunk_end = min(chunk_start + timedelta(days=chunk_days), end_date + timedelta(days=1))
+                    df = yf.download(
+                        ticker,
+                        start=chunk_start.date(),
+                        end=chunk_end.date(),
+                        interval=interval,
+                        progress=False,
+                    )
+                    if not df.empty:
+                        all_dfs.append(df)
+                    chunk_start += timedelta(days=chunk_days)
+
+                if not all_dfs:
                     log.warning(f"[BarDataLoader] No intraday data for {ticker}")
                     continue
 
-                # Normalize columns
-                df.columns = [col.lower() for col in df.columns]
+                df = pd.concat(all_dfs)
+                df = df[~df.index.duplicated(keep='first')]
+
+                # Handle MultiIndex columns (yfinance >= 0.2.31)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(col).lower() for col in df.columns]
                 if 'adj close' in df.columns:
                     df.drop(columns=['adj close'], inplace=True)
 

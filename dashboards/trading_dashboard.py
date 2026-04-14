@@ -661,6 +661,82 @@ with tab_compliance:
         fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20))
         st.plotly_chart(fig, width='stretch')
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE SESSION MONITOR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader("Live Session Monitor")
+
+
+@st.cache_data(ttl=10)
+def fetch_live_trades(_conn_str, date_str):
+    """Fetch today's closed trades from event_store."""
+    try:
+        conn = psycopg2.connect(_conn_str, connect_timeout=5)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT event_time,
+                   event_payload->>'ticker' as ticker,
+                   (event_payload->>'pnl')::float as pnl,
+                   event_payload->>'reason' as reason
+            FROM event_store
+            WHERE event_type = 'PositionClosed'
+              AND event_time >= %s::date
+              AND event_time < %s::date + interval '1 day'
+            ORDER BY event_time
+        """, (date_str, date_str))
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+live_auto_refresh = st.checkbox("Auto-refresh (10s)", value=False, key="live_auto_refresh")
+if live_auto_refresh:
+    import time as _time
+    _time.sleep(10)
+    st.rerun()
+
+# Get today's date in ET and fetch live trades
+from datetime import datetime as _datetime
+from zoneinfo import ZoneInfo
+_today = _datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')
+
+try:
+    live_rows = fetch_live_trades(DATABASE_URL, _today)
+except Exception:
+    live_rows = []
+
+if live_rows:
+    live_df = pd.DataFrame(live_rows, columns=['time', 'ticker', 'pnl', 'reason'])
+    live_df['cumulative_pnl'] = live_df['pnl'].cumsum()
+
+    live_total_pnl = live_df['pnl'].sum()
+    live_n_trades = len(live_df)
+    live_n_wins = (live_df['pnl'] >= 0).sum()
+    live_win_rate = live_n_wins / live_n_trades * 100 if live_n_trades > 0 else 0
+
+    # KPI cards
+    lc1, lc2, lc3, lc4 = st.columns(4)
+    lc1.metric("Session P&L", f"${live_total_pnl:+.2f}")
+    lc2.metric("Trades", live_n_trades)
+    lc3.metric("Wins", int(live_n_wins))
+    lc4.metric("Win Rate", f"{live_win_rate:.0f}%")
+
+    # Equity curve
+    st.line_chart(live_df.set_index('time')['cumulative_pnl'])
+
+    # Last 10 trades
+    st.dataframe(
+        live_df[['time', 'ticker', 'pnl', 'reason']].tail(10).iloc[::-1],
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.info("No trades yet today. Start the monitor to see live data.")
+
 # ── Footer ───────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.caption(f"Data: {total_trades} trades | {len(all_tickers)} tickers | {selected_date}")

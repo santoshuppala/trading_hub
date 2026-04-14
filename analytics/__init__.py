@@ -1,2 +1,2 @@
-from .attribution import PostTradeAnalytics
+from .attribution import PostTradeAnalytics, StrategyAttributionEngine
 from .compliance import ComplianceReporter

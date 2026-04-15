@@ -116,6 +116,12 @@ OPTIONS_PROFIT_TARGET_DEBIT  = float(os.getenv('OPTIONS_PROFIT_TARGET_DEBIT',  1
 OPTIONS_STOP_LOSS_FRACTION   = float(os.getenv('OPTIONS_STOP_LOSS_FRACTION',   0.80))  # cut at 80% of max risk
 OPTIONS_DTE_CLOSE            = int(os.getenv('OPTIONS_DTE_CLOSE', 7))                  # close at 7 DTE
 
+# ── Portfolio-level risk limits ──────────────────────────────────────────────
+MAX_INTRADAY_DRAWDOWN = float(os.getenv('MAX_INTRADAY_DRAWDOWN', -5000))
+MAX_NOTIONAL_EXPOSURE = float(os.getenv('MAX_NOTIONAL_EXPOSURE', 100000))
+MAX_PORTFOLIO_DELTA   = float(os.getenv('MAX_PORTFOLIO_DELTA', 5.0))
+MAX_PORTFOLIO_GAMMA   = float(os.getenv('MAX_PORTFOLIO_GAMMA', 1.0))
+
 # ── External data APIs ────────────────────────────────────────────────────────
 BENZINGA_API_KEY    = os.getenv('BENZINGA_API_KEY') or os.getenv('BENZENGA_API_KEY', '')
 STOCKTWITS_TOKEN    = os.getenv('STOCKTWITS_TOKEN', '')  # optional — public API works without token

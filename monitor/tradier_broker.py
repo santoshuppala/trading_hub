@@ -62,6 +62,9 @@ class TradierBroker:
 
     def _on_order_req(self, event: Event) -> None:
         """Handle ORDER_REQ events from the bus."""
+        # Check if portfolio risk gate already blocked this order
+        if getattr(event, '_portfolio_blocked', False):
+            return
         p: OrderRequestPayload = event.payload
         side = str(getattr(p, "side", "")).upper()
 

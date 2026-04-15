@@ -52,6 +52,9 @@ class BaseBroker(ABC):
         bus.subscribe(EventType.ORDER_REQ, self._on_order_request)
 
     def _on_order_request(self, event: Event) -> None:
+        # Check if portfolio risk gate already blocked this order
+        if getattr(event, '_portfolio_blocked', False):
+            return
         p: OrderRequestPayload = event.payload
         if p.side == 'BUY':
             self._execute_buy(p)

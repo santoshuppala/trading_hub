@@ -16,7 +16,7 @@ import logging
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from data_sources.persistence import (
     SmartPersistence, CHANGE_DETECTORS,
@@ -43,6 +43,10 @@ class DataSourceCollector:
             writer = self._write_to_db
 
         self._persistence = SmartPersistence(writer_fn=writer)
+
+        # Circuit breaker state
+        self._source_failures: Dict[str, int] = {}  # {source_name: consecutive_failures}
+        self._source_disabled_until: Dict[str, float] = {}  # {source_name: monotonic_time}
 
         # Lazy-init sources (avoid import errors if libraries missing)
         self._sources = {}
@@ -112,6 +116,27 @@ class DataSourceCollector:
         except Exception as exc:
             log.debug("[Collector] Polygon unavailable: %s", exc)
 
+    def _is_source_healthy(self, source_name: str) -> bool:
+        """Check if a source is healthy (circuit breaker)."""
+        disabled_until = self._source_disabled_until.get(source_name, 0)
+        if time.monotonic() < disabled_until:
+            return False
+        if time.monotonic() >= disabled_until and disabled_until > 0:
+            # Cooldown expired — re-enable
+            self._source_failures[source_name] = 0
+            self._source_disabled_until[source_name] = 0
+        return True
+
+    def _record_source_failure(self, source_name: str):
+        count = self._source_failures.get(source_name, 0) + 1
+        self._source_failures[source_name] = count
+        if count >= 3:
+            self._source_disabled_until[source_name] = time.monotonic() + 1800  # 30 min
+            log.warning("[Collector] %s disabled for 30min after %d failures", source_name, count)
+
+    def _record_source_success(self, source_name: str):
+        self._source_failures[source_name] = 0
+
     def collect_session_start(self, tickers: list, max_tickers: int = 20):
         """Collect all data at session start. Runs once pre-market.
 
@@ -166,6 +191,8 @@ class DataSourceCollector:
     # -- Per-source collectors -------------------------------------------------
 
     def _collect_fear_greed(self):
+        if not self._is_source_healthy('fear_greed'):
+            return
         source = self._sources.get('fear_greed')
         if not source:
             return
@@ -176,10 +203,14 @@ class DataSourceCollector:
                     'fear_greed', 'MARKET', data,
                     CHANGE_DETECTORS['fear_greed'],
                 )
+                self._record_source_success('fear_greed')
         except Exception as exc:
+            self._record_source_failure('fear_greed')
             log.debug("[Collector] Fear & Greed failed: %s", exc)
 
     def _collect_fred(self):
+        if not self._is_source_healthy('fred'):
+            return
         source = self._sources.get('fred')
         if not source:
             return
@@ -195,10 +226,14 @@ class DataSourceCollector:
                 'fred_macro', 'MARKET', data,
                 CHANGE_DETECTORS['fred_macro'],
             )
+            self._record_source_success('fred')
         except Exception as exc:
+            self._record_source_failure('fred')
             log.debug("[Collector] FRED failed: %s", exc)
 
     def _collect_yahoo_earnings(self, ticker: str):
+        if not self._is_source_healthy('yahoo_earnings'):
+            return
         source = self._sources.get('yahoo')
         if not source:
             return
@@ -214,10 +249,14 @@ class DataSourceCollector:
                     'yahoo_earnings', ticker, data,
                     CHANGE_DETECTORS['yahoo_earnings'],
                 )
+            self._record_source_success('yahoo_earnings')
         except Exception as exc:
+            self._record_source_failure('yahoo_earnings')
             log.debug("[Collector] Yahoo earnings %s: %s", ticker, exc)
 
     def _collect_yahoo_analyst(self, ticker: str):
+        if not self._is_source_healthy('yahoo_analyst'):
+            return
         source = self._sources.get('yahoo')
         if not source:
             return
@@ -234,10 +273,14 @@ class DataSourceCollector:
                     'yahoo_analyst', ticker, data,
                     CHANGE_DETECTORS['yahoo_analyst'],
                 )
+            self._record_source_success('yahoo_analyst')
         except Exception as exc:
+            self._record_source_failure('yahoo_analyst')
             log.debug("[Collector] Yahoo analyst %s: %s", ticker, exc)
 
     def _collect_finviz_screener(self, ticker: str):
+        if not self._is_source_healthy('finviz_screener'):
+            return
         source = self._sources.get('finviz')
         if not source:
             return
@@ -252,10 +295,14 @@ class DataSourceCollector:
                     'finviz_screener', ticker, data,
                     CHANGE_DETECTORS['finviz_screener'],
                 )
+            self._record_source_success('finviz_screener')
         except Exception as exc:
+            self._record_source_failure('finviz_screener')
             log.debug("[Collector] Finviz screener %s: %s", ticker, exc)
 
     def _collect_finviz_insider(self, ticker: str):
+        if not self._is_source_healthy('finviz_insider'):
+            return
         source = self._sources.get('finviz')
         if not source:
             return
@@ -271,10 +318,14 @@ class DataSourceCollector:
                     'finviz_insider', ticker, data,
                     CHANGE_DETECTORS['finviz_insider'],
                 )
+            self._record_source_success('finviz_insider')
         except Exception as exc:
+            self._record_source_failure('finviz_insider')
             log.debug("[Collector] Finviz insider %s: %s", ticker, exc)
 
     def _collect_edgar_filings(self, ticker: str):
+        if not self._is_source_healthy('edgar_filings'):
+            return
         source = self._sources.get('edgar')
         if not source:
             return
@@ -285,10 +336,14 @@ class DataSourceCollector:
                 'sec_edgar_filings', ticker, data,
                 CHANGE_DETECTORS['sec_edgar_filings'],
             )
+            self._record_source_success('edgar_filings')
         except Exception as exc:
+            self._record_source_failure('edgar_filings')
             log.debug("[Collector] EDGAR %s: %s", ticker, exc)
 
     def _collect_polygon_prev(self, ticker: str):
+        if not self._is_source_healthy('polygon_prev'):
+            return
         source = self._sources.get('polygon')
         if not source:
             return
@@ -304,7 +359,9 @@ class DataSourceCollector:
                     'polygon_prev_close', ticker, data,
                     CHANGE_DETECTORS['polygon_prev_close'],
                 )
+            self._record_source_success('polygon_prev')
         except Exception as exc:
+            self._record_source_failure('polygon_prev')
             log.debug("[Collector] Polygon %s: %s", ticker, exc)
 
     # -- Direct DB writer ------------------------------------------------------

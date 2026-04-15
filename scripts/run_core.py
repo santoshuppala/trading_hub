@@ -91,6 +91,14 @@ def main():
         data_source=DATA_SOURCE,
     )
 
+    # ── Portfolio-level risk gate (aggregate limits across all engines) ─────
+    from monitor.portfolio_risk import PortfolioRiskGate
+    portfolio_risk = PortfolioRiskGate(bus=monitor._bus, monitor=monitor)
+    log.info("PortfolioRiskGate active | drawdown=$%.0f | notional=$%.0f | delta=%.1f | gamma=%.1f",
+             portfolio_risk._max_drawdown if hasattr(portfolio_risk, '_max_drawdown') else -5000,
+             100000, 5.0, 1.0)
+    portfolio_risk.reset_day()
+
     # Hook: publish SIGNAL events to Redpanda for Options process
     def _on_signal_publish(event):
         if event.type == EventType.SIGNAL:

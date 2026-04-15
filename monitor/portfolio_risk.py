@@ -91,6 +91,15 @@ class PortfolioRiskGate:
         total_pnl = self._get_total_pnl()
         if total_pnl <= MAX_INTRADAY_DRAWDOWN:
             self._halted = True
+            # Send CRITICAL alert
+            try:
+                from monitor.alerts import send_alert
+                send_alert(
+                    f"PORTFOLIO RISK HALT: drawdown ${total_pnl:+.2f} breached ${MAX_INTRADAY_DRAWDOWN}",
+                    severity='CRITICAL',
+                )
+            except Exception:
+                pass
             self._block(ticker, event,
                         f"intraday drawdown ${total_pnl:+.2f} breached limit ${MAX_INTRADAY_DRAWDOWN:+.2f}")
             log.error("[PortfolioRisk] DRAWDOWN HALT: total P&L $%.2f (limit $%.2f)",
@@ -271,6 +280,15 @@ class PortfolioRiskGate:
             object.__setattr__(event, '_portfolio_blocked', True)
         except Exception:
             pass
+
+    def reset_day(self):
+        """Reset daily tracking state for a new trading session."""
+        with self._lock:
+            self._realized_pnl = 0.0
+            self._positions.clear()
+            self._halted = False
+            self._block_count = 0
+        log.info("[PortfolioRisk] Daily reset — all counters cleared")
 
     def status(self) -> dict:
         """Return current portfolio risk status."""

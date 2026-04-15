@@ -147,6 +147,7 @@ class TradierBroker:
                             correlation_id=parent_event.event_id,
                         )
                     )
+                    log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
                     return
 
                 # Not filled — cancel and retry
@@ -239,6 +240,7 @@ class TradierBroker:
                         correlation_id=parent_event.event_id,
                     )
                 )
+                log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
             else:
                 log.warning("[TradierBroker] SELL %s not filled", ticker)
                 self._emit_order_fail(p, parent_event)

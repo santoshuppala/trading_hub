@@ -322,7 +322,7 @@ class EventSourcingSubscriber:
             payload = {
                 "ticker":         p.ticker,
                 "action":         p.action,
-                "qty":            int(snap.qty) if snap else None,
+                "qty":            int(snap.quantity) if snap else None,
                 "entry_price":    float(snap.entry_price) if snap else None,
                 "entry_time":     snap.entry_time if snap else None,
                 "current_price":  float(snap.current_price) if snap and hasattr(snap, "current_price") else None,

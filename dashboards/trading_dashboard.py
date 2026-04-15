@@ -8,6 +8,18 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Load .env if not already in environment (Streamlit doesn't go through start_monitor.sh)
+_env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.split('#')[0].strip()
+            if '=' in _line:
+                _k, _v = _line.split('=', 1)
+                _v = _v.strip().strip('"').strip("'")
+                if _k.strip() and _k.strip() not in os.environ:
+                    os.environ[_k.strip()] = _v
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px

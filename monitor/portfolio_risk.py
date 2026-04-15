@@ -184,24 +184,57 @@ class PortfolioRiskGate:
             )
 
     def _get_buying_power(self) -> Optional[float]:
-        """Fetch buying power from Alpaca (best-effort)."""
-        try:
-            import requests
-            api_key = os.getenv('APCA_API_KEY_ID', '')
-            api_secret = os.getenv('APCA_API_SECRET_KEY', '')
-            if not api_key:
-                return None
-            base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
-            r = requests.get(
-                f'{base}/v2/account',
-                headers={'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret},
-                timeout=3,
-            )
-            if r.status_code == 200:
-                return float(r.json().get('buying_power', 0))
-        except Exception:
-            pass
-        return None
+        """Fetch aggregate buying power from ALL brokers (Alpaca + Tradier)."""
+        import requests
+        total_bp = 0.0
+        found_any = False
+
+        # ── Alpaca (main + pop + options accounts) ───────────────────────
+        alpaca_accounts = [
+            (os.getenv('APCA_API_KEY_ID', ''), os.getenv('APCA_API_SECRET_KEY', '')),
+            (os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_PUPUP_SECRET_KEY', '')),
+            (os.getenv('APCA_OPTIONS_KEY', ''), os.getenv('APCA_OPTIONS_SECRET', '')),
+        ]
+        base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+
+        for api_key, api_secret in alpaca_accounts:
+            if not api_key or not api_secret:
+                continue
+            try:
+                r = requests.get(
+                    f'{base}/v2/account',
+                    headers={'APCA-API-KEY-ID': api_key, 'APCA-API-SECRET-KEY': api_secret},
+                    timeout=3,
+                )
+                if r.status_code == 200:
+                    bp = float(r.json().get('buying_power', 0))
+                    total_bp += bp
+                    found_any = True
+            except Exception:
+                pass
+
+        # ── Tradier ──────────────────────────────────────────────────────
+        tradier_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TRADING_TOKEN', '')
+        tradier_account = os.getenv('TRADIER_ACCOUNT_ID', '')
+        tradier_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+
+        if tradier_token and tradier_account:
+            try:
+                tradier_base = 'https://sandbox.tradier.com' if tradier_sandbox else 'https://api.tradier.com'
+                r = requests.get(
+                    f'{tradier_base}/v1/accounts/{tradier_account}/balances',
+                    headers={'Authorization': f'Bearer {tradier_token}', 'Accept': 'application/json'},
+                    timeout=3,
+                )
+                if r.status_code == 200:
+                    bal = r.json().get('balances', {})
+                    bp = float(bal.get('total_cash', 0) or 0)
+                    total_bp += bp
+                    found_any = True
+            except Exception:
+                pass
+
+        return total_bp if found_any else None
 
     def _get_portfolio_greeks(self) -> tuple:
         """Get aggregate portfolio delta and gamma from options positions."""

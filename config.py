@@ -135,3 +135,15 @@ DATA_SOURCE = os.getenv('DATA_SOURCE', 'tradier')
 # 'alpaca' — live or paper execution via Alpaca TradingClient
 # 'paper'  — local simulation; fills every order instantly, no API needed
 BROKER = os.getenv('BROKER', 'alpaca')
+
+# ── Tradier trading (secondary broker) ────────────────────────────────────
+TRADIER_TRADING_TOKEN  = os.getenv('TRADIER_TRADING_TOKEN', '')     # trading API token
+TRADIER_ACCOUNT_ID     = os.getenv('TRADIER_ACCOUNT_ID', '')        # account number
+TRADIER_SANDBOX        = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+TRADIER_SANDBOX_TOKEN  = os.getenv('TRADIER_SANDBOX_TOKEN', '')     # sandbox token
+
+# ── Smart routing ─────────────────────────────────────────────────────────
+# 'smart' — route to best broker based on health/availability
+# 'alpaca' — always use Alpaca (current behavior)
+# 'tradier' — always use Tradier
+BROKER_MODE = os.getenv('BROKER_MODE', 'alpaca')  # 'alpaca', 'tradier', or 'smart'

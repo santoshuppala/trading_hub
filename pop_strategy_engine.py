@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Dict, List, Optional, Set
@@ -146,8 +147,8 @@ class PopExecutor:
         self._order_cooldown = order_cooldown
         self._alert_email    = alert_email
 
-        # Mutable state — accessed only from EventBus worker threads for the
-        # same ticker partition, so no cross-ticker race is possible.
+        # Mutable state — protected by _lock for thread safety.
+        self._lock = threading.Lock()
         self._positions:        Set[str]         = set()   # currently open pop positions
         self._last_order_time:  Dict[str, float] = {}      # ticker → monotonic timestamp
 
@@ -170,7 +171,7 @@ class PopExecutor:
         symbol = entry.symbol
         now    = time.monotonic()
 
-        # ── Risk gate ────────────────────────────────────────────────────────
+        # ── Risk gate (protected by _lock) ───────────────────────────────────
         # Cross-layer dedup: check global registry first
         from monitor.position_registry import registry
         if not registry.try_acquire(symbol, layer="pop"):
@@ -180,44 +181,44 @@ class PopExecutor:
 
         _approved = False
         try:
-            if len(self._positions) >= self._max_positions:
-                log.info("POP risk block %s: max pop positions (%d) reached",
-                         symbol, self._max_positions)
-                return
+            with self._lock:
+                if len(self._positions) >= self._max_positions:
+                    log.info("POP risk block %s: max pop positions (%d) reached",
+                             symbol, self._max_positions)
+                    return
 
-            # Sector concentration limit (max 2 per sector)
-            _MAX_PER_SECTOR = 2
-            sector = get_sector(symbol)
-            sector_counts = count_sector_positions(self._positions)
-            if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
-                log.info("POP risk block %s: sector %s already has %d positions",
-                         symbol, sector, sector_counts[sector])
-                return
+                # Sector concentration limit (max 2 per sector)
+                _MAX_PER_SECTOR = 2
+                sector = get_sector(symbol)
+                sector_counts = count_sector_positions(self._positions)
+                if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
+                    log.info("POP risk block %s: sector %s already has %d positions",
+                             symbol, sector, sector_counts[sector])
+                    return
 
-            last = self._last_order_time.get(symbol, 0.0)
-            if (now - last) < self._order_cooldown:
-                remaining = int(self._order_cooldown - (now - last))
-                log.info("POP risk block %s: cooldown %ds remaining", symbol, remaining)
-                return
+                last = self._last_order_time.get(symbol, 0.0)
+                if (now - last) < self._order_cooldown:
+                    remaining = int(self._order_cooldown - (now - last))
+                    log.info("POP risk block %s: cooldown %ds remaining", symbol, remaining)
+                    return
 
-            if symbol in self._positions:
-                log.info("POP risk block %s: already in open pop position", symbol)
-                return
+                if symbol in self._positions:
+                    log.info("POP risk block %s: already in open pop position", symbol)
+                    return
 
-            # ── Size: shares = floor(budget / entry_price) ────────────────────
-            qty = int(self._trade_budget // entry.entry_price)
-            if qty <= 0:
-                log.warning("POP risk block %s: trade_budget $%.0f too small for price $%.2f",
-                            symbol, self._trade_budget, entry.entry_price)
-                return
+                # ── Size: shares = floor(budget / entry_price) ────────────────────
+                qty = int(self._trade_budget // entry.entry_price)
+                if qty <= 0:
+                    log.warning("POP risk block %s: trade_budget $%.0f too small for price $%.2f",
+                                symbol, self._trade_budget, entry.entry_price)
+                    return
 
-            _approved = True
+                # Mark cooldown and approve while still holding the lock
+                self._last_order_time[symbol] = now
+                _approved = True
         finally:
             if not _approved:
                 registry.release(symbol)
-
-        # ── Execute ───────────────────────────────────────────────────────────
-        self._last_order_time[symbol] = now
 
         if self._paper:
             self._paper_fill(entry, qty, pop_payload)
@@ -226,7 +227,8 @@ class PopExecutor:
 
     def close_position(self, symbol: str, reason: str, current_price: float) -> None:
         """Mark a pop position as closed (called by PopStrategyEngine on exit signal)."""
-        self._positions.discard(symbol)
+        with self._lock:
+            self._positions.discard(symbol)
         from monitor.position_registry import registry
         registry.release(symbol)
         log.info("POP position closed: %s @ $%.4f reason=%s", symbol, current_price, reason)
@@ -240,7 +242,8 @@ class PopExecutor:
         order_id  = f"pop-paper-{uuid.uuid4().hex[:12]}"
         fill_price = entry.entry_price
 
-        self._positions.add(entry.symbol)
+        with self._lock:
+            self._positions.add(entry.symbol)
         log.info(
             "POP PAPER FILL: BUY %d %s @ $%.4f  stop=%.4f  t1=%.4f  t2=%.4f  "
             "strategy=%s  order_id=%s",
@@ -319,7 +322,8 @@ class PopExecutor:
             if filled:
                 filled_qty = int(float(order.filled_qty  or qty))
                 avg_price  = float(order.filled_avg_price or limit_price)
-                self._positions.add(symbol)
+                with self._lock:
+                    self._positions.add(symbol)
                 log.info(
                     "POP FILL: %d %s avg $%.4f  stop=%.4f  t1=%.4f  t2=%.4f  order=%s",
                     filled_qty, symbol, avg_price,
@@ -376,7 +380,8 @@ class PopExecutor:
 
     @property
     def open_positions(self) -> Set[str]:
-        return set(self._positions)
+        with self._lock:
+            return set(self._positions)
 
 
 # ── T3.5 pop strategy engine ──────────────────────────────────────────────────

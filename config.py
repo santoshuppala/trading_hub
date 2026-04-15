@@ -69,6 +69,15 @@ TRADE_BUDGET   = int(os.getenv('TRADE_BUDGET', 1000))  # dollars allocated per t
 OPEN_COST      = 0.0   # commission-free (Alpaca); slippage handled in OrderManager
 CLOSE_COST     = 0.0
 
+# ── Execution tuning ─────────────────────────────────────────────────
+MAX_SLIPPAGE_PCT    = float(os.getenv('MAX_SLIPPAGE_PCT', 0.005))
+DEFAULT_STOP_PCT    = float(os.getenv('DEFAULT_STOP_PCT', 0.005))
+ORPHAN_STOP_PCT     = float(os.getenv('ORPHAN_STOP_PCT', 0.03))
+ORPHAN_TARGET_PCT   = float(os.getenv('ORPHAN_TARGET_PCT', 0.05))
+TRADE_START_TIME    = os.getenv('TRADE_START_TIME', '09:45')
+FORCE_CLOSE_TIME    = os.getenv('FORCE_CLOSE_TIME', '15:00')
+MIN_BARS_REQUIRED   = int(os.getenv('MIN_BARS_REQUIRED', 30))
+
 # ── Credentials (read from environment / .env) ─────────────────────────────────
 ALERT_EMAIL    = os.getenv('ALERT_EMAIL_TO', 'usantoshayyappa@yahoo.com')
 ALPACA_API_KEY = os.getenv('APCA_API_KEY_ID')       # order execution — main VWAP strategy

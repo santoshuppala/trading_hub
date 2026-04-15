@@ -95,6 +95,7 @@ def _remove_lock():
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 from alpaca.trading.client import TradingClient
+from config import ORPHAN_STOP_PCT, ORPHAN_TARGET_PCT
 
 from .alerts import send_alert
 from .brokers import make_broker
@@ -374,8 +375,8 @@ class RealTimeMonitor:
                     ticker, stop_price, atr,
                 )
             else:
-                stop_price   = round(avg_entry * 0.97, 4)
-                target_price = round(avg_entry * 1.05, 4)
+                stop_price   = round(avg_entry * (1 - ORPHAN_STOP_PCT), 4)
+                target_price = round(avg_entry * (1 + ORPHAN_TARGET_PCT), 4)
                 log.warning(
                     "Orphaned %s: default 3%% stop $%.2f (no ATR available)",
                     ticker, stop_price,

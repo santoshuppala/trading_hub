@@ -8,6 +8,7 @@ broker/executor acts.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -67,7 +68,7 @@ class SignalCapture:
     """
 
     def __init__(self):
-        self.all_signals: List[tuple[str, Any]] = []  # complete audit trail: ('pro' | 'pop' | 'options', payload)
+        self.all_signals: deque = deque(maxlen=50_000)  # bounded audit trail: ('pro' | 'pop' | 'options', payload)
         self.fill_simulator: Optional[Any] = None  # set by BacktestEngine after construction
 
     def on_pro(self, event: Any) -> None:

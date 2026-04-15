@@ -31,6 +31,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from config import MAX_SLIPPAGE_PCT as _CFG_MAX_SLIPPAGE_PCT
 from .alerts import send_alert
 from .event_bus import Event, EventBus, EventType
 from .events import FillPayload, OrderFailPayload, OrderRequestPayload
@@ -87,7 +88,7 @@ class AlpacaBroker(BaseBroker):
     FILL_TIMEOUT_SEC = 5.0      # seconds to wait before cancel/retry (2s was too aggressive for illiquid names)
     FILL_POLL_SEC    = 0.5      # poll interval while waiting for fill
     MAX_RETRIES      = 2        # cancel-and-retry attempts per entry (fewer retries, longer timeout)
-    MAX_SLIPPAGE_PCT = 0.005    # 0.5%  — abandon retry if ask drifts beyond this
+    MAX_SLIPPAGE_PCT = _CFG_MAX_SLIPPAGE_PCT  # from config.py (default 0.5%)
 
     def __init__(
         self,

@@ -59,6 +59,8 @@ from datetime import datetime
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
 
+from config import TRADE_START_TIME, FORCE_CLOSE_TIME, MIN_BARS_REQUIRED
+
 from .event_bus import Event, EventBus, EventType
 from .events import BarPayload, SignalPayload
 from .signals import SignalAnalyzer
@@ -66,10 +68,12 @@ from .signals import SignalAnalyzer
 ET = ZoneInfo('America/New_York')
 log = logging.getLogger(__name__)
 
-# ── Trading window ────────────────────────────────────────────────────────────
-_TRADE_START   = (9, 45)   # (hour, minute) inclusive
-_FORCE_CLOSE   = (15, 0)   # (hour, minute) — EOD gate; also used for force-sell
-_MIN_BARS      = 30        # minimum bars before analysis is attempted
+# ── Trading window (parsed from config) ──────────────────────────────────────
+_h, _m = TRADE_START_TIME.split(':')
+_TRADE_START = (int(_h), int(_m))
+_h, _m = FORCE_CLOSE_TIME.split(':')
+_FORCE_CLOSE = (int(_h), int(_m))
+_MIN_BARS    = MIN_BARS_REQUIRED
 
 
 class StrategyEngine:

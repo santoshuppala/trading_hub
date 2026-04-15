@@ -33,6 +33,18 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo('America/New_York')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
+
+# Load .env so child processes inherit API keys
+_env_path = os.path.join(PROJECT_ROOT, '.env')
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.split('#')[0].strip()
+            if '=' in _line:
+                _k, _v = _line.split('=', 1)
+                _v = _v.strip().strip('"').strip("'")
+                if _k.strip() and _k.strip() not in os.environ:
+                    os.environ[_k.strip()] = _v
 PYTHON = sys.executable
 SCRIPTS_DIR = os.path.join(PROJECT_ROOT, 'scripts')
 

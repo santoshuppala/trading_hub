@@ -555,10 +555,14 @@ class PopStrategyEngine:
             log.warning("PopStrategyEngine: data fetch failed for %s: %s", symbol, exc)
             return
 
-        # 2b. Persist external data for post-hoc analysis (non-durable, never crashes engine)
+        # 2b. Smart persistence: only persist if data meaningfully changed
         try:
+            from data_sources.persistence import SmartPersistence, benzinga_changed, stocktwits_changed
             from monitor.events import NewsDataPayload, SocialDataPayload
             from datetime import datetime as _dt, timezone as _tz
+
+            if not hasattr(self, '_smart_persist'):
+                self._smart_persist = SmartPersistence(writer_fn=lambda *a: None)
 
             news_fetched_at = _dt.now(_tz.utc).isoformat()
             avg_sent_1h = (sum(n.sentiment_score for n in news_1h) / len(news_1h)) if news_1h else 0.0
@@ -570,35 +574,57 @@ class PopStrategyEngine:
             latest_ts = max((n.timestamp for n in all_news), default=None)
             oldest_1h_ts = min((n.timestamp for n in news_1h), default=None) if news_1h else None
 
-            self._bus.emit(Event(
-                type=EventType.NEWS_DATA,
-                payload=NewsDataPayload(
-                    ticker=symbol,
-                    headlines_1h=len(news_1h),
-                    headlines_24h=len(news_24h),
-                    avg_sentiment_1h=round(avg_sent_1h, 4),
-                    avg_sentiment_24h=round(avg_sent_24h, 4),
-                    top_headline=top_headline[:200],
-                    latest_headline_time=latest_ts.isoformat() if latest_ts else '',
-                    oldest_headline_time=oldest_1h_ts.isoformat() if oldest_1h_ts else '',
-                    news_fetched_at=news_fetched_at,
-                ),
-            ))
+            # Benzinga — only emit event if data meaningfully changed
+            news_snapshot = {
+                'ticker': symbol,
+                'headlines_1h': len(news_1h),
+                'headlines_24h': len(news_24h),
+                'avg_sentiment_1h': round(avg_sent_1h, 4),
+                'avg_sentiment_24h': round(avg_sent_24h, 4),
+                'top_headline': top_headline[:200],
+                'latest_headline_time': latest_ts.isoformat() if latest_ts else '',
+                'oldest_headline_time': oldest_1h_ts.isoformat() if oldest_1h_ts else '',
+                'news_fetched_at': news_fetched_at,
+            }
+            if self._smart_persist.persist_if_changed('benzinga_news', symbol, news_snapshot, benzinga_changed):
+                self._bus.emit(Event(
+                    type=EventType.NEWS_DATA,
+                    payload=NewsDataPayload(
+                        ticker=symbol,
+                        headlines_1h=len(news_1h),
+                        headlines_24h=len(news_24h),
+                        avg_sentiment_1h=round(avg_sent_1h, 4),
+                        avg_sentiment_24h=round(avg_sent_24h, 4),
+                        top_headline=top_headline[:200],
+                        latest_headline_time=latest_ts.isoformat() if latest_ts else '',
+                        oldest_headline_time=oldest_1h_ts.isoformat() if oldest_1h_ts else '',
+                        news_fetched_at=news_fetched_at,
+                    ),
+                ))
 
+            # StockTwits — only emit event if data meaningfully changed
+            social_snapshot = {
+                'ticker': symbol,
+                'mention_count': getattr(social, 'mention_count', 0),
+                'mention_velocity': round(getattr(social, 'mention_velocity', 0.0), 4),
+                'bullish_pct': round(getattr(social, 'bullish_pct', 0.0), 4),
+                'bearish_pct': round(getattr(social, 'bearish_pct', 0.0), 4),
+            }
             social_fetched_at = _dt.now(_tz.utc).isoformat()
-            self._bus.emit(Event(
-                type=EventType.SOCIAL_DATA,
-                payload=SocialDataPayload(
-                    ticker=symbol,
-                    mention_count=getattr(social, 'mention_count', 0),
-                    mention_velocity=round(getattr(social, 'mention_velocity', 0.0), 4),
-                    bullish_pct=round(getattr(social, 'bullish_pct', 0.0), 4),
-                    bearish_pct=round(getattr(social, 'bearish_pct', 0.0), 4),
-                    newest_message_time=getattr(social, 'newest_message_time', ''),
-                    oldest_message_time=getattr(social, 'oldest_message_time', ''),
-                    social_fetched_at=social_fetched_at,
-                ),
-            ))
+            if self._smart_persist.persist_if_changed('stocktwits_social', symbol, social_snapshot, stocktwits_changed):
+                self._bus.emit(Event(
+                    type=EventType.SOCIAL_DATA,
+                    payload=SocialDataPayload(
+                        ticker=symbol,
+                        mention_count=getattr(social, 'mention_count', 0),
+                        mention_velocity=round(getattr(social, 'mention_velocity', 0.0), 4),
+                        bullish_pct=round(getattr(social, 'bullish_pct', 0.0), 4),
+                        bearish_pct=round(getattr(social, 'bearish_pct', 0.0), 4),
+                        newest_message_time=getattr(social, 'newest_message_time', ''),
+                        oldest_message_time=getattr(social, 'oldest_message_time', ''),
+                        social_fetched_at=social_fetched_at,
+                    ),
+                ))
         except Exception:
             pass  # persistence must never crash the pop engine
 

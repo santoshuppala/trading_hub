@@ -149,7 +149,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Pop process interrupted.")
     finally:
-        bus.stop()
+        # bus has no stop() — dispatchers clean up on process exit
         publisher.stop()
         if db_cleanup:
             db_cleanup()

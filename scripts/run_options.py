@@ -169,7 +169,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Options process interrupted.")
     finally:
-        bus.stop()
+        # bus has no stop() — dispatchers clean up on process exit
         consumer.stop()
         if db_cleanup:
             db_cleanup()

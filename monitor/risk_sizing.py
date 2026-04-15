@@ -164,8 +164,24 @@ class RiskSizer:
             adjustment_reason=', '.join(reason_parts) if reason_parts else 'no_adjustment',
         )
 
-    def check_correlation(self, ticker: str, current_positions: Set[str]) -> tuple:
+    def check_correlation(self, ticker: str, current_positions: Set[str],
+                          news_context: dict = None) -> tuple:
         """Check if adding ticker would create too much correlation risk.
+
+        News-aware correlation:
+          - If the catalyst is TICKER-SPECIFIC (e.g., "AAPL beats earnings"),
+            allow entry even if correlated positions are held.
+          - If the catalyst is SECTOR-WIDE (e.g., "tech sells off on rates"),
+            enforce the correlation limit strictly.
+          - If no news context, default to strict enforcement.
+
+        Args:
+            ticker: ticker to check
+            current_positions: set of currently held tickers
+            news_context: optional dict with:
+                'headlines_1h': int — headline count for this ticker
+                'sentiment_delta': float — sentiment change
+                'is_ticker_specific': bool — True if catalyst is ticker-only
 
         Returns (allowed: bool, reason: str)
         """
@@ -177,7 +193,20 @@ class RiskSizer:
         for group in ticker_groups:
             group_tickers = CORRELATION_GROUPS[group]
             overlap = current_positions & group_tickers
+
             if len(overlap) >= MAX_CORRELATED_POSITIONS:
+                # Check if this is a ticker-specific catalyst
+                if news_context and self._is_ticker_specific_catalyst(
+                    ticker, group, news_context
+                ):
+                    log.info(
+                        "[RiskSizer] Correlation override for %s: ticker-specific catalyst "
+                        "(headlines=%d, sentiment_delta=%.2f) — allowing despite %d in '%s'",
+                        ticker, news_context.get('headlines_1h', 0),
+                        news_context.get('sentiment_delta', 0), len(overlap), group,
+                    )
+                    return True, f'correlation_override: ticker_specific_catalyst_for_{ticker}'
+
                 return False, (
                     f"correlation_block: {ticker} in group '{group}' "
                     f"with {len(overlap)} existing ({', '.join(sorted(overlap))}), "
@@ -185,6 +214,49 @@ class RiskSizer:
                 )
 
         return True, 'correlation_ok'
+
+    def _is_ticker_specific_catalyst(self, ticker: str, group: str,
+                                      news_context: dict) -> bool:
+        """Determine if the catalyst is ticker-specific vs sector-wide.
+
+        Heuristics:
+          1. If caller already marked it as ticker-specific → trust it
+          2. If this ticker has headlines but group peers don't → ticker-specific
+          3. If sentiment_delta is strong (>0.3) → likely a direct catalyst
+          4. If headline count > 3 in 1 hour → significant ticker attention
+        """
+        # Explicit flag from caller
+        if news_context.get('is_ticker_specific'):
+            return True
+
+        headlines = news_context.get('headlines_1h', 0)
+        sentiment_delta = abs(news_context.get('sentiment_delta', 0))
+
+        # Strong sentiment shift + multiple headlines = ticker-specific catalyst
+        if headlines >= 3 and sentiment_delta >= 0.3:
+            return True
+
+        # Check if peer tickers in the group also have headlines
+        # (if they do, it's a sector-wide event, not ticker-specific)
+        peer_headlines = news_context.get('peer_headlines', {})
+        if peer_headlines:
+            group_tickers = CORRELATION_GROUPS.get(group, set())
+            peers_with_news = sum(
+                1 for peer in group_tickers
+                if peer != ticker and peer_headlines.get(peer, 0) >= 2
+            )
+            # If most peers also have news → sector-wide
+            if peers_with_news >= 2:
+                return False
+            # Only this ticker has news → ticker-specific
+            if peers_with_news == 0 and headlines >= 2:
+                return True
+
+        # Moderate catalyst (some headlines, some sentiment) — allow with caution
+        if headlines >= 2 and sentiment_delta >= 0.2:
+            return True
+
+        return False
 
     def beta_weighted_exposure(self, positions: Dict[str, dict]) -> float:
         """Calculate total beta-weighted notional exposure.

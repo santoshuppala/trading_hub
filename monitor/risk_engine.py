@@ -185,8 +185,20 @@ class RiskEngine:
                             event)
                 return
 
-            # 7. Correlation risk
-            corr_ok, corr_reason = self._sizer.check_correlation(ticker, set(self._positions.keys()))
+            # 7. Correlation risk (news-aware: ticker-specific catalysts override)
+            news_ctx = None
+            try:
+                # Build news context from the signal payload if available
+                news_ctx = {
+                    'headlines_1h': getattr(p, 'headlines_1h', 0) or 0,
+                    'sentiment_delta': getattr(p, 'sentiment_delta', 0) or 0,
+                    'is_ticker_specific': False,  # let heuristics decide
+                }
+            except Exception:
+                pass
+            corr_ok, corr_reason = self._sizer.check_correlation(
+                ticker, set(self._positions.keys()), news_context=news_ctx,
+            )
             if not corr_ok:
                 self._block(ticker, p.action, corr_reason, event)
                 return

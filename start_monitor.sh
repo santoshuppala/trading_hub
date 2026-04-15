@@ -30,5 +30,8 @@ fi
 # Activate virtual environment
 source venv/bin/activate
 
-# Run monitor (logs go to logs/monitor_YYYY-MM-DD.log automatically)
-python run_monitor.py
+# Run monitor via watchdog (auto-recovery on crash)
+# Watchdog starts run_monitor.py, detects crashes, diagnoses via crash_analyzer,
+# applies safe fixes (file allowlist, no DB/credential changes), and restarts.
+# Falls back to direct run if watchdog itself fails.
+python scripts/watchdog.py || python run_monitor.py

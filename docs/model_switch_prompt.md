@@ -455,3 +455,11 @@ DB_CIRCUIT_BREAKER_RESET=30
 ```
 ALERT_EMAIL_TO=your@email.com
 ```
+
+---
+
+## Architecture audit fixes (April 14)
+
+- **FILL idempotency**: event_id dedup added to PositionManager — prevents double-processing of FILL events with the same event_id
+- **Broker-down halt**: SmartRouter now halts order routing when all brokers are circuit-broken (prevents silent order drops)
+- **Backtest time determinism**: SimulatedTimeSource injected into backtest EventBus — replays use deterministic timestamps instead of wall-clock time

@@ -85,6 +85,17 @@ class PositionManager:
     # ── Handler ───────────────────────────────────────────────────────────────
 
     def _on_fill(self, event: Event) -> None:
+        # Dedup: skip if we've already processed this FILL event
+        if not hasattr(self, '_processed_fill_ids'):
+            self._processed_fill_ids = set()
+        if event.event_id in self._processed_fill_ids:
+            log.debug("[PositionManager] Duplicate FILL skipped: %s", event.event_id)
+            return
+        self._processed_fill_ids.add(event.event_id)
+        # Prevent unbounded growth
+        if len(self._processed_fill_ids) > 10000:
+            self._processed_fill_ids = set(list(self._processed_fill_ids)[-5000:])
+
         p: FillPayload = event.payload
         with self._lock:
             if p.side == 'BUY':

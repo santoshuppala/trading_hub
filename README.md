@@ -541,3 +541,14 @@ Both run modes write to `logs/monitor_YYYY-MM-DD.log`. Stops automatically at 3:
 - Redpanda or Kafka broker for durable event log (optional -- bot runs without it)
 - TimescaleDB 2.26+ / PostgreSQL 16 (optional -- bot runs without it; use `cd docker && docker compose up -d`)
 - macOS/Linux for cron scheduling
+
+---
+
+## Issues Addressed (April 14 Architecture Audit)
+
+| Issue | Status | Fix |
+|---|---|---|
+| Backpressure | Addressed (EventBus v5.2) | DROP_OLDEST + priority eviction + systemic monitor (60%/80%/95%) |
+| Event ordering | Addressed (causal partitioning) | Ticker-based partition key across all EventTypes |
+| Idempotency | Fixed (event_id dedup) | 10K event dedup window in EventBus + FILL event_id dedup in PositionManager |
+| TimeSource | Fixed (SimulatedTimeSource) | SimulatedTimeSource for backtests, WallClockTimeSource for live |

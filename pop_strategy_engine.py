@@ -434,6 +434,9 @@ class PopStrategyEngine:
         self._headline_baseline = headline_baseline
         self._social_baseline   = social_baseline
         self._enabled           = enabled
+        self._news_failures     = 0
+        self._social_failures   = 0
+        self._max_data_failures = 10  # disable source after 10 consecutive failures
 
         # Per-ticker baselines from historical DB data (replaces static defaults)
         from pop_screener.sentiment_baseline import SentimentBaselineEngine
@@ -546,19 +549,42 @@ class PopStrategyEngine:
                           symbol, bar_range_pct, last_rvol, market_slice.gap_size)
                 return
 
-        # 2. External data
+        # 2. External data (with circuit breaker for consecutive failures)
+        if self._news_failures >= self._max_data_failures:
+            log.debug("PopEngine: news source disabled after %d consecutive failures, skipping %s",
+                      self._news_failures, symbol)
+            return
+        if self._social_failures >= self._max_data_failures:
+            log.debug("PopEngine: social source disabled after %d consecutive failures, skipping %s",
+                      self._social_failures, symbol)
+            return
         try:
             news_1h  = self._news.get_news(symbol, window_hours=1.0)
             news_24h = self._news.get_news(symbol, window_hours=24.0)
+            self._news_failures = 0  # reset on success
+        except Exception as exc:
+            self._news_failures += 1
+            if self._news_failures >= self._max_data_failures:
+                log.error("PopEngine: news source disabled after %d consecutive failures", self._news_failures)
+            log.warning("PopStrategyEngine: news fetch failed for %s: %s", symbol, exc)
+            return
+        try:
             social   = self._social.get_social(symbol, window_hours=1.0)
+            self._social_failures = 0  # reset on success
+        except Exception as exc:
+            self._social_failures += 1
+            if self._social_failures >= self._max_data_failures:
+                log.error("PopEngine: social source disabled after %d consecutive failures", self._social_failures)
+            log.warning("PopStrategyEngine: social fetch failed for %s: %s", symbol, exc)
+            return
+        try:
             log.debug("POP data %s: news_1h=%d news_24h=%d social_mentions=%d bull=%.0f%% bear=%.0f%%",
                       symbol, len(news_1h), len(news_24h),
                       getattr(social, 'mention_count', 0),
                       getattr(social, 'bullish_pct', 0) * 100,
                       getattr(social, 'bearish_pct', 0) * 100)
-        except Exception as exc:
-            log.warning("PopStrategyEngine: data fetch failed for %s: %s", symbol, exc)
-            return
+        except Exception:
+            pass
 
         # 2b. Smart persistence: only persist if data meaningfully changed
         try:

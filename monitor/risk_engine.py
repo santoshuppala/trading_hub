@@ -5,7 +5,7 @@ Pre-trade gate that sits between the Strategy Engine and the Broker.
 
 Responsibilities
 ----------------
-  BUY signals  — run all 6 pre-trade checks; emit ORDER_REQ on pass or
+  BUY signals  — run all 7 pre-trade checks; emit ORDER_REQ on pass or
                  RISK_BLOCK on fail.
   SELL signals — pass straight through as ORDER_REQ; exits never get gated.
 
@@ -18,10 +18,12 @@ Pre-trade checks (buy only)
   5. RSI range            — reject if RSI is outside the bullish band (RSI_LOW–RSI_HIGH).
   6. Spread               — fetch a fresh Level-1 quote; reject if bid/ask spread is too
                             wide (MAX_SPREAD_PCT).  Also computes the live ask for sizing.
+  7. Correlation risk     — reject if too many correlated positions already held.
 
 Sizing
 ------
   qty = max(1, floor(trade_budget / (ask * (1 + SLIPPAGE_PCT))))
+  Then adjusted for beta and ATR volatility (via RiskSizer).
 
 Events consumed
 ---------------
@@ -61,6 +63,7 @@ from .events import (
     RiskBlockPayload,
     SignalPayload,
 )
+from .risk_sizing import RiskSizer
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +107,7 @@ class RiskEngine:
         self._order_cooldown  = order_cooldown
         self._trade_budget    = trade_budget
         self._alert_email     = alert_email
+        self._sizer           = RiskSizer()
 
         bus.subscribe(EventType.SIGNAL, self._on_signal)
 
@@ -154,10 +158,12 @@ class RiskEngine:
                             "already reclaimed today", event)
                 return
 
-            # 4. RVOL
-            if p.rvol < MIN_RVOL:
+            # 4. RVOL (lower threshold for ETFs — they never hit 2.0x)
+            from monitor.sector_map import is_etf, ETF_RVOL_MIN
+            rvol_threshold = ETF_RVOL_MIN if is_etf(ticker) else MIN_RVOL
+            if p.rvol < rvol_threshold:
                 self._block(ticker, p.action,
-                            f"RVOL too low ({p.rvol:.2f} < {MIN_RVOL})", event)
+                            f"RVOL too low ({p.rvol:.2f} < {rvol_threshold})", event)
                 return
 
             # 5. RSI range
@@ -179,9 +185,38 @@ class RiskEngine:
                             event)
                 return
 
+            # 7. Correlation risk (news-aware: ticker-specific catalysts override)
+            news_ctx = None
+            try:
+                # Build news context from the signal payload if available
+                news_ctx = {
+                    'headlines_1h': getattr(p, 'headlines_1h', 0) or 0,
+                    'sentiment_delta': getattr(p, 'sentiment_delta', 0) or 0,
+                    'is_ticker_specific': False,  # let heuristics decide
+                }
+            except Exception:
+                pass
+            corr_ok, corr_reason = self._sizer.check_correlation(
+                ticker, set(self._positions.keys()), news_context=news_ctx,
+            )
+            if not corr_ok:
+                self._block(ticker, p.action, corr_reason, event)
+                return
+
             # ── All checks passed — size and submit ──────────────────────────
             effective_entry = ask_price * (1 + SLIPPAGE_PCT)
             qty = max(1, int(self._trade_budget / effective_entry))
+
+            # Adjust size for beta and volatility
+            sizing = self._sizer.adjust_size(
+                ticker=ticker, base_qty=qty, price=ask_price,
+                atr_value=getattr(p, 'atr_value', 0),
+                trade_budget=self._trade_budget,
+            )
+            if sizing.adjusted_qty != qty:
+                log.info("[RiskEngine] Size adjusted %s: %d → %d (%s)",
+                         ticker, qty, sizing.adjusted_qty, sizing.adjustment_reason)
+                qty = sizing.adjusted_qty
 
             log.info(
                 f"[RiskEngine] BUY approved: {ticker} "

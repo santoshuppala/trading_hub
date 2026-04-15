@@ -57,7 +57,8 @@ def _pid_is_monitor(pid: int) -> bool:
             capture_output=True, text=True, timeout=2,
         )
         return 'python' in result.stdout.lower()
-    except Exception:
+    except Exception as exc:
+        log.debug("PID check for %d failed: %s", pid, exc)
         return True
 
 
@@ -296,7 +297,8 @@ class RealTimeMonitor:
         try:
             import psycopg2
             from config import DATABASE_URL
-        except Exception:
+        except Exception as exc:
+            log.debug("Import for ATR lookup failed: %s", exc)
             return None
 
         try:
@@ -476,7 +478,8 @@ class RealTimeMonitor:
             return None
         try:
             today_df = full_df[full_df.index.date == today]
-        except Exception:
+        except Exception as exc:
+            log.debug("Date filter failed for %s: %s", ticker, exc)
             today_df = full_df
         if today_df.empty:
             return None

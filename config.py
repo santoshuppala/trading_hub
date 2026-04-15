@@ -116,6 +116,12 @@ OPTIONS_PROFIT_TARGET_DEBIT  = float(os.getenv('OPTIONS_PROFIT_TARGET_DEBIT',  1
 OPTIONS_STOP_LOSS_FRACTION   = float(os.getenv('OPTIONS_STOP_LOSS_FRACTION',   0.80))  # cut at 80% of max risk
 OPTIONS_DTE_CLOSE            = int(os.getenv('OPTIONS_DTE_CLOSE', 7))                  # close at 7 DTE
 
+# ── Portfolio-level risk limits ──────────────────────────────────────────────
+MAX_INTRADAY_DRAWDOWN = float(os.getenv('MAX_INTRADAY_DRAWDOWN', -5000))
+MAX_NOTIONAL_EXPOSURE = float(os.getenv('MAX_NOTIONAL_EXPOSURE', 100000))
+MAX_PORTFOLIO_DELTA   = float(os.getenv('MAX_PORTFOLIO_DELTA', 5.0))
+MAX_PORTFOLIO_GAMMA   = float(os.getenv('MAX_PORTFOLIO_GAMMA', 1.0))
+
 # ── External data APIs ────────────────────────────────────────────────────────
 BENZINGA_API_KEY    = os.getenv('BENZINGA_API_KEY') or os.getenv('BENZENGA_API_KEY', '')
 STOCKTWITS_TOKEN    = os.getenv('STOCKTWITS_TOKEN', '')  # optional — public API works without token
@@ -135,3 +141,27 @@ DATA_SOURCE = os.getenv('DATA_SOURCE', 'tradier')
 # 'alpaca' — live or paper execution via Alpaca TradingClient
 # 'paper'  — local simulation; fills every order instantly, no API needed
 BROKER = os.getenv('BROKER', 'alpaca')
+
+# ── Tradier trading (secondary broker) ────────────────────────────────────
+TRADIER_TRADING_TOKEN  = os.getenv('TRADIER_TRADING_TOKEN', '')     # trading API token
+TRADIER_ACCOUNT_ID     = os.getenv('TRADIER_ACCOUNT_ID', '')        # account number
+TRADIER_SANDBOX        = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+TRADIER_SANDBOX_TOKEN  = os.getenv('TRADIER_SANDBOX_TOKEN', '')     # sandbox token
+
+# ── Smart routing ─────────────────────────────────────────────────────────
+# 'smart' — route to best broker based on health/availability
+# 'alpaca' — always use Alpaca (current behavior)
+# 'tradier' — always use Tradier
+BROKER_MODE = os.getenv('BROKER_MODE', 'alpaca')  # 'alpaca', 'tradier', or 'smart'
+
+# ── Alternative data sources ──────────────────────────────────────────────
+FRED_API_KEY        = os.getenv('FRED_API_KEY', '')
+ALPHA_VANTAGE_KEY   = os.getenv('ALPHA_VANTAGE_KEY', '')
+REDDIT_CLIENT_ID    = os.getenv('REDDIT_CLIENT_ID', '')
+REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', '')
+REDDIT_USERNAME     = os.getenv('REDDIT_USERNAME', '')
+REDDIT_PASSWORD     = os.getenv('REDDIT_PASSWORD', '')
+POLYGON_API_KEY      = os.getenv('POLYGON_KEY', os.getenv('POLYGON_API_KEY', ''))
+# UNUSUAL_WHALES_KEY — disabled for now (no account)
+# REDDIT_* — disabled for now (signup pending)
+SEC_EDGAR_EMAIL      = os.getenv('SEC_EDGAR_EMAIL', os.getenv('ALERT_EMAIL_TO', 'tradinghub@example.com'))

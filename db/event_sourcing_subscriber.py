@@ -30,6 +30,7 @@ from monitor.events import (
     BarPayload, SignalPayload, OrderRequestPayload, FillPayload,
     PositionPayload, RiskBlockPayload, PopSignalPayload,
     ProStrategySignalPayload, OptionsSignalPayload,
+    NewsDataPayload, SocialDataPayload,
 )
 
 from .writer import DBWriter
@@ -51,6 +52,8 @@ EVENT_TYPE_MAP = {
     EventType.HEARTBEAT:            'HeartbeatEmitted',
     EventType.OPTIONS_SIGNAL:       'OptionsSignal',
     EventType.QUOTE:                'QuoteReceived',
+    EventType.NEWS_DATA:            'NewsDataSnapshot',
+    EventType.SOCIAL_DATA:          'SocialDataSnapshot',
 }
 
 _NOW = lambda: datetime.now(timezone.utc)
@@ -101,6 +104,8 @@ class EventSourcingSubscriber:
             EventType.HEARTBEAT:            self._on_heartbeat,
             EventType.OPTIONS_SIGNAL:       self._on_options_signal,
             EventType.QUOTE:                self._on_quote,
+            EventType.NEWS_DATA:            self._on_news_data,
+            EventType.SOCIAL_DATA:          self._on_social_data,
         }
         for event_type, handler in handlers.items():
             self._bus.subscribe(event_type, handler, priority=10)
@@ -513,6 +518,62 @@ class EventSourcingSubscriber:
             )
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_quote error: %s", exc)
+
+
+    def _on_news_data(self, event: Event) -> None:
+        """Benzinga news snapshot — persisted for post-hoc screener debugging."""
+        try:
+            p: NewsDataPayload = event.payload
+            payload = {
+                "ticker":               p.ticker,
+                "headlines_1h":         p.headlines_1h,
+                "headlines_24h":        p.headlines_24h,
+                "avg_sentiment_1h":     p.avg_sentiment_1h,
+                "avg_sentiment_24h":    p.avg_sentiment_24h,
+                "top_headline":         p.top_headline,
+                "latest_headline_time": p.latest_headline_time,
+                "oldest_headline_time": p.oldest_headline_time,
+                "news_fetched_at":      p.news_fetched_at,
+                "source":               p.source,
+            }
+
+            self._write_event(
+                event_type="NewsDataSnapshot",
+                aggregate_type="MarketData",
+                aggregate_id=f"news_{p.ticker}_{event.timestamp.isoformat()}",
+                event_payload=payload,
+                event=event,
+                source_system="BenzingaNews",
+            )
+        except Exception as exc:
+            log.debug("EventSourcingSubscriber._on_news_data error: %s", exc)
+
+    def _on_social_data(self, event: Event) -> None:
+        """StockTwits social snapshot — persisted for post-hoc screener debugging."""
+        try:
+            p: SocialDataPayload = event.payload
+            payload = {
+                "ticker":              p.ticker,
+                "mention_count":       p.mention_count,
+                "mention_velocity":    p.mention_velocity,
+                "bullish_pct":         p.bullish_pct,
+                "bearish_pct":         p.bearish_pct,
+                "newest_message_time": p.newest_message_time,
+                "oldest_message_time": p.oldest_message_time,
+                "social_fetched_at":   p.social_fetched_at,
+                "source":              p.source,
+            }
+
+            self._write_event(
+                event_type="SocialDataSnapshot",
+                aggregate_type="MarketData",
+                aggregate_id=f"social_{p.ticker}_{event.timestamp.isoformat()}",
+                event_payload=payload,
+                event=event,
+                source_system="StockTwits",
+            )
+        except Exception as exc:
+            log.debug("EventSourcingSubscriber._on_social_data error: %s", exc)
 
 
 def _safe_float(v: Any) -> float | None:

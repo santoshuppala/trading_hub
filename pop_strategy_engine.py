@@ -430,6 +430,14 @@ class PopStrategyEngine:
         self._social_baseline   = social_baseline
         self._enabled           = enabled
 
+        # Per-ticker baselines from historical DB data (replaces static defaults)
+        from pop_screener.sentiment_baseline import SentimentBaselineEngine
+        self._baseline_engine = SentimentBaselineEngine(lookback_days=7)
+        try:
+            self._baseline_engine.load_from_db()
+        except Exception as exc:
+            log.warning("SentimentBaseline load failed (using static defaults): %s", exc)
+
         # ── Data sources ──────────────────────────────────────────────────────
         self._news     = news_source   or NewsSentimentSource()
         self._social   = social_source or SocialSentimentSource()
@@ -520,12 +528,17 @@ class PopStrategyEngine:
 
         # Early exit: skip news/social fetch if bar shows no unusual activity
         # This eliminates ~90% of unnecessary API calls (main slow-handler fix)
+        # ETFs use lower RVOL threshold (they never reach 1.5x)
         if market_slice.bars:
+            from monitor.sector_map import is_etf, ETF_RVOL_MIN
             last_bar = market_slice.bars[-1]
             bar_range_pct = (last_bar.high - last_bar.low) / last_bar.open if last_bar.open > 0 else 0
             # Skip if bar range < 0.3% AND volume not elevated (no pop candidate)
             last_rvol = market_slice.rvol_series[-1] if market_slice.rvol_series else 1.0
-            if bar_range_pct < 0.003 and last_rvol < 1.5 and abs(market_slice.gap_size) < 0.02:
+            rvol_filter = ETF_RVOL_MIN if is_etf(symbol) else 1.5
+            if bar_range_pct < 0.003 and last_rvol < rvol_filter and abs(market_slice.gap_size) < 0.02:
+                log.debug("POP skip %s: range=%.4f rvol=%.2f gap=%.4f (below thresholds)",
+                          symbol, bar_range_pct, last_rvol, market_slice.gap_size)
                 return
 
         # 2. External data
@@ -533,9 +546,94 @@ class PopStrategyEngine:
             news_1h  = self._news.get_news(symbol, window_hours=1.0)
             news_24h = self._news.get_news(symbol, window_hours=24.0)
             social   = self._social.get_social(symbol, window_hours=1.0)
+            log.debug("POP data %s: news_1h=%d news_24h=%d social_mentions=%d bull=%.0f%% bear=%.0f%%",
+                      symbol, len(news_1h), len(news_24h),
+                      getattr(social, 'mention_count', 0),
+                      getattr(social, 'bullish_pct', 0) * 100,
+                      getattr(social, 'bearish_pct', 0) * 100)
         except Exception as exc:
             log.warning("PopStrategyEngine: data fetch failed for %s: %s", symbol, exc)
             return
+
+        # 2b. Smart persistence: only persist if data meaningfully changed
+        try:
+            from data_sources.persistence import SmartPersistence, benzinga_changed, stocktwits_changed
+            from monitor.events import NewsDataPayload, SocialDataPayload
+            from datetime import datetime as _dt, timezone as _tz
+
+            if not hasattr(self, '_smart_persist'):
+                self._smart_persist = SmartPersistence(writer_fn=lambda *a: None)
+
+            news_fetched_at = _dt.now(_tz.utc).isoformat()
+            avg_sent_1h = (sum(n.sentiment_score for n in news_1h) / len(news_1h)) if news_1h else 0.0
+            avg_sent_24h = (sum(n.sentiment_score for n in news_24h) / len(news_24h)) if news_24h else 0.0
+            top_headline = news_1h[-1].headline if news_1h else (news_24h[-1].headline if news_24h else '')
+
+            # Extract headline timestamps for latency analysis
+            all_news = news_1h or news_24h or []
+            latest_ts = max((n.timestamp for n in all_news), default=None)
+            oldest_1h_ts = min((n.timestamp for n in news_1h), default=None) if news_1h else None
+
+            # Benzinga — only emit event if data meaningfully changed
+            news_snapshot = {
+                'ticker': symbol,
+                'headlines_1h': len(news_1h),
+                'headlines_24h': len(news_24h),
+                'avg_sentiment_1h': round(avg_sent_1h, 4),
+                'avg_sentiment_24h': round(avg_sent_24h, 4),
+                'top_headline': top_headline[:200],
+                'latest_headline_time': latest_ts.isoformat() if latest_ts else '',
+                'oldest_headline_time': oldest_1h_ts.isoformat() if oldest_1h_ts else '',
+                'news_fetched_at': news_fetched_at,
+            }
+            if self._smart_persist.persist_if_changed('benzinga_news', symbol, news_snapshot, benzinga_changed):
+                self._bus.emit(Event(
+                    type=EventType.NEWS_DATA,
+                    payload=NewsDataPayload(
+                        ticker=symbol,
+                        headlines_1h=len(news_1h),
+                        headlines_24h=len(news_24h),
+                        avg_sentiment_1h=round(avg_sent_1h, 4),
+                        avg_sentiment_24h=round(avg_sent_24h, 4),
+                        top_headline=top_headline[:200],
+                        latest_headline_time=latest_ts.isoformat() if latest_ts else '',
+                        oldest_headline_time=oldest_1h_ts.isoformat() if oldest_1h_ts else '',
+                        news_fetched_at=news_fetched_at,
+                    ),
+                ))
+
+            # StockTwits — only emit event if data meaningfully changed
+            social_snapshot = {
+                'ticker': symbol,
+                'mention_count': getattr(social, 'mention_count', 0),
+                'mention_velocity': round(getattr(social, 'mention_velocity', 0.0), 4),
+                'bullish_pct': round(getattr(social, 'bullish_pct', 0.0), 4),
+                'bearish_pct': round(getattr(social, 'bearish_pct', 0.0), 4),
+            }
+            social_fetched_at = _dt.now(_tz.utc).isoformat()
+            if self._smart_persist.persist_if_changed('stocktwits_social', symbol, social_snapshot, stocktwits_changed):
+                self._bus.emit(Event(
+                    type=EventType.SOCIAL_DATA,
+                    payload=SocialDataPayload(
+                        ticker=symbol,
+                        mention_count=getattr(social, 'mention_count', 0),
+                        mention_velocity=round(getattr(social, 'mention_velocity', 0.0), 4),
+                        bullish_pct=round(getattr(social, 'bullish_pct', 0.0), 4),
+                        bearish_pct=round(getattr(social, 'bearish_pct', 0.0), 4),
+                        newest_message_time=getattr(social, 'newest_message_time', ''),
+                        oldest_message_time=getattr(social, 'oldest_message_time', ''),
+                        social_fetched_at=social_fetched_at,
+                    ),
+                ))
+        except Exception:
+            pass  # persistence must never crash the pop engine
+
+        # Update intraday baselines for tickers with no DB history
+        self._baseline_engine.update_intraday(
+            symbol,
+            headlines_1h=len(news_1h),
+            mention_velocity=getattr(social, 'mention_velocity', 0.0),
+        )
 
         # 3. Feature engineering
         try:
@@ -545,9 +643,12 @@ class PopStrategyEngine:
                 news_24h=news_24h,
                 social=social,
                 market=market_slice,
-                social_baseline_velocity=self._social_baseline,
-                headline_baseline_velocity=self._headline_baseline,
+                social_baseline_velocity=self._baseline_engine.social_baseline(symbol),
+                headline_baseline_velocity=self._baseline_engine.headline_baseline(symbol),
             )
+            log.debug("POP features %s: rvol=%.2f gap=%.4f sent_delta=%.3f headline_vel=%.1f social_vel=%.1f momentum=%.4f",
+                      symbol, features.rvol, features.gap_size, features.sentiment_delta,
+                      features.headline_velocity, features.social_velocity, features.price_momentum)
         except Exception as exc:
             log.warning("PopStrategyEngine: feature engineering failed for %s: %s", symbol, exc)
             return
@@ -555,7 +656,11 @@ class PopStrategyEngine:
         # 4. Screening
         candidate = self._screener.screen(features)
         if candidate is None:
+            log.debug("POP no candidate %s: screener returned None", symbol)
             return
+        log.info("POP CANDIDATE %s: reason=%s rvol=%.2f gap=%.4f sent=%.3f",
+                 symbol, candidate.pop_reason.value, features.rvol, features.gap_size,
+                 features.sentiment_delta)
 
         # 5. Classification
         assignment = self._classifier.classify(candidate)
@@ -713,14 +818,36 @@ class PopStrategyEngine:
                 cum_vol += b.volume
                 vwap_series.append(cum_tp / cum_vol if cum_vol > 0 else b.close)
 
-        rvol_series = (
-            [float(v) for v in df['rvol']] if 'rvol' in df.columns
-            else [1.0] * len(bars)
-        )
+        # Compute real RVOL from historical daily bars (payload.rvol_df)
+        rvol_series = []
+        rvol_df = payload.rvol_df if hasattr(payload, 'rvol_df') else None
+        if rvol_df is not None and not rvol_df.empty and 'volume' in rvol_df.columns:
+            # Average daily volume from historical data
+            hist_volumes = rvol_df['volume'].astype(float)
+            avg_daily_vol = float(hist_volumes.mean()) if len(hist_volumes) > 0 else 1.0
+            if avg_daily_vol > 0:
+                # Cumulative intraday volume vs expected fraction of daily volume
+                # 390 trading minutes in a day; compute time-fraction-adjusted RVOL
+                cum_vol = 0.0
+                for i, b in enumerate(bars):
+                    cum_vol += b.volume
+                    minutes_elapsed = i + 1
+                    # Expected volume at this point = avg_daily * (minutes / 390)
+                    expected = avg_daily_vol * (minutes_elapsed / 390.0)
+                    rvol_val = cum_vol / expected if expected > 0 else 1.0
+                    rvol_series.append(round(rvol_val, 4))
+            else:
+                rvol_series = [1.0] * len(bars)
+        else:
+            rvol_series = [1.0] * len(bars)
 
-        today_open  = bars[0].open
-        prior_close = today_open
-        gap_size    = 0.0  # no cross-session data in BarPayload
+        today_open = bars[0].open
+        # Compute gap from prior close using historical data
+        prior_close = today_open  # fallback
+        rvol_df = payload.rvol_df if hasattr(payload, 'rvol_df') else None
+        if rvol_df is not None and not rvol_df.empty and 'close' in rvol_df.columns:
+            prior_close = float(rvol_df['close'].iloc[-1])
+        gap_size = (today_open - prior_close) / prior_close if prior_close > 0 else 0.0
 
         return MarketDataSlice(
             symbol=symbol,

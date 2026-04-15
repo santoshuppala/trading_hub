@@ -213,8 +213,9 @@ class OptionsEngine:
         self._daily_pnl      = 0.0
 
         # ── Subscribe ──────────────────────────────────────────────────
-        bus.subscribe(EventType.SIGNAL, self._on_signal, priority=3)
-        bus.subscribe(EventType.BAR,    self._on_bar,    priority=3)
+        bus.subscribe(EventType.SIGNAL,     self._on_signal,     priority=3)
+        bus.subscribe(EventType.BAR,        self._on_bar,        priority=3)
+        bus.subscribe(EventType.POP_SIGNAL, self._on_pop_signal, priority=3)
 
         log.info(
             "[OptionsEngine] ready | max_pos=%d | budget=$%.0f/trade | total=$%.0f | "
@@ -258,6 +259,7 @@ class OptionsEngine:
             spot_price=p.current_price,
             iv_estimate=iv_estimate,
             iv_rank=iv_rank,
+            ticker=p.ticker,
         )
 
         if strategy_type is None:
@@ -286,6 +288,101 @@ class OptionsEngine:
             rvol=p.rvol,
             rsi_value=p.rsi_value,
             source='signal',
+            source_event=event,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # POP_SIGNAL HANDLER — News/sentiment-driven options entries
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _on_pop_signal(self, event: Event) -> None:
+        """
+        Convert a pop screener candidate into an options trade.
+
+        Pop candidates are news/sentiment-driven — ideal for options because:
+          - Catalyst provides directional conviction (long call/put)
+          - Defined risk via options (vs unlimited risk on equity short)
+          - If IV is already elevated from the news, use debit spreads to reduce cost
+
+        Strategy selection:
+          - Bullish pop (MODERATE_NEWS, SENTIMENT_POP, UNUSUAL_VOLUME, EARNINGS gap up)
+            → long_call or bull_call_spread (depending on IV rank)
+          - Bearish or high-impact with gap down
+            → long_put or bear_put_spread
+          - IV rich after news spike (IV rank > 50)
+            → debit spread (cap IV crush risk)
+        """
+        p = event.payload
+        if self._chain is None:
+            return
+
+        ticker = p.symbol
+        entry_price = float(p.entry_price)
+        rvol = float(p.rvol) if hasattr(p, 'rvol') else 1.0
+        atr = float(p.atr_value) if hasattr(p, 'atr_value') else entry_price * 0.02
+
+        # Determine direction from pop reason and features
+        pop_reason = str(getattr(p, 'pop_reason', '')).upper()
+        features_json = getattr(p, 'features_json', '{}')
+        try:
+            import json
+            feats = json.loads(features_json) if isinstance(features_json, str) else features_json
+        except Exception as exc:
+            log.debug("[OptionsEngine] POP_SIGNAL features_json parse failed for %s: %s", ticker, exc)
+            feats = {}
+
+        sentiment_delta = float(feats.get('sentiment_delta', 0))
+        gap_size = float(feats.get('gap_size', 0))
+
+        # Infer direction: bullish if positive sentiment + positive gap
+        is_bullish = sentiment_delta >= 0 or gap_size >= 0
+
+        # Get IV context
+        iv_estimate = self._estimate_iv(ticker, entry_price)
+        self._iv_tracker.update(ticker, iv_estimate)
+        iv_rank = self._iv_tracker.iv_rank(ticker)
+        iv_is_rich = iv_rank >= 50
+
+        # Earnings safety: block credit strategies near earnings
+        earnings_safe = self._earnings.is_earnings_safe(ticker, min_days=7)
+
+        # Strategy selection based on direction + IV regime
+        if is_bullish:
+            if iv_is_rich:
+                # IV rich after news → use spread to cap IV crush
+                strategy_type = 'bull_call_spread'
+            elif rvol >= 2.5:
+                # Strong momentum + cheap IV → outright call
+                strategy_type = 'long_call'
+            else:
+                # Moderate conviction → spread
+                strategy_type = 'bull_call_spread'
+        else:
+            if iv_is_rich:
+                strategy_type = 'bear_put_spread'
+            elif rvol >= 2.5:
+                strategy_type = 'long_put'
+            else:
+                strategy_type = 'bear_put_spread'
+
+        # RSI estimate from features (or default neutral)
+        rsi_value = float(feats.get('rsi', 50.0))
+
+        log.info(
+            "[OptionsEngine] POP_SIGNAL → %s %s | reason=%s sent_delta=%.2f gap=%.3f "
+            "rvol=%.2f iv=%.2f iv_rank=%.0f direction=%s",
+            ticker, strategy_type, pop_reason, sentiment_delta, gap_size,
+            rvol, iv_estimate, iv_rank, 'BULL' if is_bullish else 'BEAR',
+        )
+
+        self._execute_entry(
+            ticker=ticker,
+            spot_price=entry_price,
+            strategy_type=strategy_type,
+            atr_value=atr,
+            rvol=rvol,
+            rsi_value=rsi_value,
+            source='pop_signal',
             source_event=event,
         )
 

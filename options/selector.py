@@ -61,6 +61,7 @@ class OptionStrategySelector:
         spot_price:  float,
         iv_estimate: float,
         iv_rank:     float = 50.0,
+        ticker:      str = '',
     ) -> Optional[str]:
         """
         Signal-driven selection using IV rank.
@@ -72,6 +73,8 @@ class OptionStrategySelector:
         RVOL dictates conviction:
           high RVOL → strong move → more aggressive (single leg or wider spread)
           low RVOL  → weak move → only credit if IV rank supports it
+
+        ETFs use lower RVOL thresholds (they never reach 2.5x).
         """
         action_upper = action.upper()
         is_buy = action_upper == 'BUY'
@@ -84,8 +87,19 @@ class OptionStrategySelector:
         iv_is_cheap = iv_rank < IV_RANK_LOW
         iv_very_rich = iv_rank >= IV_RANK_VERY_HIGH
 
+        # ETFs have structurally lower RVOL — scale thresholds down
+        from monitor.sector_map import is_etf
+        if is_etf(ticker):
+            rvol_high = RVOL_HIGH_THRESHOLD * 0.35  # 2.5 → 0.875
+            rvol_mod  = RVOL_MOD_THRESHOLD * 0.5    # 1.2 → 0.6
+            rvol_low  = RVOL_LOW_THRESHOLD * 0.5    # 0.8 → 0.4
+        else:
+            rvol_high = RVOL_HIGH_THRESHOLD
+            rvol_mod  = RVOL_MOD_THRESHOLD
+            rvol_low  = RVOL_LOW_THRESHOLD
+
         # ── Tier 1: High RVOL — strong directional momentum ──────────
-        if rvol >= RVOL_HIGH_THRESHOLD:
+        if rvol >= rvol_high:
             if iv_is_cheap or (not iv_is_rich):
                 # IV cheap/neutral: buy outright (premium is affordable)
                 return 'long_call' if is_buy else 'long_put'
@@ -94,7 +108,7 @@ class OptionStrategySelector:
                 return 'bull_call_spread' if is_buy else 'bear_put_spread'
 
         # ── Tier 2: Moderate RVOL — spreads ───────────────────────────
-        if rvol >= RVOL_MOD_THRESHOLD:
+        if rvol >= rvol_mod:
             if iv_is_rich:
                 # IV rich: sell premium (credit spread)
                 return 'bull_put_spread' if is_buy else 'bear_call_spread'
@@ -103,7 +117,7 @@ class OptionStrategySelector:
                 return 'bull_call_spread' if is_buy else 'bear_put_spread'
 
         # ── Tier 3: Low RVOL — only trade if IV rank gives clear edge ─
-        if rvol >= RVOL_LOW_THRESHOLD:
+        if rvol >= rvol_low:
             if iv_very_rich:
                 # IV very rich + low vol = ideal credit selling
                 return 'bull_put_spread' if is_buy else 'bear_call_spread'

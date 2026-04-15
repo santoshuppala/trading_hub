@@ -327,6 +327,44 @@ def main():
         db_sub.register()
         log.info("EventSourcingSubscriber registered — all events persisted with correct timestamps")
 
+    # ── Smart routing (multi-broker) ────────────────────────────────────────
+    from config import BROKER_MODE
+    if BROKER_MODE == 'smart':
+        try:
+            from monitor.tradier_broker import TradierBroker
+            from monitor.smart_router import SmartRouter
+
+            tradier_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TRADING_TOKEN', '')
+            tradier_account = os.getenv('TRADIER_ACCOUNT_ID', '')
+            tradier_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+
+            if tradier_token and tradier_account:
+                tradier_broker = TradierBroker(
+                    bus=monitor._bus,
+                    token=tradier_token,
+                    account_id=tradier_account,
+                    sandbox=tradier_sandbox,
+                    subscribe=False,  # SmartRouter handles routing
+                )
+                # Get the existing Alpaca broker from monitor
+                alpaca_broker = getattr(monitor, '_broker', None)
+
+                smart_router = SmartRouter(
+                    bus=monitor._bus,
+                    alpaca_broker=alpaca_broker,
+                    tradier_broker=tradier_broker,
+                    default_broker='alpaca',
+                )
+                log.info("SmartRouter active | brokers=alpaca+tradier | mode=%s", BROKER_MODE)
+            else:
+                log.warning("BROKER_MODE=smart but Tradier credentials missing — using Alpaca only")
+        except Exception as exc:
+            log.warning("SmartRouter init failed (non-fatal): %s — using Alpaca only", exc)
+    elif BROKER_MODE == 'tradier':
+        log.info("BROKER_MODE=tradier — Tradier-only execution (not yet wired)")
+    else:
+        log.info("BROKER_MODE=alpaca — single broker mode")
+
     # ── Pro-setups engine (11 strategies, shared Alpaca account) ─────────────
     from pro_setups.engine import ProSetupEngine
     pro_engine = ProSetupEngine(
@@ -376,6 +414,17 @@ def main():
         f"PopStrategyEngine ready | paper={POP_PAPER_TRADING} | "
         f"max_positions={POP_MAX_POSITIONS} | budget=${POP_TRADE_BUDGET} | "
         f"news={'benzinga' if news_source else 'mock'} | social=stocktwits"
+    )
+
+    # Log sentiment baselines
+    baseline_summary = pop_engine._baseline_engine.summary()
+    log.info(
+        "SentimentBaseline ready | headline_tickers=%d | social_tickers=%d | "
+        "from_db=%s | lookback=%d days",
+        baseline_summary['headline_tickers'],
+        baseline_summary['social_tickers'],
+        baseline_summary['loaded_from_db'],
+        baseline_summary['lookback_days'],
     )
 
     # ── T3.7: Options engine (dedicated Alpaca options account) ───────────────────
@@ -602,9 +651,28 @@ def main():
         except Exception as exc:
             log.warning(f"Preflight audit failed (non-fatal): {exc}")
 
+    # ── Portfolio-level risk gate (aggregate limits across all engines) ─────
+    from monitor.portfolio_risk import PortfolioRiskGate
+    portfolio_risk = PortfolioRiskGate(bus=monitor._bus, monitor=monitor)
+    log.info("PortfolioRiskGate active | drawdown=$%.0f | notional=$%.0f | delta=%.1f | gamma=%.1f",
+             portfolio_risk._max_drawdown if hasattr(portfolio_risk, '_max_drawdown') else -5000,
+             100000, 5.0, 1.0)
+    portfolio_risk.reset_day()
+
     monitor.start()
     kill_guard = KillSwitchGuard(monitor._bus, MAX_DAILY_LOSS, monitor, log)
     log.info("Monitor running. New entries stop at 3:00 PM ET, exits until 4:00 PM ET.")
+
+    # ── Data source collector (fetch + persist alternative data) ────────────
+    data_collector = None
+    try:
+        from data_sources.collector import DataSourceCollector
+        data_collector = DataSourceCollector(bus=monitor._bus)
+        data_collector.collect_session_start(TICKERS, max_tickers=20)
+        log.info("DataSourceCollector: session start collection complete")
+    except Exception as exc:
+        data_collector = None
+        log.warning("DataSourceCollector init failed (non-fatal): %s", exc)
 
     # ── Trading halted flag (daily loss kill switch) ──────────────────────────
     trading_halted = False
@@ -700,6 +768,13 @@ def main():
                         pass
                 log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}{hourly_extra}")
 
+            # Periodic data source collection (every 10 minutes at :10, :20, :30, :40, :50)
+            if now.minute % 10 == 0 and now.minute != 0 and data_collector:
+                try:
+                    data_collector.collect_periodic(TICKERS, max_tickers=10)
+                except Exception:
+                    pass
+
             # ── Intraday position reconciliation (every hour at :30) ──────
             if now.minute == 30 and ALPACA_API_KEY and ALPACA_SECRET:
                 try:
@@ -749,6 +824,32 @@ def main():
                 except Exception as exc:
                     log.debug("Intraday reconciliation failed (non-fatal): %s", exc)
 
+                # Tradier reconciliation
+                tradier_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TRADING_TOKEN', '')
+                tradier_account = os.getenv('TRADIER_ACCOUNT_ID', '')
+                if tradier_token and tradier_account:
+                    try:
+                        tradier_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                        tradier_base = 'https://sandbox.tradier.com' if tradier_sandbox else 'https://api.tradier.com'
+                        r = _req.get(
+                            f'{tradier_base}/v1/accounts/{tradier_account}/positions',
+                            headers={'Authorization': f'Bearer {tradier_token}', 'Accept': 'application/json'},
+                            timeout=10,
+                        )
+                        if r.status_code == 200:
+                            pos_data = r.json().get('positions', {})
+                            if pos_data and pos_data != 'null':
+                                pos_list = pos_data.get('position', [])
+                                if isinstance(pos_list, dict):
+                                    pos_list = [pos_list]
+                                tradier_positions = {p['symbol']: int(float(p['quantity'])) for p in pos_list}
+                                if tradier_positions:
+                                    log.info("Tradier reconciliation: %d positions: %s",
+                                             len(tradier_positions),
+                                             ', '.join(f"{t}({q})" for t, q in tradier_positions.items()))
+                    except Exception as exc:
+                        log.debug("Tradier reconciliation failed (non-fatal): %s", exc)
+
             time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
@@ -780,6 +881,14 @@ def main():
                 )
             except Exception as exc:
                 log.warning(f"DB shutdown error (non-fatal): {exc}")
+        # EOD data source collection
+        if data_collector:
+            try:
+                data_collector.collect_session_end(TICKERS, max_tickers=30)
+                log.info("DataSourceCollector: EOD collection complete")
+            except Exception as exc:
+                log.warning("DataSourceCollector EOD failed: %s", exc)
+
         # ── EOD POSITION AUDIT (log what's still open, don't force close) ──
         # Pro/Pop positions may be valid swing holds — don't liquidate.
         # Only cancel stale open ORDERS (prevents wash trade issues next morning).

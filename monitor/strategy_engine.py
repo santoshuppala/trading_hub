@@ -141,6 +141,7 @@ class StrategyEngine:
     def _check_entry(self, ticker: str, df, rvol_df, parent: Event) -> None:
         result = self._analyzer.analyze(ticker, df, {ticker: rvol_df} if rvol_df is not None else {})
         if result is None:
+            log.debug("[StrategyEngine] %s: analyze returned None (insufficient bars or data)", ticker)
             return
 
         vwap_reclaim      = result['_vwap_reclaim']
@@ -148,7 +149,17 @@ class StrategyEngine:
         rsi_value         = result['rsi_value']
         rvol              = result['rvol']
 
-        if not (vwap_reclaim and opened_above_vwap):
+        if not vwap_reclaim and not opened_above_vwap:
+            log.debug("[StrategyEngine] %s SKIP: no vwap_reclaim AND not opened_above_vwap | rsi=%.1f rvol=%.2f",
+                      ticker, rsi_value, rvol)
+            return
+        if not vwap_reclaim:
+            log.debug("[StrategyEngine] %s SKIP: no vwap_reclaim (opened_above=True) | rsi=%.1f rvol=%.2f",
+                      ticker, rsi_value, rvol)
+            return
+        if not opened_above_vwap:
+            log.debug("[StrategyEngine] %s SKIP: not opened_above_vwap (reclaim=True) | rsi=%.1f rvol=%.2f",
+                      ticker, rsi_value, rvol)
             return
 
         # SPY market bias (data_client may be None in test mode)
@@ -163,6 +174,8 @@ class StrategyEngine:
             spy_bullish = True
 
         if not spy_bullish:
+            log.debug("[StrategyEngine] %s SKIP: SPY below VWAP (no market tailwind) | rsi=%.1f rvol=%.2f",
+                      ticker, rsi_value, rvol)
             return
 
         current_price     = result['current_price']
@@ -261,7 +274,8 @@ class StrategyEngine:
         pos = self._positions[ticker]
         try:
             current_price = float(df['close'].iloc[-1])
-        except Exception:
+        except Exception as exc:
+            log.debug("[StrategyEngine] EOD close price extraction failed for %s: %s", ticker, exc)
             current_price = pos['entry_price']
 
         log.info(f"[StrategyEngine] EOD force-close signal: {ticker} @ ${current_price:.2f}")
@@ -300,7 +314,8 @@ class StrategyEngine:
 
         try:
             current_price = float(df['close'].iloc[-1])
-        except Exception:
+        except Exception as exc:
+            log.debug("[StrategyEngine] Partial sell price extraction failed for %s: %s", ticker, exc)
             current_price = pos['entry_price']
 
         log.info(

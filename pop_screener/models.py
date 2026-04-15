@@ -104,6 +104,8 @@ class SocialData:
     mention_velocity: float  # mentions per hour (current window)
     bullish_pct:      float  # fraction of mentions that are bullish [0, 1]
     bearish_pct:      float  # fraction that are bearish [0, 1]
+    newest_message_time: str = ''  # ISO timestamp of newest message
+    oldest_message_time: str = ''  # ISO timestamp of oldest message in batch
 
 
 @dataclass

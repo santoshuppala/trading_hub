@@ -147,3 +147,11 @@ TRADIER_SANDBOX_TOKEN  = os.getenv('TRADIER_SANDBOX_TOKEN', '')     # sandbox to
 # 'alpaca' — always use Alpaca (current behavior)
 # 'tradier' — always use Tradier
 BROKER_MODE = os.getenv('BROKER_MODE', 'alpaca')  # 'alpaca', 'tradier', or 'smart'
+
+# ── Alternative data sources ──────────────────────────────────────────────
+FRED_API_KEY        = os.getenv('FRED_API_KEY', '')
+ALPHA_VANTAGE_KEY   = os.getenv('ALPHA_VANTAGE_KEY', '')
+REDDIT_CLIENT_ID    = os.getenv('REDDIT_CLIENT_ID', '')
+REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', '')
+REDDIT_USERNAME     = os.getenv('REDDIT_USERNAME', '')
+REDDIT_PASSWORD     = os.getenv('REDDIT_PASSWORD', '')

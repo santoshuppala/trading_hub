@@ -8,10 +8,11 @@ broker/executor acts.
 from __future__ import annotations
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from monitor.event_bus import EventBus, EventType, DispatchMode
+from monitor.event_bus import EventBus, EventType, DispatchMode, SimulatedTimeSource
 from monitor.position_registry import registry
 
 log = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ class SignalCapture:
     """
 
     def __init__(self):
-        self.all_signals: List[tuple[str, Any]] = []  # complete audit trail: ('pro' | 'pop' | 'options', payload)
+        self.all_signals: deque = deque(maxlen=50_000)  # bounded audit trail: ('pro' | 'pop' | 'options', payload)
         self.fill_simulator: Optional[Any] = None  # set by BacktestEngine after construction
 
     def on_pro(self, event: Any) -> None:
@@ -109,8 +110,11 @@ class BacktestBus:
         # Reset global position registry before each backtest run
         registry._positions.clear()
 
-        # Real EventBus in SYNC mode
-        self.bus = EventBus(mode=DispatchMode.SYNC)
+        # Simulated clock for deterministic backtest timestamps
+        self._time_source = SimulatedTimeSource()
+
+        # Real EventBus in SYNC mode with injected simulated clock
+        self.bus = EventBus(mode=DispatchMode.SYNC, time_source=self._time_source)
         self.capture = SignalCapture()
 
         # Swallow ORDER_REQ and FILL at priority=999 (before any engine subscriber)
@@ -143,7 +147,11 @@ class BacktestBus:
             priority=999,
         )
 
-        log.info("[BacktestBus] Initialized with SYNC dispatch, signal capture at priority=999")
+        log.info("[BacktestBus] Initialized with SYNC dispatch, simulated clock, signal capture at priority=999")
+
+    def set_time(self, dt) -> None:
+        """Advance simulated clock (called by backtest engine per bar)."""
+        self._time_source.set_time(dt)
 
     def reset_for_session(self) -> None:
         """Reset position registry and signal capture for a new trading session."""

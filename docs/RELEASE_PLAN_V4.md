@@ -26,7 +26,7 @@
 
 ## Phase 1: Quick Fixes (2 hours)
 
-### Fix 1.1: PopStrategy Thread Safety
+### Fix 1.1: PopStrategy Thread Safety -- DONE
 
 **Problem**: `_positions` set and `_last_order_time` dict mutated without locks. Under concurrent BAR processing, position limits can be exceeded (two entries pass the limit check simultaneously).
 
@@ -102,7 +102,7 @@ grep -n "self._lock\|threading.Lock\|with self._lock" pop_strategy_engine.py
 
 ---
 
-### Fix 1.2: Backtest Memory Bound
+### Fix 1.2: Backtest Memory Bound -- DONE
 
 **Problem**: `SignalCapture.all_signals` grows without limit during backtests. A 1-year backtest on 100 tickers can accumulate millions of entries, exhausting memory.
 
@@ -155,7 +155,7 @@ grep -n "deque\|maxlen\|MAX_SIGNALS" backtests/sync_bus.py
 
 ---
 
-### Fix 1.3: Options Chain Rate Limiting
+### Fix 1.3: Options Chain Rate Limiting -- DONE
 
 **Problem**: No per-second rate limiting on chain API calls. If cache misses coincide (startup, new tickers), the client can burst 10+ requests/second and hit Alpaca's rate limit. All calls then return empty for the rest of the session.
 
@@ -221,7 +221,7 @@ grep -n "_RateLimiter\|rate_limiter\|\.wait()" options/chain.py
 
 ---
 
-### Fix 1.4: Remaining Magic Numbers
+### Fix 1.4: Remaining Magic Numbers -- DONE
 
 **Problem**: Stop percentages, trade times still hardcoded in several files.
 
@@ -339,7 +339,7 @@ python -m pytest test/test_19_options_e2e.py -v
 
 ---
 
-### Test 2.2: Risk Module Tests
+### Test 2.2: Risk Module Tests -- DONE
 
 **Problem**: `portfolio_risk.py`, `risk_sizing.py`, `smart_router.py` have zero test coverage.
 
@@ -411,7 +411,7 @@ python -m pytest test/test_20_risk_modules.py -v
 
 ---
 
-### Test 2.3: Data Source Tests
+### Test 2.3: Data Source Tests -- DONE
 
 **Problem**: `data_sources/` has 12 files and zero tests. Circuit breaker, smart persistence, and dedup logic are untested.
 
@@ -574,7 +574,7 @@ print('OK')
 
 ---
 
-### Fix 3.2: New Risk Checks in Backtests
+### Fix 3.2: New Risk Checks in Backtests -- DONE
 
 **Problem**: Backtests don't use beta sizing, correlation limits, or portfolio risk. Backtest results overstate performance because real-world risk constraints are not applied.
 

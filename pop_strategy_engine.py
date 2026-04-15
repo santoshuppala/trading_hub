@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Dict, List, Optional, Set
@@ -146,8 +147,8 @@ class PopExecutor:
         self._order_cooldown = order_cooldown
         self._alert_email    = alert_email
 
-        # Mutable state — accessed only from EventBus worker threads for the
-        # same ticker partition, so no cross-ticker race is possible.
+        # Mutable state — protected by _lock for thread safety.
+        self._lock = threading.Lock()
         self._positions:        Set[str]         = set()   # currently open pop positions
         self._last_order_time:  Dict[str, float] = {}      # ticker → monotonic timestamp
 
@@ -170,7 +171,7 @@ class PopExecutor:
         symbol = entry.symbol
         now    = time.monotonic()
 
-        # ── Risk gate ────────────────────────────────────────────────────────
+        # ── Risk gate (protected by _lock) ───────────────────────────────────
         # Cross-layer dedup: check global registry first
         from monitor.position_registry import registry
         if not registry.try_acquire(symbol, layer="pop"):
@@ -180,44 +181,44 @@ class PopExecutor:
 
         _approved = False
         try:
-            if len(self._positions) >= self._max_positions:
-                log.info("POP risk block %s: max pop positions (%d) reached",
-                         symbol, self._max_positions)
-                return
+            with self._lock:
+                if len(self._positions) >= self._max_positions:
+                    log.info("POP risk block %s: max pop positions (%d) reached",
+                             symbol, self._max_positions)
+                    return
 
-            # Sector concentration limit (max 2 per sector)
-            _MAX_PER_SECTOR = 2
-            sector = get_sector(symbol)
-            sector_counts = count_sector_positions(self._positions)
-            if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
-                log.info("POP risk block %s: sector %s already has %d positions",
-                         symbol, sector, sector_counts[sector])
-                return
+                # Sector concentration limit (max 2 per sector)
+                _MAX_PER_SECTOR = 2
+                sector = get_sector(symbol)
+                sector_counts = count_sector_positions(self._positions)
+                if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
+                    log.info("POP risk block %s: sector %s already has %d positions",
+                             symbol, sector, sector_counts[sector])
+                    return
 
-            last = self._last_order_time.get(symbol, 0.0)
-            if (now - last) < self._order_cooldown:
-                remaining = int(self._order_cooldown - (now - last))
-                log.info("POP risk block %s: cooldown %ds remaining", symbol, remaining)
-                return
+                last = self._last_order_time.get(symbol, 0.0)
+                if (now - last) < self._order_cooldown:
+                    remaining = int(self._order_cooldown - (now - last))
+                    log.info("POP risk block %s: cooldown %ds remaining", symbol, remaining)
+                    return
 
-            if symbol in self._positions:
-                log.info("POP risk block %s: already in open pop position", symbol)
-                return
+                if symbol in self._positions:
+                    log.info("POP risk block %s: already in open pop position", symbol)
+                    return
 
-            # ── Size: shares = floor(budget / entry_price) ────────────────────
-            qty = int(self._trade_budget // entry.entry_price)
-            if qty <= 0:
-                log.warning("POP risk block %s: trade_budget $%.0f too small for price $%.2f",
-                            symbol, self._trade_budget, entry.entry_price)
-                return
+                # ── Size: shares = floor(budget / entry_price) ────────────────────
+                qty = int(self._trade_budget // entry.entry_price)
+                if qty <= 0:
+                    log.warning("POP risk block %s: trade_budget $%.0f too small for price $%.2f",
+                                symbol, self._trade_budget, entry.entry_price)
+                    return
 
-            _approved = True
+                # Mark cooldown and approve while still holding the lock
+                self._last_order_time[symbol] = now
+                _approved = True
         finally:
             if not _approved:
                 registry.release(symbol)
-
-        # ── Execute ───────────────────────────────────────────────────────────
-        self._last_order_time[symbol] = now
 
         if self._paper:
             self._paper_fill(entry, qty, pop_payload)
@@ -226,7 +227,8 @@ class PopExecutor:
 
     def close_position(self, symbol: str, reason: str, current_price: float) -> None:
         """Mark a pop position as closed (called by PopStrategyEngine on exit signal)."""
-        self._positions.discard(symbol)
+        with self._lock:
+            self._positions.discard(symbol)
         from monitor.position_registry import registry
         registry.release(symbol)
         log.info("POP position closed: %s @ $%.4f reason=%s", symbol, current_price, reason)
@@ -240,7 +242,8 @@ class PopExecutor:
         order_id  = f"pop-paper-{uuid.uuid4().hex[:12]}"
         fill_price = entry.entry_price
 
-        self._positions.add(entry.symbol)
+        with self._lock:
+            self._positions.add(entry.symbol)
         log.info(
             "POP PAPER FILL: BUY %d %s @ $%.4f  stop=%.4f  t1=%.4f  t2=%.4f  "
             "strategy=%s  order_id=%s",
@@ -319,7 +322,8 @@ class PopExecutor:
             if filled:
                 filled_qty = int(float(order.filled_qty  or qty))
                 avg_price  = float(order.filled_avg_price or limit_price)
-                self._positions.add(symbol)
+                with self._lock:
+                    self._positions.add(symbol)
                 log.info(
                     "POP FILL: %d %s avg $%.4f  stop=%.4f  t1=%.4f  t2=%.4f  order=%s",
                     filled_qty, symbol, avg_price,
@@ -376,7 +380,8 @@ class PopExecutor:
 
     @property
     def open_positions(self) -> Set[str]:
-        return set(self._positions)
+        with self._lock:
+            return set(self._positions)
 
 
 # ── T3.5 pop strategy engine ──────────────────────────────────────────────────
@@ -429,6 +434,9 @@ class PopStrategyEngine:
         self._headline_baseline = headline_baseline
         self._social_baseline   = social_baseline
         self._enabled           = enabled
+        self._news_failures     = 0
+        self._social_failures   = 0
+        self._max_data_failures = 10  # disable source after 10 consecutive failures
 
         # Per-ticker baselines from historical DB data (replaces static defaults)
         from pop_screener.sentiment_baseline import SentimentBaselineEngine
@@ -541,19 +549,42 @@ class PopStrategyEngine:
                           symbol, bar_range_pct, last_rvol, market_slice.gap_size)
                 return
 
-        # 2. External data
+        # 2. External data (with circuit breaker for consecutive failures)
+        if self._news_failures >= self._max_data_failures:
+            log.debug("PopEngine: news source disabled after %d consecutive failures, skipping %s",
+                      self._news_failures, symbol)
+            return
+        if self._social_failures >= self._max_data_failures:
+            log.debug("PopEngine: social source disabled after %d consecutive failures, skipping %s",
+                      self._social_failures, symbol)
+            return
         try:
             news_1h  = self._news.get_news(symbol, window_hours=1.0)
             news_24h = self._news.get_news(symbol, window_hours=24.0)
+            self._news_failures = 0  # reset on success
+        except Exception as exc:
+            self._news_failures += 1
+            if self._news_failures >= self._max_data_failures:
+                log.error("PopEngine: news source disabled after %d consecutive failures", self._news_failures)
+            log.warning("PopStrategyEngine: news fetch failed for %s: %s", symbol, exc)
+            return
+        try:
             social   = self._social.get_social(symbol, window_hours=1.0)
+            self._social_failures = 0  # reset on success
+        except Exception as exc:
+            self._social_failures += 1
+            if self._social_failures >= self._max_data_failures:
+                log.error("PopEngine: social source disabled after %d consecutive failures", self._social_failures)
+            log.warning("PopStrategyEngine: social fetch failed for %s: %s", symbol, exc)
+            return
+        try:
             log.debug("POP data %s: news_1h=%d news_24h=%d social_mentions=%d bull=%.0f%% bear=%.0f%%",
                       symbol, len(news_1h), len(news_24h),
                       getattr(social, 'mention_count', 0),
                       getattr(social, 'bullish_pct', 0) * 100,
                       getattr(social, 'bearish_pct', 0) * 100)
-        except Exception as exc:
-            log.warning("PopStrategyEngine: data fetch failed for %s: %s", symbol, exc)
-            return
+        except Exception:
+            pass
 
         # 2b. Smart persistence: only persist if data meaningfully changed
         try:

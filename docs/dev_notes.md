@@ -1808,3 +1808,22 @@ Single-session overhaul: 3.9/10 → 7.6/10 hedge fund rating. ~11,000 lines acro
 - 3 new tabs: Risk Analytics, Strategy Attribution, Market Regime
 - .env auto-loading for API keys
 
+---
+
+## 23. Architecture Audit — 10 Critical Concerns (2026-04-14)
+
+Audit of 10 institutional-grade concerns against codebase:
+
+| Issue | Status | Fix |
+|---|---|---|
+| Thread-pool blocking | Addressed (process isolation) | 4 separate processes |
+| Crash isolation | Addressed (supervisor) | Independent restart per engine |
+| GIL contention | Addressed (multiprocessing) | 4 processes = 4 cores |
+| Shared state races | Addressed (locks + file locking) | threading.Lock on all _positions; fcntl for registry |
+| Event ordering | Addressed (causal partitioning) | Ticker-based partition key across all EventTypes |
+| Idempotency | Fixed (event_id dedup) | 10K window in EventBus + FILL dedup in PositionManager |
+| Timeouts/retries/circuit breakers | Addressed (all APIs) | 5s timeouts, MAX_RETRIES, SmartRouter + collector circuit breakers |
+| Backpressure | Addressed (EventBus v5.2) | DROP_OLDEST, priority eviction, 60/80/95% thresholds |
+| Health checks | Partially addressed | Broker circuit breaker + data source circuit breaker; broker-down halt added |
+| Replay determinism | Fixed (SimulatedTimeSource) | Injected into backtest EventBus |
+

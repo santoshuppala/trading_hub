@@ -242,4 +242,27 @@
 
 ---
 
+---
+
+## VII. ARCHITECTURE AUDIT (April 14)
+
+10 institutional-grade concerns audited against the codebase:
+
+| Concern | Status | Evidence |
+|---|---|---|
+| Thread-pool blocking | DONE | Process isolation (4 processes) |
+| Crash isolation | DONE | Supervisor with independent restart |
+| GIL contention | DONE | Multiprocessing (4 cores) |
+| Shared state races | DONE | threading.Lock + fcntl file locking |
+| Event ordering | DONE | Causal partitioning by ticker |
+| Idempotency | DONE | EventBus 10K dedup + FILL event_id check |
+| Timeouts/retries | DONE | All APIs have timeouts + circuit breakers |
+| Backpressure | DONE | DROP_OLDEST + priority eviction + 60/80/95% monitor |
+| Health checks | PARTIAL | Broker + data source circuit breakers; needs dependency-level gating |
+| Replay determinism | DONE | SimulatedTimeSource injected in backtests |
+
+**9/10 concerns fully addressed. 1 partial (dependency-level health gating). System rating updated to 7.8/10.**
+
+---
+
 *This report contains no fabricated data. All statements are based on actual code, test results, trading logs, and system state as of April 14, 2026.*

@@ -26,6 +26,7 @@ from backtests.metrics import MetricsEngine, BacktestResult
 from backtests.adapters.pro_adapter import ProBacktestAdapter
 from monitor.event_bus import Event, EventType
 from monitor.events import BarPayload
+from monitor.risk_sizing import RiskSizer
 
 try:
     from backtests.adapters.options_adapter import OptionsBacktestAdapter
@@ -52,6 +53,7 @@ class BacktestEngine:
         engines: List[str] = None,
         data_source: str = 'yfinance',
         trade_budget: float = 1000.0,
+        use_risk_sizing: bool = True,
         **engine_kwargs,
     ):
         """
@@ -64,6 +66,7 @@ class BacktestEngine:
             engines: ['pro', 'pop', 'options'] — which engines to run
             data_source: 'yfinance' (default) | 'tradier' | 'alpaca'
             trade_budget: starting capital
+            use_risk_sizing: enable beta/correlation risk checks (default True)
             **engine_kwargs: passed to engine constructors (not yet used)
         """
         self.tickers = tickers
@@ -72,7 +75,13 @@ class BacktestEngine:
         self.engines_to_run = engines or ['pro']
         self.data_source = data_source
         self.trade_budget = trade_budget
+        self.use_risk_sizing = use_risk_sizing
         self.engine_kwargs = engine_kwargs
+
+        # Risk sizing (beta-adjusted, correlation-aware)
+        self._sizer = RiskSizer() if use_risk_sizing else None
+        # Per-ticker ATR cache (updated each bar for sizing adjustments)
+        self._atr_cache: Dict[str, float] = {}
 
         # Load data
         self.loader = BarDataLoader(source=data_source)
@@ -83,6 +92,10 @@ class BacktestEngine:
         self.bus = BacktestBus()
         self.fill_simulator = FillSimulator(trade_budget=trade_budget)
         self.bus.capture.fill_simulator = self.fill_simulator
+
+        # Wire risk sizing into the signal capture pipeline
+        if self._sizer:
+            self._wire_risk_sizing()
 
         # Initialize strategy engines
         self.adapters: List[Any] = []
@@ -120,6 +133,101 @@ class BacktestEngine:
         return result
 
     # Private methods
+
+    def _wire_risk_sizing(self) -> None:
+        """Wrap SignalCapture handlers to apply correlation + beta sizing before fill queuing."""
+        capture = self.bus.capture
+        fill_sim = self.fill_simulator
+        sizer = self._sizer
+
+        # Save original handlers
+        _orig_on_pro = capture.on_pro
+        _orig_on_pop = capture.on_pop
+
+        def _held_tickers() -> set:
+            """Return set of tickers currently held across all layers."""
+            held = set()
+            for layer_positions in fill_sim.open_positions.values():
+                for pos in layer_positions:
+                    held.add(pos.ticker)
+            return held
+
+        def _risked_on_pro(event) -> None:
+            payload = event.payload
+            ticker = payload.ticker
+
+            # 1. Correlation check
+            held = _held_tickers()
+            corr_ok, corr_reason = sizer.check_correlation(ticker, held)
+            if not corr_ok:
+                log.debug("[Backtest] Correlation block: %s — %s", ticker, corr_reason)
+                capture.all_signals.append(('pro_blocked', payload))
+                return
+
+            # 2. Beta / volatility sizing adjustment
+            base_qty = getattr(payload, 'qty', 1)
+            price = getattr(payload, 'entry_price', 0.0)
+            atr_value = self._atr_cache.get(ticker, 0.0)
+
+            sizing = sizer.adjust_size(
+                ticker=ticker,
+                base_qty=base_qty,
+                price=price,
+                atr_value=atr_value,
+                trade_budget=self.trade_budget,
+            )
+            if sizing.adjusted_qty != base_qty:
+                log.debug(
+                    "[Backtest] Risk sizing %s: %d → %d (%s)",
+                    ticker, base_qty, sizing.adjusted_qty, sizing.adjustment_reason,
+                )
+            payload.qty = sizing.adjusted_qty
+
+            # Record signal and queue fill
+            capture.all_signals.append(('pro', payload))
+            if fill_sim:
+                fill_sim.queue_from_pro(payload)
+
+        def _risked_on_pop(event) -> None:
+            payload = event.payload
+            ticker = payload.ticker
+
+            # 1. Correlation check
+            held = _held_tickers()
+            corr_ok, corr_reason = sizer.check_correlation(ticker, held)
+            if not corr_ok:
+                log.debug("[Backtest] Correlation block: %s — %s", ticker, corr_reason)
+                capture.all_signals.append(('pop_blocked', payload))
+                return
+
+            # 2. Beta / volatility sizing adjustment
+            base_qty = getattr(payload, 'qty', 1)
+            price = getattr(payload, 'entry_price', 0.0)
+            atr_value = self._atr_cache.get(ticker, 0.0)
+
+            sizing = sizer.adjust_size(
+                ticker=ticker,
+                base_qty=base_qty,
+                price=price,
+                atr_value=atr_value,
+                trade_budget=self.trade_budget,
+            )
+            if sizing.adjusted_qty != base_qty:
+                log.debug(
+                    "[Backtest] Risk sizing %s: %d → %d (%s)",
+                    ticker, base_qty, sizing.adjusted_qty, sizing.adjustment_reason,
+                )
+            payload.qty = sizing.adjusted_qty
+
+            # Record signal and queue fill
+            capture.all_signals.append(('pop', payload))
+            if fill_sim:
+                fill_sim.queue_from_pop(payload)
+
+        # Replace handlers on the capture object
+        capture.on_pro = _risked_on_pro
+        capture.on_pop = _risked_on_pop
+        log.info("[BacktestEngine] Risk sizing wired: correlation + beta/vol adjustments enabled")
 
     def _init_engines(self) -> None:
         """Initialize strategy engines based on engines_to_run."""
@@ -215,6 +323,8 @@ class BacktestEngine:
                             atr = float(tr.mean())
                         else:
                             atr = 0.5
+                        # Cache ATR for risk sizing adjustments
+                        self._atr_cache[ticker] = atr
                         for adapter in self.adapters:
                             if hasattr(adapter, 'update_bar'):
                                 adapter.update_bar(ticker, atr, spot)

@@ -79,6 +79,7 @@ class SmartRouter:
 
         self._default = default_broker
         self._lock = threading.Lock()
+        self._all_brokers_down_alerted = False
 
         # Subscribe to ORDER_REQ (we handle routing, individual brokers don't)
         bus.subscribe(EventType.ORDER_REQ, self._on_order_req, priority=1)
@@ -119,6 +120,14 @@ class SmartRouter:
         # No healthy broker available
         log.error("[SmartRouter] NO HEALTHY BROKER for %s %s — all brokers down",
                   p.side, ticker)
+        if not self._all_brokers_down_alerted:
+            self._all_brokers_down_alerted = True
+            log.error("[SmartRouter] ALL BROKERS DOWN — halting order routing")
+            try:
+                from monitor.alerts import send_alert
+                send_alert(None, "ALL BROKERS DOWN — trading halted", severity='CRITICAL')
+            except Exception:
+                pass
         from monitor.events import OrderFailPayload
         self._bus.emit(Event(
             type=EventType.ORDER_FAIL,
@@ -219,6 +228,7 @@ class SmartRouter:
                 h.consecutive_failures = 0
                 h.total_fills += 1
                 h.available = True
+        self._all_brokers_down_alerted = False
 
     def _is_healthy(self, broker_name: str) -> bool:
         """Check if a broker is healthy (circuit breaker)."""

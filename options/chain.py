@@ -8,6 +8,7 @@ Uses alpaca-py SDK:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -32,6 +33,22 @@ except ImportError:
         "[AlpacaOptionChainClient] alpaca-py SDK not installed; "
         "option chain queries will return empty results"
     )
+
+
+class _RateLimiter:
+    """Simple token-bucket rate limiter."""
+    def __init__(self, max_per_second: float = 3.0):
+        self._interval = 1.0 / max_per_second
+        self._last_request = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request
+            if elapsed < self._interval:
+                time.sleep(self._interval - elapsed)
+            self._last_request = time.monotonic()
 
 
 @dataclass
@@ -68,6 +85,7 @@ class AlpacaOptionChainClient:
         # Cache: ticker -> (timestamp, List[OptionContract])
         self._chain_cache: Dict[str, Tuple[float, List[OptionContract]]] = {}
         self._cache_ttl = 60  # seconds
+        self._rate_limiter = _RateLimiter(max_per_second=3.0)
 
         if not _HAS_ALPACA:
             log.warning(
@@ -176,6 +194,7 @@ class AlpacaOptionChainClient:
             expiration_date_lte=exp_to.isoformat(),
         )
 
+        self._rate_limiter.wait()
         resp = self._trading_client.get_option_contracts(req)
         raw_contracts = resp.option_contracts if resp and resp.option_contracts else []
 
@@ -285,15 +304,28 @@ class AlpacaOptionChainClient:
         all_snapshots: Dict = {}
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i : i + batch_size]
-            try:
-                req = OptionSnapshotRequest(symbol_or_symbols=batch)
-                snaps = self._data_client.get_option_snapshot(req)
-                if snaps:
-                    all_snapshots.update(snaps)
-            except Exception as exc:
-                log.warning(
-                    f"[chain] snapshot batch error (batch {i}): {exc}"
-                )
+            for attempt in range(3):
+                try:
+                    self._rate_limiter.wait()
+                    req = OptionSnapshotRequest(symbol_or_symbols=batch)
+                    snaps = self._data_client.get_option_snapshot(req)
+                    if snaps:
+                        all_snapshots.update(snaps)
+                    break  # success
+                except Exception as exc:
+                    exc_str = str(exc)
+                    if '429' in exc_str and attempt < 2:
+                        backoff = 2 ** (attempt + 1)
+                        log.warning(
+                            "[chain] 429 rate limited (batch %d, attempt %d) — "
+                            "retrying in %ds", i, attempt + 1, backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
+                    log.warning(
+                        f"[chain] snapshot batch error (batch {i}): {exc}"
+                    )
+                    break
         return all_snapshots
 
     # ------------------------------------------------------------------
@@ -550,6 +582,7 @@ class AlpacaOptionChainClient:
             return None
 
         try:
+            self._rate_limiter.wait()
             req = OptionSnapshotRequest(symbol_or_symbols=symbol)
             snaps = self._data_client.get_option_snapshot(req)
             if not snaps or symbol not in snaps:

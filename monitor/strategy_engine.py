@@ -274,7 +274,8 @@ class StrategyEngine:
         pos = self._positions[ticker]
         try:
             current_price = float(df['close'].iloc[-1])
-        except Exception:
+        except Exception as exc:
+            log.debug("[StrategyEngine] EOD close price extraction failed for %s: %s", ticker, exc)
             current_price = pos['entry_price']
 
         log.info(f"[StrategyEngine] EOD force-close signal: {ticker} @ ${current_price:.2f}")
@@ -313,7 +314,8 @@ class StrategyEngine:
 
         try:
             current_price = float(df['close'].iloc[-1])
-        except Exception:
+        except Exception as exc:
+            log.debug("[StrategyEngine] Partial sell price extraction failed for %s: %s", ticker, exc)
             current_price = pos['entry_price']
 
         log.info(

@@ -52,6 +52,9 @@ class BaseBroker(ABC):
         bus.subscribe(EventType.ORDER_REQ, self._on_order_request)
 
     def _on_order_request(self, event: Event) -> None:
+        # Check if portfolio risk gate already blocked this order
+        if getattr(event, '_portfolio_blocked', False):
+            return
         p: OrderRequestPayload = event.payload
         if p.side == 'BUY':
             self._execute_buy(p)
@@ -247,8 +250,8 @@ class AlpacaBroker(BaseBroker):
                     try:
                         self._client.cancel_order_by_id(str(oo.id))
                         log.info(f"Cancelled {oo.side} order {oo.id} for {p.ticker} before SELL")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.warning("Cancel open order %s for %s failed: %s", oo.id, p.ticker, exc)
                 # Wait for Alpaca to process cancellations
                 time.sleep(0.5)
         except Exception as cancel_err:
@@ -267,9 +270,9 @@ class AlpacaBroker(BaseBroker):
                     f"Alpaca says {alpaca_qty} — using Alpaca qty"
                 )
                 actual_qty = alpaca_qty
-        except Exception:
+        except Exception as exc:
             # Position may not exist at Alpaca (already closed)
-            pass
+            log.debug("Position lookup for %s failed (may be already closed): %s", p.ticker, exc)
 
         if actual_qty <= 0:
             log.warning(f"SELL skipped for {p.ticker}: no position at Alpaca")
@@ -306,7 +309,8 @@ class AlpacaBroker(BaseBroker):
                     elif status in ('cancelled', 'expired', 'rejected'):
                         log.warning(f"SELL {p.ticker} order {status}")
                         break
-                except Exception:
+                except Exception as exc:
+                    log.warning("SELL order status check failed (%s): %s", order_id, exc)
                     break
 
             if filled:

@@ -62,6 +62,9 @@ class TradierBroker:
 
     def _on_order_req(self, event: Event) -> None:
         """Handle ORDER_REQ events from the bus."""
+        # Check if portfolio risk gate already blocked this order
+        if getattr(event, '_portfolio_blocked', False):
+            return
         p: OrderRequestPayload = event.payload
         side = str(getattr(p, "side", "")).upper()
 
@@ -144,6 +147,7 @@ class TradierBroker:
                             correlation_id=parent_event.event_id,
                         )
                     )
+                    log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
                     return
 
                 # Not filled — cancel and retry
@@ -236,6 +240,7 @@ class TradierBroker:
                         correlation_id=parent_event.event_id,
                     )
                 )
+                log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
             else:
                 log.warning("[TradierBroker] SELL %s not filled", ticker)
                 self._emit_order_fail(p, parent_event)

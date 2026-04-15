@@ -336,6 +336,38 @@ ImportError: cannot import name 'SomeNewPayload' from 'monitor.events'"""
     except Exception as e:
         check("Sentiment baseline", False, str(e))
 
+    # ── Test 11: Production modules import check ───────────────────
+    print("\n11. Production modules import check")
+    try:
+        from monitor.portfolio_risk import PortfolioRiskGate
+        check("PortfolioRiskGate import", True)
+    except Exception as e:
+        check("PortfolioRiskGate import", False, str(e))
+
+    try:
+        from monitor.smart_router import SmartRouter
+        check("SmartRouter import", True)
+    except Exception as e:
+        check("SmartRouter import", False, str(e))
+
+    try:
+        from monitor.risk_sizing import RiskSizer
+        check("RiskSizer import", True)
+    except Exception as e:
+        check("RiskSizer import", False, str(e))
+
+    try:
+        from data_sources.collector import DataSourceCollector
+        check("DataSourceCollector import", True)
+    except Exception as e:
+        check("DataSourceCollector import", False, str(e))
+
+    try:
+        from monitor.tradier_broker import TradierBroker
+        check("TradierBroker import", True)
+    except Exception as e:
+        check("TradierBroker import", False, str(e))
+
     # ── Summary ─────────────────────────────────────────────────────
     print()
     print("=" * 60)

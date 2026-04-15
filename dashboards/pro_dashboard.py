@@ -387,6 +387,17 @@ with col_regime:
     except Exception:
         metric_card("ENGINES", "?", None, 'gray')
 
+    st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+
+    try:
+        from monitor.portfolio_risk import PortfolioRiskGate, MAX_INTRADAY_DRAWDOWN, MAX_NOTIONAL_EXPOSURE
+        # Show limits as reference (gate runs in monitor process, not dashboard)
+        metric_card("DRAWDOWN LIMIT", f"${MAX_INTRADAY_DRAWDOWN:,.0f}", "intraday halt", 'red')
+        st.markdown("<div style='height: 6px'></div>", unsafe_allow_html=True)
+        metric_card("NOTIONAL CAP", f"${MAX_NOTIONAL_EXPOSURE:,.0f}", "max exposure", 'yellow')
+    except Exception:
+        pass
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROW 3: Ticker Heatmap + Strategy Breakdown + Risk Metrics
 # ═══════════════════════════════════════════════════════════════════════════════

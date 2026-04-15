@@ -327,7 +327,8 @@ class OptionsEngine:
         try:
             import json
             feats = json.loads(features_json) if isinstance(features_json, str) else features_json
-        except Exception:
+        except Exception as exc:
+            log.debug("[OptionsEngine] POP_SIGNAL features_json parse failed for %s: %s", ticker, exc)
             feats = {}
 
         sentiment_delta = float(feats.get('sentiment_delta', 0))

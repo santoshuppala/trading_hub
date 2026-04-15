@@ -35,7 +35,9 @@ sys.path.insert(0, PROJECT_ROOT)
 # ── Logging ──────────────────────────────────────────────────────────────
 log_dir = os.path.join(PROJECT_ROOT, 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"watchdog_{datetime.now().strftime('%Y-%m-%d')}.log")
+date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+os.makedirs(date_dir, exist_ok=True)
+log_file = os.path.join(date_dir, 'watchdog.log')
 
 logging.basicConfig(
     level=logging.INFO,

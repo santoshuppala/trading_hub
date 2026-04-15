@@ -51,7 +51,9 @@ SCRIPTS_DIR = os.path.join(PROJECT_ROOT, 'scripts')
 # Logging
 log_dir = os.path.join(PROJECT_ROOT, 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"supervisor_{datetime.now().strftime('%Y-%m-%d')}.log")
+date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+os.makedirs(date_dir, exist_ok=True)
+log_file = os.path.join(date_dir, 'supervisor.log')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,7 +129,9 @@ class ProcessManager:
                     pass
 
         try:
-            log_path = os.path.join(log_dir, f"{self.name}_{datetime.now().strftime('%Y-%m-%d')}.log")
+            date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+            os.makedirs(date_dir, exist_ok=True)
+            log_path = os.path.join(date_dir, f"{self.name}.log")
             self.process = subprocess.Popen(
                 [PYTHON, self.script],
                 cwd=PROJECT_ROOT,
@@ -168,7 +172,8 @@ class ProcessManager:
 
     def get_crash_traceback(self) -> str:
         """Read the process log file and extract the last traceback."""
-        log_path = os.path.join(log_dir, f"{self.name}_{datetime.now().strftime('%Y-%m-%d')}.log")
+        date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+        log_path = os.path.join(date_dir, f"{self.name}.log")
         try:
             with open(log_path, 'r') as f:
                 content = f.read()

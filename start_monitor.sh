@@ -33,5 +33,27 @@ source venv/bin/activate
 # Run monitor via watchdog (auto-recovery on crash)
 # Watchdog starts run_monitor.py, detects crashes, diagnoses via crash_analyzer,
 # applies safe fixes (file allowlist, no DB/credential changes), and restarts.
-# Falls back to direct run if watchdog itself fails.
-python scripts/watchdog.py || python run_monitor.py
+#
+# If watchdog itself fails to import (syntax error in watchdog.py etc.),
+# fall back to direct run_monitor.py so we get at least one attempt.
+# If that also fails, send an alert and exit — don't loop forever on unfixed bugs.
+WATCHDOG_EXIT=0
+python scripts/watchdog.py || WATCHDOG_EXIT=$?
+
+if [ "$WATCHDOG_EXIT" -ne 0 ]; then
+    echo "$(date) WATCHDOG FAILED (exit=$WATCHDOG_EXIT) — attempting direct run_monitor.py"
+    python run_monitor.py
+    MONITOR_EXIT=$?
+    if [ "$MONITOR_EXIT" -ne 0 ]; then
+        echo "$(date) CRITICAL: Both watchdog and direct monitor failed. No trading today."
+        echo "$(date) Check logs/watchdog_*.log and logs/crash_report_*.json for details."
+        # Try to send an alert email
+        python -c "
+try:
+    from monitor.alerts import send_alert
+    send_alert('CRITICAL: Trading monitor failed to start — both watchdog and direct run crashed. Check logs immediately.', severity='CRITICAL')
+except Exception:
+    pass
+" 2>/dev/null
+    fi
+fi

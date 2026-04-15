@@ -37,10 +37,7 @@ logging.root.handlers = []
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [options] %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(log_file)],
 )
 log = logging.getLogger(__name__)
 

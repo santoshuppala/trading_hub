@@ -35,15 +35,12 @@ log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"core_{datetime.now().strftime('%Y-%m-%d')}.log")
 
-# Clear any existing handlers to prevent double-logging
+# Only FileHandler — supervisor already redirects stdout to this log file
 logging.root.handlers = []
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [core] %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(log_file)],
     force=True,
 )
 log = logging.getLogger(__name__)

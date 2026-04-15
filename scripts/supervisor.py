@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo('America/New_York')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 PYTHON = sys.executable
 SCRIPTS_DIR = os.path.join(PROJECT_ROOT, 'scripts')
 
@@ -102,6 +103,16 @@ class ProcessManager:
         """Start the process. Returns True on success."""
         if self.process and self.process.poll() is None:
             return True  # Already running
+
+        # Clean up stale lock file if this is the core process (prevents "already running" error)
+        if self.name == 'core':
+            lock_file = os.path.join(PROJECT_ROOT, '.monitor.lock')
+            if os.path.exists(lock_file):
+                try:
+                    os.unlink(lock_file)
+                    log.info("[%s] Removed stale .monitor.lock", self.name)
+                except Exception:
+                    pass
 
         try:
             log_path = os.path.join(log_dir, f"{self.name}_{datetime.now().strftime('%Y-%m-%d')}.log")

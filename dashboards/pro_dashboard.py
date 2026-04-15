@@ -403,7 +403,9 @@ with col_heat:
         marker_color=[ACCENT_GREEN if v > 0 else ACCENT_RED for v in ticker_pnl.values],
         hovertemplate='%{y}: $%{x:+,.2f}<extra></extra>',
     ))
-    fig.update_layout(**DARK_LAYOUT, height=300, yaxis=dict(autorange='reversed'))
+    layout = {**DARK_LAYOUT, 'height': 300}
+    layout['yaxis'] = {**DARK_LAYOUT.get('yaxis', {}), 'autorange': 'reversed'}
+    fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True)
 
 with col_strat:

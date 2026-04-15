@@ -778,7 +778,7 @@ class OptionsSignalPayload:
                   'ratio': 1, 'limit_price': 2.50}, ...]
                 Stored as str to keep the payload frozen and serialisable.
 
-    source    : 'signal' (from StrategyEngine SIGNAL event) or 'bar_scan'
+    source    : 'signal' (from StrategyEngine SIGNAL event), 'bar_scan', or 'pop_signal'
                 (independent neutral/volatility scan).
     """
     ticker:           str
@@ -808,5 +808,70 @@ class OptionsSignalPayload:
             raise ValueError(f"rsi_value must be in [0, 100], got {self.rsi_value!r}")
         if not self.legs_json:
             raise ValueError("legs_json must be a non-empty string")
-        if self.source not in ('signal', 'bar_scan'):
-            raise ValueError(f"source must be 'signal' or 'bar_scan', got {self.source!r}")
+        if self.source not in ('signal', 'bar_scan', 'pop_signal'):
+            raise ValueError(f"source must be 'signal', 'bar_scan', or 'pop_signal', got {self.source!r}")
+
+
+# ── NEWS_DATA ────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class NewsDataPayload:
+    """
+    Benzinga news data snapshot for a ticker (persistence only).
+
+    Producer  : PopStrategyEngine (after early-exit filter passes)
+    Consumers : EventSourcingSubscriber (DB persistence for post-hoc analysis)
+
+    Emitted as non-durable (no Redpanda write) to minimise bus overhead.
+    Only emitted for tickers that pass the bar-activity early-exit filter,
+    so volume is bounded to ~20-50 tickers per cycle, not all 183.
+    """
+    ticker:           str
+    headlines_1h:     int        # count of headlines in last 1 hour
+    headlines_24h:    int        # count of headlines in last 24 hours
+    avg_sentiment_1h: float      # average sentiment score [-1, +1]
+    avg_sentiment_24h: float
+    top_headline:     str        # most recent headline text (truncated to 200 chars)
+    latest_headline_time: str = ''   # ISO timestamp of most recent headline
+    oldest_headline_time: str = ''   # ISO timestamp of oldest headline in 1h window
+    news_fetched_at:      str = ''   # ISO timestamp when Benzinga API was called
+    source:           str = 'benzinga'
+
+    def __post_init__(self):
+        _require_ticker(self.ticker)
+        _require_non_negative('headlines_1h',  self.headlines_1h)
+        _require_non_negative('headlines_24h', self.headlines_24h)
+        if not math.isfinite(self.avg_sentiment_1h) or not (-1.0 <= self.avg_sentiment_1h <= 1.0):
+            raise ValueError(f"avg_sentiment_1h must be in [-1, 1], got {self.avg_sentiment_1h!r}")
+        if not math.isfinite(self.avg_sentiment_24h) or not (-1.0 <= self.avg_sentiment_24h <= 1.0):
+            raise ValueError(f"avg_sentiment_24h must be in [-1, 1], got {self.avg_sentiment_24h!r}")
+
+
+# ── SOCIAL_DATA ──────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SocialDataPayload:
+    """
+    StockTwits social data snapshot for a ticker (persistence only).
+
+    Producer  : PopStrategyEngine (after early-exit filter passes)
+    Consumers : EventSourcingSubscriber (DB persistence for post-hoc analysis)
+
+    Emitted as non-durable (no Redpanda write) to minimise bus overhead.
+    """
+    ticker:           str
+    mention_count:    int
+    mention_velocity: float
+    bullish_pct:      float      # [0, 1]
+    bearish_pct:      float      # [0, 1]
+    newest_message_time: str = ''  # ISO timestamp of newest StockTwits message
+    oldest_message_time: str = ''  # ISO timestamp of oldest message in batch
+    social_fetched_at:   str = ''  # ISO timestamp when StockTwits API was called
+    source:           str = 'stocktwits'
+
+    def __post_init__(self):
+        _require_ticker(self.ticker)
+        _require_non_negative('mention_count',    self.mention_count)
+        _require_non_negative('mention_velocity', self.mention_velocity)
+        _require_non_negative('bullish_pct',      self.bullish_pct)
+        _require_non_negative('bearish_pct',      self.bearish_pct)

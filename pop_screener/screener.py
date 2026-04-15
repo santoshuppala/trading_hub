@@ -116,12 +116,14 @@ class PopScreener:
           - earnings_flag == True  (now propagated from MarketDataSlice through
             EngineeredFeatures)
           - abs(gap_size) > GAP_SIZE_EARNINGS_MIN
-          - rvol > 2.0 (unusual volume confirms the move)
+          - rvol > threshold (2.0 for stocks, ETF_RVOL_MIN for ETFs)
         """
+        from monitor.sector_map import is_etf, ETF_RVOL_MIN
+        rvol_min = ETF_RVOL_MIN if is_etf(f.symbol) else 2.0
         if (
             f.earnings_flag
             and abs(f.gap_size) > cfg.GAP_SIZE_EARNINGS_MIN
-            and f.rvol > 2.0
+            and f.rvol > rvol_min
         ):
             return PopCandidate(
                 symbol=f.symbol,
@@ -216,11 +218,13 @@ class PopScreener:
         UNUSUAL_VOLUME: abnormal volume with positive price momentum.
 
         Conditions (ALL must be true):
-          - rvol            > RVOL_UNUSUAL_THRESHOLD
+          - rvol            > threshold (RVOL_UNUSUAL_THRESHOLD for stocks, lower for ETFs)
           - price_momentum  > MOMENTUM_MIN
         """
+        from monitor.sector_map import is_etf, ETF_RVOL_MIN
+        rvol_threshold = max(ETF_RVOL_MIN, 1.0) if is_etf(f.symbol) else cfg.RVOL_UNUSUAL_THRESHOLD
         if (
-            f.rvol           > cfg.RVOL_UNUSUAL_THRESHOLD
+            f.rvol           > rvol_threshold
             and f.price_momentum > cfg.MOMENTUM_MIN
         ):
             return PopCandidate(

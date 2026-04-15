@@ -198,14 +198,26 @@ class StockTwitsSocialSource:
 
         # StockTwits returns latest 30 messages — estimate velocity
         # by looking at the time span of returned messages
+        newest_ts_str = ''
+        oldest_ts_str = ''
         if len(messages) >= 2:
             try:
                 newest = _parse_ts(messages[0].get('created_at', ''))
                 oldest = _parse_ts(messages[-1].get('created_at', ''))
+                newest_ts_str = newest.isoformat()
+                oldest_ts_str = oldest.isoformat()
                 span_hours = max((newest - oldest).total_seconds() / 3600, 0.01)
                 mention_velocity = round(total / span_hours, 1)
             except Exception:
                 mention_velocity = float(total)
+        elif len(messages) == 1:
+            try:
+                ts = _parse_ts(messages[0].get('created_at', ''))
+                newest_ts_str = ts.isoformat()
+                oldest_ts_str = newest_ts_str
+            except Exception:
+                pass
+            mention_velocity = float(total)
         else:
             mention_velocity = float(total)
 
@@ -215,6 +227,8 @@ class StockTwitsSocialSource:
             mention_velocity=mention_velocity,
             bullish_pct=bullish_pct,
             bearish_pct=bearish_pct,
+            newest_message_time=newest_ts_str,
+            oldest_message_time=oldest_ts_str,
         )
 
 

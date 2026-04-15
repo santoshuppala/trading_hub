@@ -81,7 +81,9 @@ class VWAPReclaimEngine:
             return entries, exits
 
         # ── RVOL gate (compensates for passing rvol_cache={} to T4) ──────────
-        if features.rvol < _RVOL_MIN:
+        from monitor.sector_map import is_etf, ETF_RVOL_MIN
+        rvol_min = ETF_RVOL_MIN if is_etf(symbol) else _RVOL_MIN
+        if features.rvol < rvol_min:
             return entries, exits
 
         # ── Convert to DataFrame and delegate to T4 ─────────────────────────

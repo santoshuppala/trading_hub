@@ -297,6 +297,12 @@ class EventType(Enum):
     # Emitted by OptionsEngine after strategy selection + option chain lookup.
     # Does NOT route through the existing RiskEngine or AlpacaBroker.
     OPTIONS_SIGNAL = auto()
+    # ── External data snapshots (persistence only, non-durable) ────────────
+    # Emitted by PopStrategyEngine after fetching Benzinga/StockTwits data
+    # for tickers that pass the early-exit filter.  Consumed only by
+    # EventSourcingSubscriber for DB persistence — never triggers execution.
+    NEWS_DATA    = auto()
+    SOCIAL_DATA  = auto()
 
 
 # Populate config dicts now that EventType exists

@@ -234,6 +234,18 @@ def get_sector(ticker: str) -> str:
     return SECTOR_MAP.get(ticker, 'Unknown')
 
 
+def is_etf(ticker: str) -> bool:
+    """Return True if ticker is classified as an ETF."""
+    return SECTOR_MAP.get(ticker) == 'ETF'
+
+
+# ── ETF-specific RVOL thresholds ─────────────────────────────────────────
+# ETFs are the most liquid instruments — they almost never reach 2x RVOL.
+# A 1.3% move on QQQ at 0.8x RVOL is more significant than a 1.3% move
+# on a mid-cap stock at 0.8x RVOL, because ETF volume is institutional.
+ETF_RVOL_MIN = 0.7   # vs 2.0 for individual stocks
+
+
 def count_sector_positions(held_tickers: Set[str]) -> Dict[str, int]:
     """
     Given a set of currently-held ticker strings, return a dict of

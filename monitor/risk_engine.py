@@ -154,10 +154,12 @@ class RiskEngine:
                             "already reclaimed today", event)
                 return
 
-            # 4. RVOL
-            if p.rvol < MIN_RVOL:
+            # 4. RVOL (lower threshold for ETFs — they never hit 2.0x)
+            from monitor.sector_map import is_etf, ETF_RVOL_MIN
+            rvol_threshold = ETF_RVOL_MIN if is_etf(ticker) else MIN_RVOL
+            if p.rvol < rvol_threshold:
                 self._block(ticker, p.action,
-                            f"RVOL too low ({p.rvol:.2f} < {MIN_RVOL})", event)
+                            f"RVOL too low ({p.rvol:.2f} < {rvol_threshold})", event)
                 return
 
             # 5. RSI range

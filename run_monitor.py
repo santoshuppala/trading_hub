@@ -378,6 +378,17 @@ def main():
         f"news={'benzinga' if news_source else 'mock'} | social=stocktwits"
     )
 
+    # Log sentiment baselines
+    baseline_summary = pop_engine._baseline_engine.summary()
+    log.info(
+        "SentimentBaseline ready | headline_tickers=%d | social_tickers=%d | "
+        "from_db=%s | lookback=%d days",
+        baseline_summary['headline_tickers'],
+        baseline_summary['social_tickers'],
+        baseline_summary['loaded_from_db'],
+        baseline_summary['lookback_days'],
+    )
+
     # ── T3.7: Options engine (dedicated Alpaca options account) ───────────────────
     from options.engine import OptionsEngine
     options_engine = OptionsEngine(

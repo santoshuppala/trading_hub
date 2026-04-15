@@ -69,18 +69,4 @@ class SRFlip(BaseProStrategy):
     ) -> float:
         return float(df['close'].iloc[-1])
 
-    def generate_stop(
-        self,
-        entry_price: float,
-        direction:   str,
-        atr:         float,
-        df:          pd.DataFrame,
-    ) -> float:
-        sr_sig    = None   # will use ATR-based stop
-        offset    = self.SL_ATR * atr
-        if direction == 'long':
-            stop = entry_price - offset
-            stop = min(stop, entry_price - 0.01)
-        else:
-            stop = entry_price + offset
-        return round(stop, 4)
+    # Uses BaseProStrategy.generate_stop() — structure-aware with SR levels

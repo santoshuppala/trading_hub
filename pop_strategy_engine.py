@@ -215,18 +215,37 @@ class PopExecutor:
 
                 # Mark cooldown and approve while still holding the lock
                 self._last_order_time[symbol] = now
+                self._positions.add(symbol)
                 _approved = True
         finally:
             if not _approved:
                 registry.release(symbol)
 
-        if self._paper:
-            self._paper_fill(entry, qty, pop_payload)
-        else:
-            self._live_buy(entry, qty, pop_payload)
+        # Emit ORDER_REQ on local bus → forwarded to Core via IPC (like Pro)
+        # Core's SmartRouter handles broker execution, bracket orders, and exit monitoring.
+        from monitor.event_bus import EventType, Event
+        from monitor.events import OrderRequestPayload
+        reason = f"pop:{entry.strategy_type}:{entry.metadata.get('engine', 'pop')}"
+        self._bus.emit(Event(
+            type=EventType.ORDER_REQ,
+            payload=OrderRequestPayload(
+                ticker=symbol,
+                side='BUY',
+                qty=qty,
+                price=entry.entry_price,
+                reason=reason,
+                needs_ask_refresh=True,
+                stop_price=entry.stop_loss,
+                target_price=entry.target_2,
+                atr_value=entry.metadata.get('atr', 0),
+            ),
+        ), durable=True)
+        log.info("POP ORDER_REQ emitted: %s BUY qty=%d @ $%.2f stop=$%.2f target=$%.2f reason=%s",
+                 symbol, qty, entry.entry_price, entry.stop_loss, entry.target_2, reason)
 
     def close_position(self, symbol: str, reason: str, current_price: float) -> None:
-        """Mark a pop position as closed (called by PopStrategyEngine on exit signal)."""
+        """Mark a pop position as closed in local tracking.
+        Actual sell is handled by Core's SmartRouter (same execution path as Pro)."""
         with self._lock:
             self._positions.discard(symbol)
         from monitor.position_registry import registry
@@ -461,6 +480,12 @@ class PopStrategyEngine:
         self._classifier = StrategyClassifier()
         self._router     = StrategyRouter()
 
+        # ── Periodic heartbeat logging ────────────────────────────────────────
+        self._pop_scan_count = 0
+        self._pop_news_hits = 0
+        self._pop_social_hits = 0
+        self._pop_last_heartbeat = 0.0
+
         # ── Pop executor (dedicated Alpaca account) ────────────────────────────
         trading_client = None
         effective_paper = pop_paper
@@ -523,6 +548,13 @@ class PopStrategyEngine:
                   └─ emits FILL → PositionManager / StateEngine
         """
         if not self._enabled:
+            return
+
+        # EOD gate: no new entries after 3:45 PM ET
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo('America/New_York'))
+        if (now_et.hour, now_et.minute) >= (15, 45):
             return
 
         from monitor.events import BarPayload
@@ -685,9 +717,27 @@ class PopStrategyEngine:
             return
 
         # 4. Screening
+        self._pop_scan_count += 1
+        if len(news_1h) > 0:
+            self._pop_news_hits += 1
+        if getattr(social, 'mention_count', 0) > 0:
+            self._pop_social_hits += 1
+
+        # Periodic heartbeat every 5 minutes
+        import time as _time
+        now_mono = _time.monotonic()
+        if now_mono - self._pop_last_heartbeat >= 300:
+            self._pop_last_heartbeat = now_mono
+            log.info(
+                "[POP HEARTBEAT] scans=%d | news_hits=%d | social_hits=%d | "
+                "last: %s news_1h=%d social_mentions=%d sent_delta=%.3f rvol=%.2f gap=%.4f",
+                self._pop_scan_count, self._pop_news_hits, self._pop_social_hits,
+                symbol, len(news_1h), getattr(social, 'mention_count', 0),
+                features.sentiment_delta, features.rvol, features.gap_size,
+            )
+
         candidate = self._screener.screen(features)
         if candidate is None:
-            log.debug("POP no candidate %s: screener returned None", symbol)
             return
         log.info("POP CANDIDATE %s: reason=%s rvol=%.2f gap=%.4f sent=%.3f",
                  symbol, candidate.pop_reason.value, features.rvol, features.gap_size,
@@ -704,6 +754,17 @@ class PopStrategyEngine:
             features=features,
             assignment=assignment,
         )
+
+        if not entries:
+            bar_count = len(market_slice.bars) if market_slice.bars else 0
+            log.info(
+                "POP CANDIDATE %s REJECTED by router: bars=%d strategy=%s "
+                "reason=%s rvol=%.2f",
+                symbol, bar_count,
+                getattr(assignment, 'primary_strategy', '?'),
+                candidate.pop_reason.value, features.rvol,
+            )
+            return
 
         # 7. Emit + execute
         for entry in entries:

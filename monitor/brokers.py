@@ -47,10 +47,18 @@ class BaseBroker(ABC):
     FILL / ORDER_FAIL events back onto the bus.
     """
 
-    def __init__(self, bus: EventBus, alert_email: Optional[str] = None):
+    def __init__(self, bus: EventBus, alert_email: Optional[str] = None,
+                 broker_name: str = 'alpaca'):
         self._bus         = bus
         self._alert_email = alert_email
+        self._broker_name = broker_name
         bus.subscribe(EventType.ORDER_REQ, self._on_order_request)
+
+    def _emit_fill(self, fill_payload: FillPayload, correlation_id=None) -> None:
+        """Emit a FILL event tagged with this broker's name."""
+        evt = Event(EventType.FILL, fill_payload, correlation_id=correlation_id)
+        evt._routed_broker = self._broker_name
+        self._bus.emit(evt)
 
     def _on_order_request(self, event: Event) -> None:
         # Check if portfolio risk gate already blocked this order
@@ -108,8 +116,10 @@ class AlpacaBroker(BaseBroker):
         self._quote_fn = quote_fn   # ticker -> Optional[float]
 
     def _execute_buy(self, p: OrderRequestPayload) -> None:
-        from alpaca.trading.requests import LimitOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import (
+            LimitOrderRequest, StopLossRequest, TakeProfitRequest,
+        )
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
         if not self._client:
             send_alert(self._alert_email, f"BUY skipped (no Alpaca client): {p.qty} {p.ticker}")
@@ -122,6 +132,18 @@ class AlpacaBroker(BaseBroker):
         for attempt in range(1, self.MAX_RETRIES + 1):
             limit_price = round(ask_price, 2)
 
+            # ── Build bracket order if stop/target available ──────────
+            bracket_kwargs = {}
+            if p.stop_price and p.stop_price > 0 and p.stop_price < limit_price:
+                bracket_kwargs['order_class'] = OrderClass.BRACKET
+                bracket_kwargs['stop_loss'] = StopLossRequest(
+                    stop_price=round(p.stop_price, 2),
+                )
+                if p.target_price and p.target_price > limit_price:
+                    bracket_kwargs['take_profit'] = TakeProfitRequest(
+                        limit_price=round(p.target_price, 2),
+                    )
+
             # ── Submit ────────────────────────────────────────────────
             try:
                 req = LimitOrderRequest(
@@ -130,12 +152,16 @@ class AlpacaBroker(BaseBroker):
                     side=OrderSide.BUY,
                     limit_price=limit_price,
                     time_in_force=TimeInForce.DAY,
+                    **bracket_kwargs,
                 )
                 order    = self._client.submit_order(req)
                 order_id = str(order.id)
+                order_type = "bracket" if bracket_kwargs.get('order_class') else "limit"
+                stop_info = f" stop=${p.stop_price:.2f}" if p.stop_price else ""
+                target_info = f" target=${p.target_price:.2f}" if p.target_price else ""
                 log.info(
-                    f"[attempt {attempt}] BUY limit {p.qty} {p.ticker} "
-                    f"@ ${limit_price:.2f} (order {order_id})"
+                    f"[attempt {attempt}] BUY {order_type} {p.qty} {p.ticker} "
+                    f"@ ${limit_price:.2f}{stop_info}{target_info} (order {order_id})"
                 )
             except Exception as e:
                 send_alert(self._alert_email, f"BUY submit failed: {p.qty} {p.ticker} — {e}")
@@ -160,9 +186,29 @@ class AlpacaBroker(BaseBroker):
                 filled_qty = int(float(order.filled_qty  or p.qty))
                 avg_price  = float(order.filled_avg_price or limit_price)
 
+                # If partial fill, cancel remaining order to prevent untracked fills
+                order_status = getattr(order, 'status', '')
+                if hasattr(order_status, 'value'):
+                    order_status = order_status.value
+                if order_status == 'partially_filled':
+                    log.warning(
+                        "BUY %s partial fill: %d of %d — cancelling remainder",
+                        p.ticker, filled_qty, p.qty,
+                    )
+                    try:
+                        self._client.cancel_order_by_id(order_id)
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                    # Re-check final filled qty after cancel
+                    try:
+                        final_order = self._client.get_order_by_id(order_id)
+                        filled_qty = int(float(final_order.filled_qty or filled_qty))
+                        avg_price = float(final_order.filled_avg_price or avg_price)
+                    except Exception:
+                        pass
+
                 # Wait 1s for Alpaca to fully settle the buy order.
-                # Without this, an immediate sell signal triggers a wash trade
-                # rejection because Alpaca still sees the buy as "recent".
                 time.sleep(1.0)
 
                 send_alert(
@@ -170,12 +216,33 @@ class AlpacaBroker(BaseBroker):
                     f"BUY filled: {filled_qty} {p.ticker} avg ${avg_price:.2f} "
                     f"(limit ${limit_price:.2f}, attempt {attempt})",
                 )
-                self._bus.emit(Event(EventType.FILL, FillPayload(
+
+                # Bracket order: if partial fill, cancel bracket children and resubmit
+                # for the actual filled qty to prevent stop selling more than we hold
+                if bracket_kwargs.get('order_class') and filled_qty < p.qty:
+                    self._cancel_bracket_children(p.ticker)
+                    # Resubmit stop-loss only for filled qty
+                    if p.stop_price and p.stop_price > 0:
+                        try:
+                            from alpaca.trading.requests import StopOrderRequest
+                            from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                            stop_req = StopOrderRequest(
+                                symbol=p.ticker, qty=filled_qty,
+                                side=_OS.SELL, stop_price=round(p.stop_price, 2),
+                                time_in_force=_TIF.DAY,
+                            )
+                            self._client.submit_order(stop_req)
+                            log.info("Resubmitted stop for partial fill: %s qty=%d stop=$%.2f",
+                                     p.ticker, filled_qty, p.stop_price)
+                        except Exception as exc:
+                            log.warning("Stop resubmit failed for %s: %s", p.ticker, exc)
+
+                self._emit_fill(FillPayload(
                     ticker=p.ticker, side='BUY', qty=filled_qty,
                     fill_price=avg_price, order_id=order_id, reason=p.reason,
                     stop_price=p.stop_price, target_price=p.target_price,
                     atr_value=p.atr_value,
-                )))
+                ))
                 return
 
             # ── Cancel unfilled ───────────────────────────────────────
@@ -222,6 +289,35 @@ class AlpacaBroker(BaseBroker):
             )
             ask_price = new_ask
 
+    def _cancel_bracket_children(self, ticker: str) -> None:
+        """Cancel any open bracket child orders (stop-loss/take-profit) for a ticker.
+        Must be called before submitting a SELL to prevent double-execution."""
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            orders = self._client.get_orders(filter=req)
+            cancelled = 0
+            for o in orders:
+                if str(o.symbol) != ticker:
+                    continue
+                side = getattr(o, 'side', None)
+                side_str = side.value if hasattr(side, 'value') else str(side)
+                order_class = getattr(o, 'order_class', None)
+                class_str = order_class.value if hasattr(order_class, 'value') else str(order_class)
+                # Cancel bracket parents and any open sell orders for this ticker
+                if class_str == 'bracket' or side_str.lower() == 'sell':
+                    try:
+                        self._client.cancel_order_by_id(str(o.id))
+                        cancelled += 1
+                    except Exception:
+                        pass
+            if cancelled:
+                log.info("[AlpacaBroker] Cancelled %d bracket/stop orders for %s before SELL",
+                         cancelled, ticker)
+        except Exception as exc:
+            log.warning("[AlpacaBroker] Failed to cancel bracket orders for %s: %s", ticker, exc)
+
     def _execute_sell(self, p: OrderRequestPayload) -> None:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -231,6 +327,10 @@ class AlpacaBroker(BaseBroker):
             send_alert(self._alert_email, f"SELL skipped (no Alpaca client): {p.qty} {p.ticker}")
             self._fail(p)
             return
+
+        # Cancel any bracket child orders (stop-loss/take-profit) before selling
+        # to prevent double-execution (strategy sells + bracket stop fires = short)
+        self._cancel_bracket_children(p.ticker)
 
         client_order_id = f"th-sell-{p.ticker}-{uuid.uuid4().hex[:8]}"
 
@@ -319,23 +419,49 @@ class AlpacaBroker(BaseBroker):
                     self._alert_email,
                     f"SELL {filled_qty} {p.ticker} at market (order {order_id})",
                 )
-                self._bus.emit(Event(EventType.FILL, FillPayload(
+                self._emit_fill(FillPayload(
                     ticker=p.ticker, side='SELL', qty=filled_qty,
                     fill_price=fill_price, order_id=order_id, reason=p.reason,
-                )))
+                ))
             else:
-                log.warning(
-                    f"SELL {p.ticker} not confirmed within 5s — "
-                    f"emitting FILL optimistically (order {order_id})"
-                )
-                send_alert(
-                    self._alert_email,
-                    f"SELL {actual_qty} {p.ticker} at market (order {order_id})",
-                )
-                self._bus.emit(Event(EventType.FILL, FillPayload(
-                    ticker=p.ticker, side='SELL', qty=actual_qty,
-                    fill_price=p.price, order_id=order_id, reason=p.reason,
-                )))
+                # Check for partial fill before emitting optimistically
+                try:
+                    final = self._client.get_order_by_id(order_id)
+                    final_status = final.status.value if hasattr(final.status, 'value') else str(final.status)
+                    final_qty = int(float(final.filled_qty or 0))
+                    if final_status == 'partially_filled' and final_qty > 0:
+                        fill_price = float(final.filled_avg_price or p.price)
+                        log.warning(
+                            f"SELL {p.ticker} partial fill: {final_qty} of {actual_qty} — "
+                            f"emitting FILL for {final_qty} only"
+                        )
+                        self._emit_fill(FillPayload(
+                            ticker=p.ticker, side='SELL', qty=final_qty,
+                            fill_price=fill_price, order_id=order_id, reason=p.reason,
+                        ))
+                    else:
+                        log.warning(
+                            f"SELL {p.ticker} not confirmed within 5s (status={final_status}) — "
+                            f"emitting FILL optimistically (order {order_id})"
+                        )
+                        self._emit_fill(FillPayload(
+                            ticker=p.ticker, side='SELL', qty=actual_qty,
+                            fill_price=p.price, order_id=order_id, reason=p.reason,
+                        ))
+                except Exception:
+                    # Fallback: emit optimistically if we can't check
+                    log.warning(
+                        f"SELL {p.ticker} not confirmed within 5s — "
+                        f"emitting FILL optimistically (order {order_id})"
+                    )
+                    send_alert(
+                        self._alert_email,
+                        f"SELL {actual_qty} {p.ticker} at market (order {order_id})",
+                    )
+                    self._emit_fill(FillPayload(
+                        ticker=p.ticker, side='SELL', qty=actual_qty,
+                        fill_price=p.price, order_id=order_id, reason=p.reason,
+                    ))
 
         except Exception as e:
             log.error(
@@ -353,10 +479,10 @@ class AlpacaBroker(BaseBroker):
                         f"SELL for {p.ticker} was actually {status} at Alpaca "
                         f"(qty={filled_qty} @ ${fill_price:.2f}) — emitting FILL"
                     )
-                    self._bus.emit(Event(EventType.FILL, FillPayload(
+                    self._emit_fill(FillPayload(
                         ticker=p.ticker, side='SELL', qty=filled_qty,
                         fill_price=fill_price, order_id=order_id, reason=p.reason,
-                    )))
+                    ))
                     return
             except Exception as poll_exc:
                 log.error(f"Failed to poll Alpaca for sell status: {poll_exc}")
@@ -386,20 +512,20 @@ class PaperBroker(BaseBroker):
     def _execute_buy(self, p: OrderRequestPayload) -> None:
         order_id = str(uuid.uuid4())
         log.info(f"[PAPER] BUY  {p.qty:>4} {p.ticker:<6} @ ${p.price:.2f}  ({p.reason})")
-        self._bus.emit(Event(EventType.FILL, FillPayload(
+        self._emit_fill(FillPayload(
             ticker=p.ticker, side='BUY', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
             stop_price=p.stop_price, target_price=p.target_price,
             atr_value=p.atr_value,
-        )))
+        ))
 
     def _execute_sell(self, p: OrderRequestPayload) -> None:
         order_id = str(uuid.uuid4())
         log.info(f"[PAPER] SELL {p.qty:>4} {p.ticker:<6} @ ${p.price:.2f}  ({p.reason})")
-        self._bus.emit(Event(EventType.FILL, FillPayload(
+        self._emit_fill(FillPayload(
             ticker=p.ticker, side='SELL', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
-        )))
+        ))
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

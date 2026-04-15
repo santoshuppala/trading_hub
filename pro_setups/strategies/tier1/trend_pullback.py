@@ -82,6 +82,7 @@ class TrendPullback(BaseProStrategy):
         direction:   str,
         atr:         float,
         df:          pd.DataFrame,
+        outputs:     dict = None,
     ) -> float:
         atr_stop    = entry_price - self.SL_ATR * atr
         swing_stop  = float(df['low'].tail(5).min())

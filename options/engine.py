@@ -400,7 +400,15 @@ class OptionsEngine:
         spot = float(df['close'].iloc[-1])
 
         # ── STEP 1: Monitor existing positions for exits ──────────────
+        # (exits always run, even after EOD cutoff)
         self._monitor_positions(p.ticker, spot)
+
+        # EOD gate: no new entries after 3:45 PM ET (exits still monitored above)
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo('America/New_York'))
+        if (now_et.hour, now_et.minute) >= (15, 45):
+            return
 
         # ── STEP 2: Scan for new neutral/volatility entries ───────────
         if self._chain is None:
@@ -438,6 +446,8 @@ class OptionsEngine:
         self._iv_tracker.update(p.ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(p.ticker)
 
+        iv_days = self._iv_tracker.history_days(p.ticker)
+
         strategy_type = self._selector.select_from_bar(
             atr_value=atr_value,
             spot_price=spot,
@@ -446,6 +456,7 @@ class OptionsEngine:
             rvol=rvol,
             has_existing_position=has_pos,
             iv_rank=iv_rank,
+            iv_history_days=iv_days,
         )
 
         if strategy_type is None:
@@ -467,16 +478,27 @@ class OptionsEngine:
             rsi_value, iv_estimate, iv_rank,
         )
 
-        self._execute_entry(
-            ticker=p.ticker,
-            spot_price=spot,
-            strategy_type=strategy_type,
-            atr_value=atr_value,
-            rvol=rvol,
-            rsi_value=rsi_value,
-            source='bar_scan',
-            source_event=event,
+        # Reserve the ticker atomically before spawning execution thread
+        # This prevents multiple bars from starting parallel executions
+        if not self._risk.reserve(p.ticker):
+            return
+
+        import threading
+        t = threading.Thread(
+            target=self._execute_entry,
+            kwargs=dict(
+                ticker=p.ticker,
+                spot_price=spot,
+                strategy_type=strategy_type,
+                atr_value=atr_value,
+                rvol=rvol,
+                rsi_value=rsi_value,
+                source='bar_scan',
+                source_event=event,
+            ),
+            daemon=True,
         )
+        t.start()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # POSITION MONITORING — Exit management on every bar
@@ -796,18 +818,21 @@ class OptionsEngine:
         6. Execute via broker
         7. Track position for monitoring
         """
-        # Step 1: Pre-check risk gate
+        # Step 1: Pre-check risk gate (ticker already reserved by caller)
         reject_reason = self._risk.check(ticker, max_risk=self._risk._trade_budget)
         if reject_reason:
             log.debug("[OptionsEngine] %s %s BLOCKED: %s", ticker, strategy_type, reject_reason)
+            self._risk.unreserve(ticker)
             return
 
         # Step 2: Get strategy class and build
         if strategy_type not in STRATEGY_REGISTRY:
             log.warning("[OptionsEngine] unknown strategy type: %s", strategy_type)
+            self._risk.unreserve(ticker)
             return
 
         if not self._chain:
+            self._risk.unreserve(ticker)
             return
 
         strategy = STRATEGY_REGISTRY[strategy_type]()
@@ -823,12 +848,14 @@ class OptionsEngine:
 
         if trade_spec is None:
             log.debug("[OptionsEngine] %s %s build returned None", ticker, strategy_type)
+            self._risk.unreserve(ticker)
             return
 
         # Step 3: Verify risk with actual max_risk
         reject_reason = self._risk.check(ticker, max_risk=trade_spec.max_risk)
         if reject_reason:
             log.debug("[OptionsEngine] %s %s BLOCKED after build: %s", ticker, strategy_type, reject_reason)
+            self._risk.unreserve(ticker)
             return
 
         # Step 4: Emit durable OPTIONS_SIGNAL
@@ -849,6 +876,7 @@ class OptionsEngine:
         if not success:
             log.error("[OptionsEngine] execution failed for %s; releasing position", ticker)
             self._risk.release(ticker)
+            self._risk.unreserve(ticker)
             return
 
         # Step 7: Track position for monitoring
@@ -860,7 +888,7 @@ class OptionsEngine:
             entry_cost=trade_spec.net_debit,
             max_risk=trade_spec.max_risk,
             max_reward=trade_spec.max_reward,
-            expiry_date=trade_spec.expiry_date,
+            expiry_date=str(trade_spec.expiry_date),
             current_value=abs(trade_spec.net_debit),
             last_check_time=time.monotonic(),
         )
@@ -937,7 +965,7 @@ class OptionsEngine:
             ticker=ticker,
             strategy_type=strategy_type,
             underlying_price=spot_price,
-            expiry_date=trade_spec.expiry_date,
+            expiry_date=str(trade_spec.expiry_date),
             net_debit=trade_spec.net_debit,
             max_risk=trade_spec.max_risk,
             max_reward=trade_spec.max_reward,

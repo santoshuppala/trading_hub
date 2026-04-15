@@ -15,7 +15,9 @@ Usage:
     # Router subscribes to ORDER_REQ and handles routing automatically.
     # Individual brokers should NOT subscribe to ORDER_REQ when using the router.
 """
+import json
 import logging
+import os
 import time
 import threading
 from typing import Optional, Dict
@@ -72,21 +74,44 @@ class SmartRouter:
         if alpaca_broker:
             self._brokers['alpaca'] = alpaca_broker
             self._health['alpaca'] = BrokerHealth(name='alpaca')
+            # Unsubscribe broker's own ORDER_REQ handler — SmartRouter calls it directly
+            try:
+                bus.unsubscribe(EventType.ORDER_REQ, alpaca_broker._on_order_request)
+            except Exception:
+                pass
 
         if tradier_broker:
             self._brokers['tradier'] = tradier_broker
             self._health['tradier'] = BrokerHealth(name='tradier')
+            # Tradier uses _on_order_req (not _on_order_request)
+            handler = getattr(tradier_broker, '_on_order_request', None) or \
+                      getattr(tradier_broker, '_on_order_req', None)
+            if handler:
+                try:
+                    bus.unsubscribe(EventType.ORDER_REQ, handler)
+                except Exception:
+                    pass
 
         self._default = default_broker
         self._lock = threading.Lock()
         self._all_brokers_down_alerted = False
+        self._order_counter = 0  # for round-robin routing
+        # Track which broker opened each position (ticker → broker_name)
+        # Persisted to disk so it survives restarts
+        self._position_broker: Dict[str, str] = {}
+        self._broker_map_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'data', 'position_broker_map.json',
+        )
+        self._load_broker_map()
 
         # Subscribe to ORDER_REQ (we handle routing, individual brokers don't)
         bus.subscribe(EventType.ORDER_REQ, self._on_order_req, priority=1)
 
-        # Track fills and failures for health monitoring
+        # Track fills, failures, and position lifecycle for health monitoring
         bus.subscribe(EventType.FILL, self._on_fill, priority=10)
         bus.subscribe(EventType.ORDER_FAIL, self._on_order_fail, priority=10)
+        bus.subscribe(EventType.POSITION, self._on_position, priority=10)
 
         broker_names = list(self._brokers.keys())
         log.info("[SmartRouter] ready | brokers=%s | default=%s", broker_names, default_broker)
@@ -143,31 +168,61 @@ class SmartRouter:
 
     def _select_broker(self, p) -> str:
         """Select the best broker for this order."""
-        # 1. Check if order specifies a preferred broker
+        side = str(getattr(p, 'side', '')).upper()
+        ticker = p.ticker
+
+        # 1. SELL orders MUST go to the broker that opened the position
+        if 'SELL' in side:
+            opening_broker = self._position_broker.get(ticker)
+            if opening_broker and opening_broker in self._brokers:
+                return opening_broker
+            # Fallback: check which broker actually has the position
+            for broker_name, broker in self._brokers.items():
+                try:
+                    if broker_name == 'alpaca' and hasattr(broker, '_client') and broker._client:
+                        pos = broker._client.get_open_position(ticker)
+                        if pos and int(float(pos.qty or 0)) > 0:
+                            log.info("[SmartRouter] SELL %s → %s (detected open position)", ticker, broker_name)
+                            return broker_name
+                except Exception:
+                    pass
+            # Last resort: default
+            return self._default
+
+        # 2. Check if order specifies a preferred broker
         source = str(getattr(p, 'reason', '')).lower()
         if 'tradier' in source:
             return 'tradier'
         if 'alpaca' in source:
             return 'alpaca'
 
-        # 2. Strategy-based routing
-        # Pop engine uses its own Alpaca account, options has its own too
-        # Pro-setups and VWAP can go to either
-
         # 3. Health-based: if one broker is unhealthy, use the other
-        for name in self._brokers:
-            if not self._is_healthy(name):
-                other = self._get_fallback(name)
-                if other and self._is_healthy(other):
-                    return other
+        healthy_brokers = [n for n in self._brokers if self._is_healthy(n)]
+        if len(healthy_brokers) == 1:
+            return healthy_brokers[0]
+        if not healthy_brokers:
+            return self._default
 
-        # 4. Default
-        return self._default
+        # 4. Round-robin across healthy brokers (BUY orders only)
+        self._order_counter += 1
+        return healthy_brokers[self._order_counter % len(healthy_brokers)]
 
     def _execute_on_broker(self, broker_name: str, broker, p, event: Event) -> None:
         """Execute an order on a specific broker."""
+        side = str(getattr(p, 'side', '')).upper()
+        ticker = p.ticker
+
         with self._lock:
             self._health[broker_name].total_orders += 1
+            # Track which broker opened this position
+            if 'BUY' in side:
+                self._position_broker[ticker] = broker_name
+                self._save_broker_map()
+            # Only clear on full close — partial sells keep the broker mapping
+            # We listen for POSITION events to clear on full close instead
+
+        # Tag the event so fill tracking knows which broker executed
+        event._routed_broker = broker_name
 
         try:
             # Call the broker's order handler directly
@@ -198,13 +253,26 @@ class SmartRouter:
 
     def _on_fill(self, event: Event) -> None:
         """Track successful fills for health monitoring."""
-        # We don't know which broker filled — track via order_id prefix or count
-        pass
+        broker_name = getattr(event, '_routed_broker', None)
+        if broker_name:
+            self._record_success(broker_name)
 
     def _on_order_fail(self, event: Event) -> None:
         """Track failures for health monitoring."""
-        # Could correlate back to broker, but for now just log
-        pass
+        broker_name = getattr(event, '_routed_broker', None)
+        if broker_name:
+            self._record_failure(broker_name)
+
+    def _on_position(self, event: Event) -> None:
+        """Clear broker mapping only when position is fully closed."""
+        try:
+            p = event.payload
+            if str(p.action) == 'CLOSED':
+                with self._lock:
+                    self._position_broker.pop(p.ticker, None)
+                    self._save_broker_map()
+        except Exception:
+            pass
 
     def _record_failure(self, broker_name: str) -> None:
         """Record a broker failure for circuit breaking."""
@@ -252,6 +320,40 @@ class SmartRouter:
             if name != primary:
                 return name
         return None
+
+    def _load_broker_map(self) -> None:
+        """Load position→broker mapping from disk."""
+        try:
+            if os.path.exists(self._broker_map_file):
+                with open(self._broker_map_file) as f:
+                    self._position_broker = json.load(f)
+                log.info("[SmartRouter] Loaded broker map: %s", self._position_broker or '{}')
+        except Exception as exc:
+            log.warning("[SmartRouter] Failed to load broker map: %s", exc)
+
+    def _save_broker_map(self) -> None:
+        """Persist position→broker mapping to disk."""
+        try:
+            os.makedirs(os.path.dirname(self._broker_map_file), exist_ok=True)
+            tmp = self._broker_map_file + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(self._position_broker, f)
+            os.replace(tmp, self._broker_map_file)
+        except Exception as exc:
+            log.debug("[SmartRouter] Failed to save broker map: %s", exc)
+
+    def seed_position_broker(self, alpaca_tickers: set, tradier_tickers: set) -> None:
+        """Seed position→broker mapping from broker open positions on startup.
+        Merges with any existing mapping loaded from disk."""
+        with self._lock:
+            for t in alpaca_tickers:
+                self._position_broker[t] = 'alpaca'
+            for t in tradier_tickers:
+                self._position_broker[t] = 'tradier'
+            self._save_broker_map()
+        if alpaca_tickers or tradier_tickers:
+            log.info("[SmartRouter] Seeded position_broker: alpaca=%s tradier=%s",
+                     alpaca_tickers or '{}', tradier_tickers or '{}')
 
     def status(self) -> dict:
         """Return router status for monitoring."""

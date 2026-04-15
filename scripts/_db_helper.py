@@ -71,11 +71,17 @@ def init_satellite_db(bus, process_name: str = 'satellite'):
         start_future = asyncio.run_coroutine_threadsafe(db_writer.start(), db_loop)
         start_future.result(timeout=5)
 
+        # Deterministic daily session ID — stable across restarts within the same day
+        import uuid
+        from datetime import date
+        daily_seed = f"{date.today().isoformat()}_{process_name}"
+        session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, daily_seed))
+
         # Register event sourcing subscriber on the local bus
         db_sub = EventSourcingSubscriber(
             bus=bus,
             writer=db_writer,
-            session_id=f"{process_name}_{os.getpid()}",
+            session_id=session_id,
         )
         db_sub.register()
 

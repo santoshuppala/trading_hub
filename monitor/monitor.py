@@ -353,7 +353,21 @@ class RealTimeMonitor:
         for ap in alpaca_positions:
             ticker = str(ap.symbol)
             if ticker in self.positions:
-                continue  # already tracked locally — trust local record
+                # Verify qty matches — fix if diverged (crash recovery, partial fills)
+                try:
+                    alpaca_qty = int(float(ap.qty or 0))
+                    local_qty = self.positions[ticker].get('quantity', 0)
+                    if alpaca_qty > 0 and alpaca_qty != local_qty:
+                        log.warning(
+                            "[reconcile] qty mismatch for %s: local=%d Alpaca=%d — updating to Alpaca",
+                            ticker, local_qty, alpaca_qty,
+                        )
+                        self.positions[ticker]['quantity'] = alpaca_qty
+                        self.positions[ticker]['qty'] = alpaca_qty
+                        reconciled += 1
+                except (TypeError, ValueError):
+                    pass
+                continue
 
             try:
                 avg_entry = float(ap.avg_entry_price or 0)
@@ -404,9 +418,44 @@ class RealTimeMonitor:
             )
             reconciled += 1
 
+        # Reverse reconciliation: remove local positions not at any broker
+        # Prevents selling positions that were already closed by bracket stops
+        alpaca_tickers = {str(ap.symbol) for ap in alpaca_positions}
+        tradier_tickers = set()
+        try:
+            import requests as _req
+            t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '')
+            t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+            if t_token and t_acct:
+                t_base = 'https://sandbox.tradier.com'
+                t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+                resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/positions',
+                               headers=t_headers, timeout=5)
+                if resp.status_code == 200:
+                    t_positions = resp.json().get('positions', {})
+                    if t_positions and t_positions != 'null':
+                        t_list = t_positions.get('position', [])
+                        if isinstance(t_list, dict):
+                            t_list = [t_list]
+                        for p in t_list:
+                            if int(float(p.get('quantity', 0))) > 0:
+                                tradier_tickers.add(p['symbol'])
+        except Exception:
+            pass
+
+        all_broker_tickers = alpaca_tickers | tradier_tickers
+        stale = [t for t in list(self.positions.keys()) if t not in all_broker_tickers]
+        for ticker in stale:
+            log.warning(
+                "[reconcile] Removing stale position %s — not found at any broker "
+                "(may have been closed by bracket stop)", ticker
+            )
+            del self.positions[ticker]
+            reconciled += 1
+
         if reconciled:
             log.warning(
-                f"[reconcile] Imported {reconciled} orphaned position(s) from Alpaca. "
+                f"[reconcile] Reconciled {reconciled} position(s). "
                 f"Verify stop/target prices — defaults are ±3%/±5% from avg entry."
             )
         else:
@@ -508,18 +557,21 @@ class RealTimeMonitor:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self):
-        already_running, pid = _is_running_elsewhere()
-        if already_running:
-            msg = (
-                f"ERROR: Monitor already running (PID {pid}).\n"
-                f"Stop it first.  Lock: {os.path.abspath(LOCK_FILE)}"
-            )
-            log.error(msg)
-            raise RuntimeError(msg)
+        # Skip lock check when running under supervisor (isolated mode)
+        if not os.environ.get('SUPERVISED_MODE'):
+            already_running, pid = _is_running_elsewhere()
+            if already_running:
+                msg = (
+                    f"ERROR: Monitor already running (PID {pid}).\n"
+                    f"Stop it first.  Lock: {os.path.abspath(LOCK_FILE)}"
+                )
+                log.error(msg)
+                raise RuntimeError(msg)
 
         if not self.running:
-            _write_lock()
-            atexit.register(_remove_lock)
+            if not os.environ.get('SUPERVISED_MODE'):
+                _write_lock()
+                atexit.register(_remove_lock)
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
             log.info(f"Real-time monitoring started (PID {os.getpid()}).")

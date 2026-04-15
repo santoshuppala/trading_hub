@@ -24,7 +24,8 @@ from datetime import datetime, date
 logger = logging.getLogger(__name__)
 
 _DEFAULT_LOOKBACK = 252          # 1 trading year
-_MIN_HISTORY = 20                # minimum data points before meaningful stats
+_MIN_HISTORY_HARD = 2            # absolute minimum (need 2 points for a range)
+_MIN_HISTORY_FULL = 20           # full confidence — no blending after this
 _DEFAULT_SAVE_PATH = "data/iv_history.json"
 _AUTO_SAVE_INTERVAL = 3600       # seconds (1 hour)
 
@@ -79,26 +80,33 @@ class IVTracker:
 
     def iv_rank(self, ticker: str) -> float:
         """
-        IV Rank (0-100).
+        IV Rank (0-100), blended toward neutral (50) when history is thin.
 
         Formula: (current_iv - min_iv) / (max_iv - min_iv) * 100
-        Returns 50.0 if insufficient history or zero range.
+        Confidence scales linearly from 0 at 2 days to 1.0 at 20 days.
+        Returns 50.0 if < 2 data points or zero range.
         """
         with self._lock:
             entries = self._history.get(ticker)
-            if not entries or len(entries) < _MIN_HISTORY:
+            if not entries or len(entries) < _MIN_HISTORY_HARD:
                 return 50.0
 
             ivs = [e["iv"] for e in entries]
             current = ivs[-1]
             min_iv = min(ivs)
             max_iv = max(ivs)
+            num_days = len(entries)
 
         if max_iv == min_iv:
             return 50.0
 
-        rank = (current - min_iv) / (max_iv - min_iv) * 100.0
-        return round(max(0.0, min(100.0, rank)), 2)
+        raw_rank = (current - min_iv) / (max_iv - min_iv) * 100.0
+        raw_rank = max(0.0, min(100.0, raw_rank))
+
+        # Blend toward neutral based on data confidence
+        confidence = min(1.0, (num_days - _MIN_HISTORY_HARD + 1) / _MIN_HISTORY_FULL)
+        blended = confidence * raw_rank + (1.0 - confidence) * 50.0
+        return round(blended, 2)
 
     # ------------------------------------------------------------------
     # IV Percentile
@@ -106,26 +114,37 @@ class IVTracker:
 
     def iv_percentile(self, ticker: str) -> float:
         """
-        IV Percentile (0-100).
+        IV Percentile (0-100), blended toward neutral when history is thin.
 
         Formula: % of days in lookback where IV was LOWER than current IV.
-        Returns 50.0 if insufficient history.
+        Returns 50.0 if < 2 data points.
         """
         with self._lock:
             entries = self._history.get(ticker)
-            if not entries or len(entries) < _MIN_HISTORY:
+            if not entries or len(entries) < _MIN_HISTORY_HARD:
                 return 50.0
 
             ivs = [e["iv"] for e in entries]
             current = ivs[-1]
+            num_days = len(entries)
 
         days_lower = sum(1 for iv in ivs if iv < current)
-        pct = days_lower / len(ivs) * 100.0
-        return round(max(0.0, min(100.0, pct)), 2)
+        raw_pct = days_lower / len(ivs) * 100.0
+        raw_pct = max(0.0, min(100.0, raw_pct))
+
+        confidence = min(1.0, (num_days - _MIN_HISTORY_HARD + 1) / _MIN_HISTORY_FULL)
+        blended = confidence * raw_pct + (1.0 - confidence) * 50.0
+        return round(blended, 2)
 
     # ------------------------------------------------------------------
     # Convenience flags
     # ------------------------------------------------------------------
+
+    def history_days(self, ticker: str) -> int:
+        """Number of IV data points stored for *ticker*."""
+        with self._lock:
+            entries = self._history.get(ticker)
+            return len(entries) if entries else 0
 
     def is_iv_high(self, ticker: str) -> bool:
         """IV rank > 50 — favorable for selling premium."""

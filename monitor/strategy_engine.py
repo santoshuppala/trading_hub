@@ -135,10 +135,13 @@ class StrategyEngine:
         if not in_window:
             return
 
-        if ticker in self._positions:
-            self._check_exits(ticker, df, rvol_df, event)
-        else:
-            self._check_entry(ticker, df, rvol_df, event)
+        try:
+            if ticker in self._positions:
+                self._check_exits(ticker, df, rvol_df, event)
+            else:
+                self._check_entry(ticker, df, rvol_df, event)
+        except (IndexError, KeyError) as exc:
+            log.debug("[StrategyEngine] %s skipped: %s", ticker, exc)
 
     # ── Entry analysis ────────────────────────────────────────────────────────
 
@@ -194,6 +197,11 @@ class StrategyEngine:
         stop_price   = min(candle_stop, pct_stop)
         target_price = current_price + (atr_value * atr_mult)
         half_target  = current_price + (atr_value * 1.0)
+
+        # Enforce minimum stop distance (0.3% of price) to avoid micro-stops
+        min_stop_offset = current_price * 0.003
+        if current_price - stop_price < min_stop_offset:
+            stop_price = current_price - min_stop_offset
 
         # Guard: stop must be strictly below current; target/half above
         if stop_price >= current_price:

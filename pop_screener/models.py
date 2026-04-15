@@ -30,6 +30,7 @@ class StrategyType(str, Enum):
     PARABOLIC_REVERSAL     = 'PARABOLIC_REVERSAL'
     EMA_TREND_CONTINUATION = 'EMA_TREND_CONTINUATION'
     BREAKOUT_PULLBACK      = 'BREAKOUT_PULLBACK'
+    MOMENTUM_ENTRY         = 'MOMENTUM_ENTRY'
 
     def __str__(self) -> str:
         return self.value

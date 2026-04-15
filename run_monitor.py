@@ -44,7 +44,9 @@ from monitor.event_bus import EventType, Event
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"monitor_{datetime.now().strftime('%Y-%m-%d')}.log")
+date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+os.makedirs(date_dir, exist_ok=True)
+log_file = os.path.join(date_dir, 'monitor.log')
 
 logging.basicConfig(
     level=logging.INFO,

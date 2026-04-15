@@ -133,6 +133,13 @@ class ProSetupEngine:
         if len(df) < _MIN_BARS:
             return
 
+        # EOD gate: no new signals after 3:45 PM ET
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo('America/New_York'))
+        if (now_et.hour, now_et.minute) >= (15, 45):
+            return
+
         t0 = time.monotonic()
 
         # ── Step 1: run all detectors ─────────────────────────────────────
@@ -165,7 +172,15 @@ class ProSetupEngine:
         try:
             entry_price = strategy.generate_entry(ticker, df, confirmed, outputs)
             atr         = compute_atr(df)
-            stop_price  = strategy.generate_stop(entry_price, confirmed, atr, df)
+            stop_price  = strategy.generate_stop(entry_price, confirmed, atr, df, outputs=outputs)
+
+            # Enforce minimum stop distance (0.3%) as a safety net across ALL strategies
+            min_stop_offset = entry_price * 0.003
+            if confirmed == 'long' and (entry_price - stop_price) < min_stop_offset:
+                stop_price = entry_price - min_stop_offset
+            elif confirmed == 'short' and (stop_price - entry_price) < min_stop_offset:
+                stop_price = entry_price + min_stop_offset
+
             target_1, target_2 = strategy.generate_exit(entry_price, stop_price, confirmed)
         except Exception as exc:
             log.warning("[ProSetupEngine][%s][%s] level generation failed: %s", ticker, strategy_name, exc)
@@ -181,6 +196,19 @@ class ProSetupEngine:
             vwap_series = compute_vwap(df)
             vwap        = float(vwap_series.iloc[-1])
             rsi         = compute_rsi(df)
+
+            # Update RVOLEngine with latest bar before reading
+            try:
+                from monitor.rvol import _global_rvol_engine
+                if _global_rvol_engine is not None and len(df) > 0:
+                    last_bar = df.iloc[-1]
+                    bar_ts = last_bar.name if hasattr(last_bar, 'name') else None
+                    _global_rvol_engine.update(
+                        ticker, float(last_bar.get('volume', 0)), bar_ts,
+                    )
+            except Exception:
+                pass
+
             rvol        = compute_rvol(df, rvol_df)
         except Exception:
             vwap = float(df['close'].iloc[-1])
@@ -268,9 +296,22 @@ class ProSetupEngine:
                 log.warning("%s invalid long levels: stop=%.4f entry=%.4f t1=%.4f t2=%.4f",
                             tag, stop, entry, target_1, target_2)
                 return False
+            # R:R check: reward (target_1 - entry) must be >= risk (entry - stop)
+            risk = entry - stop
+            reward = target_1 - entry
+            if risk > 0 and reward / risk < 1.0:
+                log.debug("%s rejected: R:R too low (%.2f) stop=%.2f entry=%.2f t1=%.2f",
+                          tag, reward / risk, stop, entry, target_1)
+                return False
         else:
             if not (stop > entry > target_1 > target_2):
                 log.warning("%s invalid short levels: stop=%.4f entry=%.4f t1=%.4f t2=%.4f",
                             tag, stop, entry, target_1, target_2)
+                return False
+            risk = stop - entry
+            reward = entry - target_1
+            if risk > 0 and reward / risk < 1.0:
+                log.debug("%s rejected: R:R too low (%.2f) stop=%.2f entry=%.2f t1=%.2f",
+                          tag, reward / risk, stop, entry, target_1)
                 return False
         return True

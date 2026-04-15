@@ -258,6 +258,9 @@ class RiskEngine:
             log.warning(f"[RiskEngine] SELL signal for {ticker} but qty={qty}.")
             return
 
+        # Pop now uses the same execution path as Pro (ORDER_REQ via IPC → Core SmartRouter).
+        # No special handling needed — sells go through the same broker as buys.
+
         # Partial exit sells half; guard against qty=1 (can't split)
         if p.action == 'PARTIAL_SELL':
             sell_qty = qty // 2

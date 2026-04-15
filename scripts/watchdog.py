@@ -35,7 +35,9 @@ sys.path.insert(0, PROJECT_ROOT)
 # ── Logging ──────────────────────────────────────────────────────────────
 log_dir = os.path.join(PROJECT_ROOT, 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"watchdog_{datetime.now().strftime('%Y-%m-%d')}.log")
+date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+os.makedirs(date_dir, exist_ok=True)
+log_file = os.path.join(date_dir, 'watchdog.log')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,7 +53,53 @@ log = logging.getLogger(__name__)
 MAX_RETRIES = 5           # max fix-and-restart attempts
 COOLDOWN_SECONDS = 10     # wait between retries
 MONITOR_SCRIPT = os.path.join(PROJECT_ROOT, 'run_monitor.py')
+LOCK_FILE = os.path.join(PROJECT_ROOT, '.monitor.lock')
 PYTHON = sys.executable
+
+
+def _check_existing_monitor():
+    """Check if a monitor is already running via lock file.
+
+    Returns (is_running, pid).  If the lock is stale, removes it and
+    returns (False, None) so the watchdog can proceed normally.
+    """
+    if not os.path.exists(LOCK_FILE):
+        return False, None
+    try:
+        with open(LOCK_FILE) as f:
+            pid = int(f.read().strip())
+    except (ValueError, OSError):
+        return False, None
+
+    # Is the PID alive?
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        # Process is dead — stale lock
+        log.warning("Stale lock file (PID %d not running). Removing.", pid)
+        try:
+            os.remove(LOCK_FILE)
+        except FileNotFoundError:
+            pass
+        return False, None
+
+    # PID is alive — is it actually a Python/monitor process?
+    try:
+        result = subprocess.run(
+            ['ps', '-p', str(pid), '-o', 'comm='],
+            capture_output=True, text=True, timeout=2,
+        )
+        if 'python' not in result.stdout.lower():
+            log.warning("Stale lock (PID %d is not Python). Removing.", pid)
+            try:
+                os.remove(LOCK_FILE)
+            except FileNotFoundError:
+                pass
+            return False, None
+    except Exception:
+        pass  # can't check — assume it's real
+
+    return True, pid
 
 
 def stash_before_fix():
@@ -222,6 +270,18 @@ def main():
     log.info("WATCHDOG STARTED — %s", datetime.now().isoformat())
     log.info("=" * 60)
 
+    # ── Pre-flight: bail out if monitor is already running ───────────
+    already_running, existing_pid = _check_existing_monitor()
+    if already_running:
+        log.info(
+            "Monitor already running (PID %d) — nothing to do. "
+            "Watchdog exiting cleanly.", existing_pid
+        )
+        log.info("=" * 60)
+        log.info("WATCHDOG FINISHED — %s", datetime.now().isoformat())
+        log.info("=" * 60)
+        return
+
     from scripts.crash_analyzer import CrashAnalyzer
     analyzer = CrashAnalyzer()
 
@@ -267,6 +327,19 @@ def main():
         log.info("Diagnosis: %s | %s", diagnosis.error_type, diagnosis.root_cause)
         log.info("Fix applicable: %s (confidence: %.0f%%)",
                  diagnosis.fix_applicable, diagnosis.confidence * 100)
+
+        # ── Lock-file collision: another monitor is running ───────────
+        if '.monitor.lock' in (diagnosis.error_message or ''):
+            running, pid = _check_existing_monitor()
+            if running:
+                log.info(
+                    "Monitor is already running (PID %d) — "
+                    "no point retrying. Exiting cleanly.", pid
+                )
+                break
+            else:
+                log.info("Lock was stale — removed. Will retry.")
+                continue
 
         if not diagnosis.fix_applicable:
             # Can't auto-fix — write crash report and alert

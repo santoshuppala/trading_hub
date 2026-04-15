@@ -60,6 +60,7 @@ class FlagPennant(BaseProStrategy):
         direction:   str,
         atr:         float,
         df:          pd.DataFrame,
+        outputs:     dict = None,
     ) -> float:
         flag_sig   = None
         offset     = self.SL_ATR * atr

@@ -484,6 +484,7 @@ class PositionPayload:
     action:   PositionAction
     position: Optional[PositionSnapshot]  # None only when action=CLOSED
     pnl:      Optional[float] = None
+    close_detail: Optional[dict] = None  # qty, entry_price, exit_price for CLOSED
 
     def __post_init__(self):
         _require_ticker(self.ticker)

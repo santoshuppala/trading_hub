@@ -32,20 +32,34 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo('America/New_York')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+# Load .env so child processes inherit API keys
+_env_path = os.path.join(PROJECT_ROOT, '.env')
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.split('#')[0].strip()
+            if '=' in _line:
+                _k, _v = _line.split('=', 1)
+                _v = _v.strip().strip('"').strip("'")
+                if _k.strip() and _k.strip() not in os.environ:
+                    os.environ[_k.strip()] = _v
 PYTHON = sys.executable
 SCRIPTS_DIR = os.path.join(PROJECT_ROOT, 'scripts')
 
 # Logging
 log_dir = os.path.join(PROJECT_ROOT, 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"supervisor_{datetime.now().strftime('%Y-%m-%d')}.log")
+date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+os.makedirs(date_dir, exist_ok=True)
+log_file = os.path.join(date_dir, 'supervisor.log')
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [supervisor] %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger(__name__)
@@ -103,8 +117,20 @@ class ProcessManager:
         if self.process and self.process.poll() is None:
             return True  # Already running
 
+        # Clean up stale lock file if this is the core process (prevents "already running" error)
+        if self.name == 'core':
+            lock_file = os.path.join(PROJECT_ROOT, '.monitor.lock')
+            if os.path.exists(lock_file):
+                try:
+                    os.unlink(lock_file)
+                    log.info("[%s] Removed stale .monitor.lock", self.name)
+                except Exception:
+                    pass
+
         try:
-            log_path = os.path.join(log_dir, f"{self.name}_{datetime.now().strftime('%Y-%m-%d')}.log")
+            date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+            os.makedirs(date_dir, exist_ok=True)
+            log_path = os.path.join(date_dir, f"{self.name}.log")
             self.process = subprocess.Popen(
                 [PYTHON, self.script],
                 cwd=PROJECT_ROOT,
@@ -130,6 +156,15 @@ class ProcessManager:
 
         retcode = self.process.poll()
         if retcode is None:
+            # Process is alive — reset restart counter if it's been stable (>60s)
+            if self.restart_count > 0 and self.started_at:
+                try:
+                    started = datetime.fromisoformat(self.started_at)
+                    uptime = (datetime.now(ET) - started).total_seconds()
+                    if uptime > 60:
+                        self.restart_count = 0
+                except Exception:
+                    pass
             return 'running'
 
         # Process exited
@@ -145,7 +180,8 @@ class ProcessManager:
 
     def get_crash_traceback(self) -> str:
         """Read the process log file and extract the last traceback."""
-        log_path = os.path.join(log_dir, f"{self.name}_{datetime.now().strftime('%Y-%m-%d')}.log")
+        date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+        log_path = os.path.join(date_dir, f"{self.name}.log")
         try:
             with open(log_path, 'r') as f:
                 content = f.read()
@@ -231,12 +267,15 @@ class ProcessManager:
                       self.name, self.max_restarts)
             return False
 
-        # Try to diagnose and fix before restarting
-        fixed = self.diagnose_and_fix()
-        if fixed:
-            log.info("[%s] Bug fixed — restarting with patched code", self.name)
+        # Only run crash analysis if the process actually crashed (non-zero exit)
+        if self.status == 'crashed':
+            fixed = self.diagnose_and_fix()
+            if fixed:
+                log.info("[%s] Bug fixed — restarting with patched code", self.name)
+            else:
+                log.info("[%s] No fix applied — restarting as-is (may crash again)", self.name)
         else:
-            log.info("[%s] No fix applied — restarting as-is (may crash again)", self.name)
+            log.info("[%s] Clean exit — restarting without crash analysis", self.name)
 
         self.restart_count += 1
         log.info("[%s] Restarting (%d/%d) after %ds cooldown...",
@@ -300,6 +339,9 @@ def send_alert(subject: str, body: str):
 
 
 def main():
+    # Tell child processes they're running under supervisor (skip lock file)
+    os.environ['SUPERVISED_MODE'] = '1'
+
     log.info("=" * 60)
     log.info("SUPERVISOR STARTING — Process Isolation Mode")
     log.info("=" * 60)
@@ -360,8 +402,11 @@ def main():
             for name, manager in managers.items():
                 status = manager.check()
 
-                if status == 'crashed':
-                    log.error("[%s] CRASHED — attempting restart", name)
+                if status in ('crashed', 'stopped'):
+                    if status == 'crashed':
+                        log.error("[%s] CRASHED — attempting restart", name)
+                    else:
+                        log.warning("[%s] STOPPED unexpectedly — attempting restart", name)
 
                     if manager.critical:
                         # Core crashed — this is serious

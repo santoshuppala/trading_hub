@@ -1,0 +1,44 @@
+{
+  "supervisor": {
+    "updated_at": "2026-04-15T16:00:29.264083-04:00",
+    "mode": "process_isolation"
+  },
+  "processes": {
+    "core": {
+      "name": "core",
+      "status": "stopped",
+      "pid": null,
+      "started_at": "2026-04-15T15:54:24.165114-04:00",
+      "restart_count": 0,
+      "last_error": "",
+      "critical": true
+    },
+    "pro": {
+      "name": "pro",
+      "status": "stopped",
+      "pid": null,
+      "started_at": "2026-04-15T15:54:29.174033-04:00",
+      "restart_count": 0,
+      "last_error": "",
+      "critical": false
+    },
+    "pop": {
+      "name": "pop",
+      "status": "stopped",
+      "pid": null,
+      "started_at": "2026-04-15T15:54:29.178396-04:00",
+      "restart_count": 0,
+      "last_error": "",
+      "critical": false
+    },
+    "options": {
+      "name": "options",
+      "status": "stopped",
+      "pid": null,
+      "started_at": "2026-04-15T15:54:29.183145-04:00",
+      "restart_count": 0,
+      "last_error": "",
+      "critical": false
+    }
+  }
+}

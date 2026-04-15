@@ -64,6 +64,9 @@ STRATEGY_PARAMS = {
 MAX_POSITIONS  = 5
 GLOBAL_MAX_POSITIONS = int(os.getenv('GLOBAL_MAX_POSITIONS', 75))  # aggregate limit across ALL layers
 MAX_DAILY_LOSS = float(os.getenv('MAX_DAILY_LOSS', -10000))  # kill switch: halt trading if daily P&L drops below this
+PRO_MAX_DAILY_LOSS     = float(os.getenv('PRO_MAX_DAILY_LOSS', -2000))     # pro engine kill switch
+POP_MAX_DAILY_LOSS     = float(os.getenv('POP_MAX_DAILY_LOSS', -2000))     # pop engine kill switch
+OPTIONS_MAX_DAILY_LOSS = float(os.getenv('OPTIONS_MAX_DAILY_LOSS', -3000)) # options engine kill switch
 ORDER_COOLDOWN = 300   # seconds between orders on same ticker
 TRADE_BUDGET   = int(os.getenv('TRADE_BUDGET', 1000))  # dollars allocated per trade
 OPEN_COST      = 0.0   # commission-free (Alpaca); slippage handled in OrderManager
@@ -92,8 +95,8 @@ PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
 ALPACA_POPUP_KEY          = os.getenv('APCA_POPUP_KEY')
 ALPACA_PUPUP_SECRET_KEY   = os.getenv('APCA_PUPUP_SECRET_KEY')
 POP_PAPER_TRADING         = os.getenv('POP_PAPER_TRADING', 'true').lower() == 'true'
-POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 25))   # max concurrent pop positions
-POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 10000))  # dollars per pop trade
+POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 15))   # max concurrent pop positions
+POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 2000))   # dollars per pop trade
 POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds cooldown per ticker
 
 # ── Pro-setups subsystem (pro_setups/) ────────────────────────────────────────
@@ -101,20 +104,20 @@ POP_ORDER_COOLDOWN        = int(os.getenv('POP_ORDER_COOLDOWN', 300)) # seconds 
 # Execution goes through the shared AlpacaBroker via ORDER_REQ events.
 # RiskAdapter is the independent risk gate; existing RiskEngine is not used for
 # pro-setup entries.
-PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   25))   # max concurrent pro positions
+PRO_MAX_POSITIONS  = int(os.getenv('PRO_MAX_POSITIONS',   15))   # max concurrent pro positions
 PRO_TRADE_BUDGET   = int(os.getenv('PRO_TRADE_BUDGET',  1000))   # dollars allocated per pro trade
 PRO_ORDER_COOLDOWN = int(os.getenv('PRO_ORDER_COOLDOWN',  300))  # seconds cooldown per ticker
 
 # ── Options engine (T3.7) — dedicated Alpaca account ────────────────────────────
 # Uses separate APCA_OPTIONS_KEY / APCA_OPTIONS_SECRET credentials for options trading.
 # Independent risk gate (OptionsRiskGate); does NOT route through existing RiskEngine.
-# Starting budget: $10,000 total; $500 per trade max; 5 concurrent positions.
+# Starting budget: $20,000 total; $2,000 per trade max; 5 concurrent positions.
 ALPACA_OPTIONS_KEY     = os.getenv('APCA_OPTIONS_KEY')
 ALPACA_OPTIONS_SECRET  = os.getenv('APCA_OPTIONS_SECRET')
 OPTIONS_PAPER_TRADING  = os.getenv('OPTIONS_PAPER_TRADING', 'true').lower() == 'true'
 OPTIONS_MAX_POSITIONS  = int(os.getenv('OPTIONS_MAX_POSITIONS', 5))
-OPTIONS_TRADE_BUDGET   = int(os.getenv('OPTIONS_TRADE_BUDGET', 500))      # per trade
-OPTIONS_TOTAL_BUDGET   = int(os.getenv('OPTIONS_TOTAL_BUDGET', 10000))    # $10K ceiling
+OPTIONS_TRADE_BUDGET   = int(os.getenv('OPTIONS_TRADE_BUDGET', 2000))     # per trade
+OPTIONS_TOTAL_BUDGET   = int(os.getenv('OPTIONS_TOTAL_BUDGET', 20000))    # $20K ceiling
 OPTIONS_ORDER_COOLDOWN = int(os.getenv('OPTIONS_ORDER_COOLDOWN', 300))    # seconds per ticker
 OPTIONS_MIN_DTE        = int(os.getenv('OPTIONS_MIN_DTE', 20))             # days to expiry
 OPTIONS_MAX_DTE        = int(os.getenv('OPTIONS_MAX_DTE', 45))             # days to expiry

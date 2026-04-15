@@ -380,8 +380,9 @@ st.dataframe(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.markdown("---")
-tab_perf, tab_attr, tab_compliance = st.tabs([
-    "Performance Metrics", "P&L Attribution", "Compliance & Audit"
+tab_perf, tab_risk, tab_strat, tab_attr, tab_market, tab_compliance = st.tabs([
+    "Performance Metrics", "Risk Analytics", "Strategy Attribution",
+    "P&L Attribution", "Market Regime", "Compliance & Audit",
 ])
 
 # ── TAB 1: Performance Metrics ───────────────────────────────────────────────
@@ -490,7 +491,155 @@ with tab_perf:
     else:
         st.info("Need at least 2 trades for performance metrics")
 
-# ── TAB 2: P&L Attribution ───────────────────────────────────────────────────
+# ── TAB 2: Risk Analytics ────────────────────────────────────────────────────
+with tab_risk:
+    st.subheader("Risk Analytics")
+
+    try:
+        from analytics.risk_metrics import RiskMetricsEngine
+        risk_engine = RiskMetricsEngine()
+        trade_records = trades_df.to_dict('records')
+        risk_m = risk_engine.compute(trade_records)
+
+        if risk_m['trade_count'] >= 2:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Sharpe Ratio", f"{risk_m['sharpe_ratio']:.2f}")
+            r2.metric("Sortino Ratio", f"{risk_m['sortino_ratio']:.2f}")
+            r3.metric("Daily VaR (95%)", f"${risk_m['daily_var_95']:.2f}")
+            r4.metric("Calmar Ratio", f"{risk_m['calmar_ratio']:.2f}")
+
+            r5, r6, r7, r8 = st.columns(4)
+            r5.metric("Profit Factor", f"{risk_m['profit_factor']:.2f}")
+            r6.metric("Kelly Fraction", f"{risk_m['kelly_fraction']:.2f}")
+            r7.metric("Expectancy", f"${risk_m['expectancy']:.3f}")
+            r8.metric("Max Consecutive Losses", risk_m['consecutive_losses_max'])
+
+            r9, r10, r11, r12 = st.columns(4)
+            r9.metric("Recovery Factor", f"{risk_m['recovery_factor']:.2f}")
+            r10.metric("Avg R:R", f"{risk_m['avg_rr']:.2f}")
+            r11.metric("Max Drawdown %", f"{risk_m['max_drawdown_pct']:.1f}%")
+            r12.metric("Max Consecutive Wins", risk_m['consecutive_wins_max'])
+
+            # Rolling Sharpe chart
+            rolling_sharpe = risk_engine.rolling_sharpe(trade_records, window=20)
+            if rolling_sharpe:
+                st.subheader("Rolling Sharpe Ratio (20-trade window)")
+                sharpe_df = pd.DataFrame({
+                    'Trade #': list(range(20, 20 + len(rolling_sharpe))),
+                    'Sharpe': rolling_sharpe,
+                })
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=sharpe_df['Trade #'], y=sharpe_df['Sharpe'],
+                    mode='lines', line=dict(width=2, color='#636EFA'),
+                ))
+                fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.5)
+                fig.add_hline(y=1, line_dash='dot', line_color='green', opacity=0.3,
+                              annotation_text='Good (1.0)')
+                fig.add_hline(y=2, line_dash='dot', line_color='#00CC96', opacity=0.3,
+                              annotation_text='Excellent (2.0)')
+                fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20),
+                                  yaxis_title='Sharpe Ratio')
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Rolling VaR chart
+            rolling_var = risk_engine.rolling_var(trade_records, window=20)
+            if rolling_var:
+                st.subheader("Rolling Value at Risk (95%, 20-trade)")
+                var_df = pd.DataFrame({
+                    'Trade #': list(range(20, 20 + len(rolling_var))),
+                    'VaR 95%': rolling_var,
+                })
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=var_df['Trade #'], y=var_df['VaR 95%'],
+                    mode='lines', fill='tozeroy',
+                    line=dict(width=2, color='#EF553B'),
+                    fillcolor='rgba(239, 85, 59, 0.1)',
+                ))
+                fig.update_layout(height=250, margin=dict(l=20, r=20, t=10, b=20),
+                                  yaxis_title='VaR ($)')
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Sector exposure
+            try:
+                from monitor.state_engine import StateEngine
+                positions_data = {}
+                for _, row in trades_df.iterrows():
+                    t = row['ticker']
+                    if t not in positions_data:
+                        positions_data[t] = {
+                            'quantity': row.get('qty', 1),
+                            'entry_price': row.get('entry_price', 0),
+                        }
+                sector_exp = risk_engine.sector_exposure(positions_data)
+                if sector_exp:
+                    st.subheader("Sector Exposure (traded tickers)")
+                    sec_df = pd.DataFrame([
+                        {'Sector': s, 'Count': d['count'], 'Notional': f"${d['notional']:,.0f}",
+                         'Weight': f"{d['pct']:.1f}%"}
+                        for s, d in sorted(sector_exp.items(), key=lambda x: -x[1]['count'])
+                    ])
+                    st.dataframe(sec_df, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+        else:
+            st.info("Need at least 2 trades for risk analytics")
+    except ImportError:
+        st.warning("Risk analytics module not available (analytics/risk_metrics.py)")
+
+# ── TAB 3: Strategy Attribution ──────────────────────────────────────────────
+with tab_strat:
+    st.subheader("Strategy Attribution")
+
+    try:
+        from analytics.attribution import StrategyAttributionEngine
+        attr_engine = StrategyAttributionEngine()
+        attr_result = attr_engine.from_trade_log(trades_df.to_dict('records'))
+
+        if attr_result['strategies']:
+            # KPI: best and worst strategy
+            bc1, bc2 = st.columns(2)
+            if attr_result.get('best_strategy'):
+                best = attr_result['strategies'][attr_result['best_strategy']]
+                bc1.metric(f"Best: {attr_result['best_strategy']}",
+                           f"${best['pnl']:+.2f}",
+                           f"{best['win_rate']:.0f}% win rate")
+            if attr_result.get('worst_strategy'):
+                worst = attr_result['strategies'][attr_result['worst_strategy']]
+                bc2.metric(f"Worst: {attr_result['worst_strategy']}",
+                           f"${worst['pnl']:+.2f}",
+                           f"{worst['win_rate']:.0f}% win rate")
+
+            # Strategy table
+            strat_rows = []
+            for name, stats in sorted(attr_result['strategies'].items(), key=lambda x: -x[1]['pnl']):
+                strat_rows.append({
+                    'Strategy': name,
+                    'Trades': stats['trades'],
+                    'P&L': f"${stats['pnl']:+.2f}",
+                    'Win Rate': f"{stats['win_rate']:.0f}%",
+                    'Avg Win': f"${stats.get('avg_win', 0):+.2f}",
+                    'Avg Loss': f"${stats.get('avg_loss', 0):.2f}",
+                })
+            st.dataframe(pd.DataFrame(strat_rows), use_container_width=True, hide_index=True)
+
+            # Strategy P&L bar chart
+            strat_pnl = {name: stats['pnl'] for name, stats in attr_result['strategies'].items()}
+            fig = go.Figure(go.Bar(
+                x=list(strat_pnl.keys()),
+                y=list(strat_pnl.values()),
+                marker_color=['#00CC96' if v > 0 else '#EF553B' for v in strat_pnl.values()],
+            ))
+            fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20),
+                              yaxis_title='P&L ($)', xaxis_title='Strategy')
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No strategy attribution data available")
+    except ImportError:
+        st.warning("Attribution module not available (analytics/attribution.py)")
+
+# ── TAB 4: P&L Attribution ───────────────────────────────────────────────────
 with tab_attr:
     st.subheader("P&L Attribution")
 
@@ -595,7 +744,133 @@ with tab_attr:
     else:
         st.info("Need SPY bar data in event_store for P&L attribution")
 
-# ── TAB 3: Compliance & Audit ────────────────────────────────────────────────
+# ── TAB 5: Market Regime & Data Sources ──────────────────────────────────────
+with tab_market:
+    st.subheader("Market Regime & Alternative Data")
+
+    # Fear & Greed
+    try:
+        from data_sources.fear_greed import FearGreedSource
+        fg = FearGreedSource()
+        fg_data = fg.get_current()
+        if fg_data:
+            fg1, fg2, fg3, fg4 = st.columns(4)
+            fg_val = fg_data['value']
+            fg_color = ('inverse' if fg_val <= 25 else 'normal' if fg_val <= 55 else 'off')
+            fg1.metric("Fear & Greed Index", f"{fg_val:.0f}", fg_data['label'],
+                       delta_color=fg_color)
+            fg2.metric("Previous Close", f"{fg_data['previous_close']:.0f}")
+            fg3.metric("1 Week Ago", f"{fg_data['one_week_ago']:.0f}")
+            fg4.metric("1 Month Ago", f"{fg_data['one_month_ago']:.0f}")
+
+            # Gauge chart
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=fg_val,
+                title={'text': 'Fear & Greed'},
+                gauge={
+                    'axis': {'range': [0, 100]},
+                    'bar': {'color': '#636EFA'},
+                    'steps': [
+                        {'range': [0, 25], 'color': '#EF553B'},
+                        {'range': [25, 45], 'color': '#FFA15A'},
+                        {'range': [45, 55], 'color': '#FECB52'},
+                        {'range': [55, 75], 'color': '#00CC96'},
+                        {'range': [75, 100], 'color': '#00CC96'},
+                    ],
+                },
+            ))
+            fig.update_layout(height=250, margin=dict(l=30, r=30, t=50, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as exc:
+        st.info(f"Fear & Greed unavailable: {exc}")
+
+    st.markdown("---")
+
+    # FRED Macro Regime
+    try:
+        from data_sources.fred_macro import FREDMacroSource
+        fred = FREDMacroSource()
+        if fred._api_key:
+            regime = fred.macro_regime()
+            st.subheader("Macro Regime")
+            m1, m2, m3, m4 = st.columns(4)
+
+            regime_colors = {'risk_on': 'normal', 'neutral': 'off',
+                             'risk_off': 'inverse', 'crisis': 'inverse'}
+            m1.metric("Regime", regime.regime.upper(),
+                      delta_color=regime_colors.get(regime.regime, 'off'))
+            m2.metric("Fed Rate", f"{regime.fed_rate:.2f}%", regime.fed_trend)
+            m3.metric("Yield Curve", f"{regime.yield_curve:+.2f}%", regime.yield_status)
+            m4.metric("VIX", f"{regime.vix:.1f}", regime.vix_regime)
+        else:
+            st.info("FRED API key not set — macro regime unavailable")
+    except Exception as exc:
+        st.info(f"FRED unavailable: {exc}")
+
+    st.markdown("---")
+
+    # Data source snapshots from DB
+    st.subheader("Data Source Activity (Today)")
+    try:
+        source_counts = run_query(f"""
+            SELECT event_type, COUNT(*) as cnt,
+                   MIN(event_time) as first_seen,
+                   MAX(event_time) as last_seen
+            FROM event_store
+            WHERE event_type LIKE 'DataSource_%%'
+              AND event_time::DATE = '{selected_date}'
+            GROUP BY event_type
+            ORDER BY cnt DESC
+        """)
+        if not source_counts.empty:
+            st.dataframe(source_counts, use_container_width=True, hide_index=True)
+        else:
+            st.info("No data source snapshots yet (collector runs during trading session)")
+    except Exception:
+        pass
+
+    # News/Social snapshots
+    try:
+        news_social = run_query(f"""
+            SELECT event_type, COUNT(*) as snapshots,
+                   COUNT(DISTINCT event_payload->>'ticker') as tickers
+            FROM event_store
+            WHERE event_type IN ('NewsDataSnapshot', 'SocialDataSnapshot')
+              AND event_time::DATE = '{selected_date}'
+            GROUP BY event_type
+        """)
+        if not news_social.empty:
+            st.subheader("Benzinga / StockTwits Snapshots")
+            st.dataframe(news_social, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
+
+    # Polygon previous close for top tickers
+    try:
+        from data_sources.polygon_data import PolygonSource
+        from config import POLYGON_API_KEY
+        if POLYGON_API_KEY:
+            poly = PolygonSource()
+            st.subheader("Polygon Previous Close (Top Traded)")
+            top_tickers = trades_df['ticker'].value_counts().head(5).index.tolist()
+            poly_rows = []
+            for t in top_tickers:
+                prev = poly.previous_close(t)
+                if prev:
+                    poly_rows.append({
+                        'Ticker': t,
+                        'Close': f"${prev.close:.2f}",
+                        'Volume': f"{prev.volume:,}",
+                        'VWAP': f"${prev.vwap:.2f}",
+                        'Change': f"{prev.change_pct:+.2f}%",
+                    })
+            if poly_rows:
+                st.dataframe(pd.DataFrame(poly_rows), use_container_width=True, hide_index=True)
+    except Exception:
+        pass
+
+# ── TAB 6: Compliance & Audit ────────────────────────────────────────────────
 with tab_compliance:
     st.subheader("Compliance & Audit Trail")
 

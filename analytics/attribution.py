@@ -3,12 +3,23 @@ Post-trade analytics: P&L attribution, performance metrics,
 exit efficiency, and signal accuracy.
 
 All computation uses pandas + numpy only.
+StrategyAttributionEngine provides per-strategy P&L breakdown from event_store.
 """
 
 from __future__ import annotations
 
+import json
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
+
+ET = ZoneInfo('America/New_York')
 
 
 # ---------------------------------------------------------------------------
@@ -448,3 +459,206 @@ class PostTradeAnalytics:
             "exit_efficiency": efficiency_df,
             "signal_accuracy": signal_accuracy,
         }
+
+
+# ---------------------------------------------------------------------------
+# Strategy Performance Attribution (Enhancement 4.2)
+# ---------------------------------------------------------------------------
+
+class StrategyAttributionEngine:
+    """Compute per-strategy P&L attribution from trade history."""
+
+    def __init__(self, db_url=None):
+        self._db_url = db_url
+
+    def daily_attribution(self, date_str: str = None) -> dict:
+        """Compute strategy attribution for a given date.
+
+        Returns dict with:
+            date, total_pnl, strategies (dict of per-strategy metrics),
+            best_strategy, worst_strategy, recommendation
+        """
+        if date_str is None:
+            date_str = datetime.now(ET).strftime('%Y-%m-%d')
+
+        trades_by_strategy = self._fetch_attributed_trades(date_str)
+
+        if not trades_by_strategy:
+            return {
+                'date': date_str,
+                'total_pnl': 0,
+                'strategies': {},
+                'best_strategy': None,
+                'worst_strategy': None,
+                'recommendation': 'No trades to attribute',
+            }
+
+        strategies = {}
+        total_pnl = 0
+
+        for strategy_name, trades in trades_by_strategy.items():
+            pnls = [t['pnl'] for t in trades]
+            wins = [p for p in pnls if p >= 0]
+            losses = [p for p in pnls if p < 0]
+            total = sum(pnls)
+            total_pnl += total
+
+            strategies[strategy_name] = {
+                'trades': len(pnls),
+                'pnl': round(total, 2),
+                'win_rate': round(len(wins) / len(pnls) * 100, 1) if pnls else 0,
+                'avg_win': round(sum(wins) / len(wins), 2) if wins else 0,
+                'avg_loss': round(sum(losses) / len(losses), 2) if losses else 0,
+                'gross_win': round(sum(wins), 2),
+                'gross_loss': round(sum(losses), 2),
+            }
+
+        best = max(strategies.items(), key=lambda x: x[1]['pnl'])[0] if strategies else None
+        worst = min(strategies.items(), key=lambda x: x[1]['pnl'])[0] if strategies else None
+
+        recommendation = self._generate_recommendation(strategies)
+
+        return {
+            'date': date_str,
+            'total_pnl': round(total_pnl, 2),
+            'strategies': strategies,
+            'best_strategy': best,
+            'worst_strategy': worst,
+            'recommendation': recommendation,
+        }
+
+    def from_trade_log(self, trades: list) -> dict:
+        """Compute attribution from an in-memory trade log (no DB needed).
+
+        Groups by the 'reason' field to identify strategy.
+        Useful for real-time attribution without DB access.
+        """
+        by_strategy = defaultdict(list)
+        for t in trades:
+            reason = t.get('reason', 'unknown')
+            # Map exit reasons to strategy categories
+            strategy = self._reason_to_strategy(reason)
+            by_strategy[strategy].append(t)
+
+        strategies = {}
+        total_pnl = 0
+
+        for strategy_name, strades in by_strategy.items():
+            pnls = [t['pnl'] for t in strades]
+            wins = [p for p in pnls if p >= 0]
+            losses = [p for p in pnls if p < 0]
+            total = sum(pnls)
+            total_pnl += total
+
+            strategies[strategy_name] = {
+                'trades': len(pnls),
+                'pnl': round(total, 2),
+                'win_rate': round(len(wins) / len(pnls) * 100, 1) if pnls else 0,
+                'avg_win': round(sum(wins) / len(wins), 2) if wins else 0,
+                'avg_loss': round(sum(losses) / len(losses), 2) if losses else 0,
+            }
+
+        best = max(strategies.items(), key=lambda x: x[1]['pnl'])[0] if strategies else None
+        worst = min(strategies.items(), key=lambda x: x[1]['pnl'])[0] if strategies else None
+
+        return {
+            'total_pnl': round(total_pnl, 2),
+            'strategies': strategies,
+            'best_strategy': best,
+            'worst_strategy': worst,
+        }
+
+    def _reason_to_strategy(self, reason: str) -> str:
+        """Map exit reason to strategy name."""
+        reason = reason.upper()
+        if reason.startswith('SELL_') or reason == 'PARTIAL_SELL':
+            return 'vwap_reclaim'
+        elif reason.startswith('PRO_') or reason.startswith('pro_'):
+            return f'pro/{reason.lower()}'
+        elif reason.startswith('POP_') or reason.startswith('pop_'):
+            return f'pop/{reason.lower()}'
+        elif reason.startswith('OPTIONS_') or reason.startswith('options_'):
+            return f'options/{reason.lower()}'
+        elif reason == 'KILL_SWITCH_DAILY_LOSS':
+            return 'kill_switch'
+        else:
+            return reason.lower()
+
+    def _fetch_attributed_trades(self, date_str: str) -> dict:
+        """Fetch trades from DB with strategy attribution."""
+        if not self._db_url:
+            try:
+                from config import DATABASE_URL
+                self._db_url = DATABASE_URL
+            except ImportError:
+                return {}
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self._db_url, connect_timeout=5)
+            cur = conn.cursor()
+
+            # Get all PositionClosed events for the date
+            cur.execute("""
+                SELECT event_payload, correlation_id, event_time
+                FROM event_store
+                WHERE event_type = 'PositionClosed'
+                  AND event_time >= %s::date
+                  AND event_time < %s::date + interval '1 day'
+                ORDER BY event_time
+            """, (date_str, date_str))
+
+            rows = cur.fetchall()
+            by_strategy = defaultdict(list)
+
+            for payload_json, corr_id, event_time in rows:
+                payload = json.loads(payload_json) if isinstance(payload_json, str) else payload_json
+                pnl = float(payload.get('pnl', 0) or 0)
+                ticker = payload.get('ticker', '?')
+
+                # Try to trace back to originating signal
+                strategy = 'unknown'
+                if corr_id:
+                    cur.execute("""
+                        SELECT event_type, event_payload
+                        FROM event_store
+                        WHERE event_id = %s
+                        LIMIT 1
+                    """, (corr_id,))
+                    origin = cur.fetchone()
+                    if origin:
+                        evt_type = origin[0]
+                        orig_payload = json.loads(origin[1]) if isinstance(origin[1], str) else origin[1]
+                        if evt_type == 'StrategySignal':
+                            strategy = 'vwap_reclaim'
+                        elif evt_type == 'ProStrategySignal':
+                            strategy = f"pro/{orig_payload.get('strategy_name', 'unknown')}"
+                        elif evt_type == 'PopStrategySignal':
+                            strategy = f"pop/{orig_payload.get('strategy_type', 'unknown')}"
+                        elif evt_type == 'OptionsSignal':
+                            strategy = f"options/{orig_payload.get('strategy_type', 'unknown')}"
+                        else:
+                            strategy = evt_type.lower()
+
+                by_strategy[strategy].append({
+                    'ticker': ticker,
+                    'pnl': pnl,
+                    'time': str(event_time),
+                })
+
+            conn.close()
+            return dict(by_strategy)
+
+        except Exception as exc:
+            log.warning("Attribution DB query failed: %s", exc)
+            return {}
+
+    def _generate_recommendation(self, strategies: dict) -> str:
+        """Generate actionable recommendation from attribution data."""
+        recs = []
+        for name, stats in strategies.items():
+            if stats['trades'] >= 5 and stats['pnl'] < 0:
+                recs.append(f"Consider pausing {name} (negative P&L: ${stats['pnl']:.2f} over {stats['trades']} trades)")
+            if stats['trades'] >= 10 and stats['win_rate'] > 70 and stats['pnl'] > 0:
+                recs.append(f"Consider increasing budget for {name} (win rate: {stats['win_rate']:.0f}%, P&L: ${stats['pnl']:.2f})")
+        return '; '.join(recs) if recs else 'No actionable recommendations'

@@ -699,6 +699,56 @@ def main():
                     except Exception:
                         pass
                 log.info(f"Hourly summary: {len(trades)} trades | {wins}W/{losses}L | PnL: ${total_pnl:+.2f}{hourly_extra}")
+
+            # ── Intraday position reconciliation (every hour at :30) ──────
+            if now.minute == 30 and ALPACA_API_KEY and ALPACA_SECRET:
+                try:
+                    import requests as _req
+                    base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+                    _headers = {'APCA-API-KEY-ID': ALPACA_API_KEY,
+                                'APCA-API-SECRET-KEY': ALPACA_SECRET}
+
+                    r = _req.get(f'{base}/v2/positions', headers=_headers, timeout=10)
+                    if r.status_code == 200:
+                        broker_positions = {p['symbol']: int(float(p['qty']))
+                                            for p in r.json()}
+                    else:
+                        broker_positions = None
+
+                    if broker_positions is not None:
+                        monitor_positions = {tk: pos.get('quantity', 0)
+                                             for tk, pos in positions.items()}
+
+                        all_tickers = set(list(broker_positions.keys()) +
+                                          list(monitor_positions.keys()))
+                        mismatches = []
+                        for tk in sorted(all_tickers):
+                            b_qty = broker_positions.get(tk, 0)
+                            m_qty = monitor_positions.get(tk, 0)
+                            if b_qty != m_qty:
+                                mismatches.append(
+                                    f"{tk}: broker={b_qty} monitor={m_qty}")
+
+                        if mismatches:
+                            log.warning(
+                                "INTRADAY RECONCILIATION MISMATCH at %s:",
+                                now.strftime('%H:%M')
+                            )
+                            for m in mismatches:
+                                log.warning("  %s", m)
+                            # TODO(santosh): Investigate mismatches:
+                            #   - Missed FILL event (network timeout)
+                            #   - Position from another engine on same account
+                            #   - Partial fill not fully processed
+                            #   - Manual trade on Alpaca dashboard
+                        else:
+                            log.info(
+                                "Intraday reconciliation OK: %d positions match",
+                                len(broker_positions)
+                            )
+                except Exception as exc:
+                    log.debug("Intraday reconciliation failed (non-fatal): %s", exc)
+
             time.sleep(60)
     except KeyboardInterrupt:
         log.info("Interrupted by user.")

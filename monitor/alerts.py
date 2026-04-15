@@ -14,14 +14,32 @@ Configuration (env vars):
 If alert_email is None/falsy the message is written to the log instead.
 If the queue is full (>200 pending) the alert is dropped and logged.
 """
+import hashlib
 import logging
 import os
 import queue
 import smtplib
 import threading
+import time
 from email.mime.text import MIMEText
 
 log = logging.getLogger(__name__)
+
+# ── Severity levels ──────────────────────────────────────────────────────────
+
+CRITICAL = 0
+WARNING  = 1
+INFO     = 2
+
+# Rate limits in seconds per severity
+_RATE_LIMITS = {
+    'CRITICAL': 0,       # no rate limit — always send
+    'WARNING':  900,     # 15 minutes
+    'INFO':     3600,    # 1 hour
+}
+
+# Tracks last send time per unique message hash: {msg_hash: timestamp}
+_alert_last_sent: dict[str, float] = {}
 
 # ── Background delivery ───────────────────────────────────────────────────────
 
@@ -34,7 +52,6 @@ _backoff_until = 0.0
 
 def _alert_worker() -> None:
     """Daemon thread: drain the queue and send each email."""
-    import time
     global _consecutive_failures, _backoff_until
 
     server = None
@@ -100,21 +117,58 @@ def _ensure_worker() -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def send_alert(alert_email, message):
+def send_alert(alert_email, message, severity='INFO'):
     """
     Queue an email alert for asynchronous SMTP delivery.
 
     Returns immediately.  Never blocks the calling thread.
     If alert_email is None or falsy, logs the message instead.
+
+    Severity levels control rate-limiting and subject tagging:
+      'CRITICAL' — send immediately, no rate limit, subject prefixed [CRITICAL]
+      'WARNING'  — max 1 per 15 min per unique message, subject prefixed [WARNING]
+      'INFO'     — max 1 per hour per unique message (default)
     """
+    severity = severity.upper()
+    if severity not in _RATE_LIMITS:
+        severity = 'INFO'
+
+    log.debug("Alert attempt [%s]: %s", severity, message[:120])
+
+    # ── Rate limiting (CRITICAL always passes) ────────────────────────────
+    msg_hash = hashlib.md5(message.encode()).hexdigest()[:16]
+    now = time.time()
+    rate_limit = _RATE_LIMITS[severity]
+
+    if rate_limit > 0 and msg_hash in _alert_last_sent:
+        elapsed = now - _alert_last_sent[msg_hash]
+        if elapsed < rate_limit:
+            log.debug(
+                "Alert rate-limited [%s]: %s (last sent %ds ago, limit %ds)",
+                severity, message[:80], int(elapsed), rate_limit,
+            )
+            return
+
+    _alert_last_sent[msg_hash] = now
+
+    # ── Prepend severity tag ──────────────────────────────────────────────
+    if severity == 'CRITICAL':
+        tagged_message = f"[CRITICAL] {message}"
+    elif severity == 'WARNING':
+        tagged_message = f"[WARNING] {message}"
+    else:
+        tagged_message = message
+
+    log.info("Alert queued [%s]: %s", severity, message[:120])
+
     if not alert_email:
-        log.info(f"ALERT: {message}")
+        log.info(f"ALERT: {tagged_message}")
         return
     _ensure_worker()
     try:
-        _alert_queue.put_nowait((alert_email, message))
+        _alert_queue.put_nowait((alert_email, tagged_message))
     except queue.Full:
-        log.warning(f"Alert queue full — dropping: {message[:120]}")
+        log.warning(f"Alert queue full — dropping: {tagged_message[:120]}")
 
 
 # ── SMTP delivery (runs in background thread only) ────────────────────────────
@@ -172,7 +226,13 @@ def _deliver_with_connection(server, alert_email: str, message: str) -> bool:
 
     try:
         msg = MIMEText(message)
-        msg['Subject'] = 'Trading Alert'
+        # Derive subject from severity tag in message body
+        if message.startswith('[CRITICAL]'):
+            msg['Subject'] = '[CRITICAL] Trading Alert'
+        elif message.startswith('[WARNING]'):
+            msg['Subject'] = '[WARNING] Trading Alert'
+        else:
+            msg['Subject'] = 'Trading Alert'
         msg['From']    = email_from
         msg['To']      = alert_email
         server.sendmail(email_from, alert_email, msg.as_string())

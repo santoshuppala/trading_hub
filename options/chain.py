@@ -297,6 +297,103 @@ class AlpacaOptionChainClient:
         return all_snapshots
 
     # ------------------------------------------------------------------
+    # get_greeks — fetch current Greeks for open position legs
+    # ------------------------------------------------------------------
+    def get_greeks(
+        self, legs
+    ) -> List[Dict]:
+        """Fetch current Greeks for a list of option contract legs.
+
+        Args:
+            legs: list of OptionLeg objects (or dicts) with 'symbol', 'qty',
+                  'side' attributes/keys.
+
+        Returns list of dicts with delta, gamma, theta, vega, qty, side.
+        Returns empty list on failure or if data client is unavailable.
+        """
+        if self._data_client is None:
+            return []
+
+        symbols = []
+        leg_meta = []  # parallel list: (qty, side) per symbol
+        for leg in legs:
+            sym = leg.symbol if hasattr(leg, 'symbol') else leg['symbol']
+            qty = leg.qty if hasattr(leg, 'qty') else leg['qty']
+            side = leg.side if hasattr(leg, 'side') else leg['side']
+            symbols.append(sym)
+            leg_meta.append((qty, side))
+
+        if not symbols:
+            return []
+
+        # Check cache (keyed by frozenset of symbols)
+        cache_key = "_greeks|" + "|".join(sorted(symbols))
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        # Fetch snapshots for all leg symbols in one batch
+        try:
+            snapshots = self._get_snapshots_batched(symbols)
+        except Exception as exc:
+            log.warning("[chain] get_greeks snapshot error: %s", exc)
+            return []
+
+        results: List[Dict] = []
+        for sym, (qty, side) in zip(symbols, leg_meta):
+            snap = snapshots.get(sym)
+            if snap is None:
+                continue
+            greeks = getattr(snap, "greeks", None)
+            if greeks is None:
+                continue
+
+            results.append({
+                'delta': float(greeks.delta) if greeks.delta is not None else 0.0,
+                'gamma': float(greeks.gamma) if greeks.gamma is not None else 0.0,
+                'theta': float(greeks.theta) if greeks.theta is not None else 0.0,
+                'vega':  float(greeks.vega) if greeks.vega is not None else 0.0,
+                'qty':   qty,
+                'side':  side,
+            })
+
+        # Cache with standard TTL (60s)
+        self._set_cached(cache_key, results)
+        return results
+
+    # ------------------------------------------------------------------
+    # get_greeks_for_symbol — single-contract Greeks lookup
+    # ------------------------------------------------------------------
+    def get_greeks_for_symbol(self, symbol: str) -> Optional[Dict]:
+        """Fetch current Greeks for a single option contract symbol.
+
+        Returns dict with delta, gamma, theta, vega keys, or None on failure.
+        Used by PortfolioGreeksTracker.
+        """
+        if self._data_client is None:
+            return None
+
+        try:
+            snapshots = self._get_snapshots_batched([symbol])
+            snap = snapshots.get(symbol)
+            if snap is None:
+                return None
+
+            greeks = getattr(snap, "greeks", None)
+            if greeks is None:
+                return None
+
+            return {
+                'delta': float(greeks.delta) if greeks.delta is not None else 0.0,
+                'gamma': float(greeks.gamma) if greeks.gamma is not None else 0.0,
+                'theta': float(greeks.theta) if greeks.theta is not None else 0.0,
+                'vega':  float(greeks.vega) if greeks.vega is not None else 0.0,
+            }
+        except Exception as exc:
+            log.warning("[chain] get_greeks_for_symbol error for %s: %s", symbol, exc)
+            return None
+
+    # ------------------------------------------------------------------
     # find_by_delta / find_atm / find_otm (unchanged)
     # ------------------------------------------------------------------
     def find_by_delta(

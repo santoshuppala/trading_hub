@@ -460,6 +460,92 @@ class OptionsEngine:
             if pos.current_pnl > 0:
                 return f"dte_roll_profit (DTE={dte}, pnl=${pos.current_pnl:.2f})"
 
+        # ── 7. Greeks-based exit triggers ──────────────────────────────
+        greeks_exit = self._evaluate_greeks_exit(pos, dte)
+        if greeks_exit:
+            return greeks_exit
+
+        return None
+
+    def _evaluate_greeks_exit(
+        self, pos: OptionsPosition, dte: int,
+    ) -> Optional[str]:
+        """
+        Evaluate Greeks-based exit conditions.
+
+        Checks gamma spike, theta decay acceleration, and delta drift.
+        Returns exit reason string or None. Never raises.
+        """
+        if not self._chain:
+            return None
+
+        try:
+            current_greeks = self._chain.get_greeks(pos.spec.legs)
+
+            if not current_greeks:
+                return None
+
+            total_delta = sum(
+                g['delta'] * g['qty'] * (1 if g['side'].upper() == 'BUY' else -1)
+                for g in current_greeks
+            )
+            total_gamma = sum(
+                abs(g['gamma'] * g['qty'])
+                for g in current_greeks
+            )
+            total_theta = sum(
+                g['theta'] * g['qty'] * (1 if g['side'].upper() == 'BUY' else -1)
+                for g in current_greeks
+            )
+
+            # Exit: Gamma spike — position becomes unmanageable near expiry
+            if total_gamma > 0.10 and dte <= 14:
+                log.info(
+                    "[OptionsEngine] GREEKS EXIT %s | gamma_spike | "
+                    "gamma=%.4f dte=%d",
+                    pos.ticker, total_gamma, dte,
+                )
+                return f"gamma_spike (gamma={total_gamma:.4f}, DTE={dte})"
+
+            # Exit: Theta decay acceleration — bleeding too fast
+            position_value = abs(pos.current_value) if pos.current_value != 0.0 else abs(
+                pos.entry_cost if pos.entry_cost != 0 else pos.max_risk or 1
+            )
+            if position_value > 0 and abs(total_theta) / position_value > 0.05:
+                log.info(
+                    "[OptionsEngine] GREEKS EXIT %s | theta_bleed_fast | "
+                    "theta=%.4f pos_value=%.2f ratio=%.4f",
+                    pos.ticker, total_theta, position_value,
+                    abs(total_theta) / position_value,
+                )
+                return (
+                    f"theta_bleed_fast (theta={total_theta:.4f}, "
+                    f"pos_value=${position_value:.2f}, "
+                    f"ratio={abs(total_theta) / position_value:.4f})"
+                )
+
+            # Exit: Delta drift — neutral position has become directional
+            _NEUTRAL_STRATEGIES = {
+                'iron_condor', 'iron_butterfly', 'long_straddle',
+                'long_strangle', 'butterfly_spread',
+            }
+            if pos.strategy_type in _NEUTRAL_STRATEGIES and abs(total_delta) > 0.30:
+                log.info(
+                    "[OptionsEngine] GREEKS EXIT %s | delta_drift | "
+                    "delta=%.4f strategy=%s",
+                    pos.ticker, total_delta, pos.strategy_type,
+                )
+                return (
+                    f"delta_drift (delta={total_delta:.4f}, "
+                    f"strategy={pos.strategy_type})"
+                )
+
+        except Exception as exc:
+            log.debug(
+                "Greeks fetch failed for %s (non-fatal): %s",
+                pos.ticker, exc,
+            )
+
         return None
 
     def _get_position_mark(self, pos: OptionsPosition) -> Optional[float]:

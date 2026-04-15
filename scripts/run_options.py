@@ -131,8 +131,6 @@ def main():
     consumer.start()
     log.info("IPC consumer started (SIGNAL + POP_SIGNAL)")
 
-    bus.start()
-
     log.info("Options process running.")
     try:
         while True:

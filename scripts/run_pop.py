@@ -108,8 +108,6 @@ def main():
 
     bus.subscribe(EventType.POP_SIGNAL, _forward_pop_signal, priority=10)
 
-    bus.start()
-
     log.info("Pop process running.")
     try:
         while True:

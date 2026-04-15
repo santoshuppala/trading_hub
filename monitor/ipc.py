@@ -44,9 +44,9 @@ class EventPublisher:
             'compression.type': 'snappy',
             'queue.buffering.max.messages': 10000,
         })
+        self._running = True
         self._flush_thread = threading.Thread(target=self._bg_flush, daemon=True)
         self._flush_thread.start()
-        self._running = True
 
     def publish(self, topic: str, key: str, payload: dict, headers: dict = None) -> None:
         """Publish a message to a topic. Non-blocking."""

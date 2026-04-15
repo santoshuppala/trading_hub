@@ -88,9 +88,6 @@ def main():
 
     bus.subscribe(EventType.ORDER_REQ, _forward_order, priority=0)
 
-    # Start local bus
-    bus.start()
-
     # Main loop: read shared cache → emit BAR events on local bus
     log.info("Pro process running. Reading bars from shared cache.")
     try:

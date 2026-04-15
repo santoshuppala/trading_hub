@@ -1,5 +1,19 @@
 # Release Plan v3 — Production Hardening & Institutional Compliance
 
+**Status**: PARTIALLY COMPLETE (2026-04-14)
+
+| Item | Status |
+|---|---|
+| Fix 1.1: PopStrategy thread safety | DEFERRED to v4 |
+| Fix 1.2: Backtest memory bound | DEFERRED to v4 |
+| Fix 1.3: Options chain rate limiting | DEFERRED to v4 |
+| Enh 2.1: Magic numbers to config | PARTIAL (portfolio risk limits added) |
+| Enh 2.2: Dashboard analytics wiring | DONE |
+| Enh 2.3: Order submission logging | DONE |
+| Fix 3.1: Options E2E tests | DEFERRED to v4 |
+| Fix 3.2: IV history seeding | DEFERRED to v4 |
+| Enh 4.1: Structured exceptions | DONE (top 5 files) |
+
 **Date**: 2026-04-15+
 **Risk Level**: HIGH — fixes race conditions, memory leaks, and silent failures
 **Prerequisite**: Release Plan v1 (commit `148fb28`) and v2 deployed

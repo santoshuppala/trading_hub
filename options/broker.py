@@ -11,10 +11,10 @@ from monitor.event_bus import Event
 
 log = logging.getLogger(__name__)
 
-FILL_TIMEOUT_SEC = 30.0  # options fill slower than equity
+FILL_TIMEOUT_SEC = 15.0  # reduced from 30s to avoid long blocking
 FILL_POLL_SEC    = 1.0
-MAX_RETRIES      = 2
-WIDEN_INCREMENT  = 0.05   # widen limit price by $0.05 per retry
+MAX_RETRIES      = 1     # reduced from 2 — 2 attempts total (submit + 1 retry)
+WIDEN_INCREMENT  = 0.05  # widen limit price by $0.05 per retry
 
 
 class AlpacaOptionsBroker:
@@ -96,8 +96,10 @@ class AlpacaOptionsBroker:
         """
         try:
             order = self._client.get_order_by_id(order_id)
+            # order.status is an enum (OrderStatus.FILLED) — use .value for the raw string
+            raw_status = order.status.value if hasattr(order.status, 'value') else str(order.status)
             return {
-                "status": str(order.status),
+                "status": raw_status,
                 "filled_qty": float(order.filled_qty or 0),
                 "filled_avg_price": float(order.filled_avg_price or 0),
             }
@@ -283,27 +285,28 @@ class AlpacaOptionsBroker:
         for attempt in range(MAX_RETRIES + 1):
             try:
                 # Build the mleg order payload for Alpaca REST API
+                # Alpaca mleg format: qty at top level (number of spreads),
+                # each leg uses ratio_qty (not qty)
                 order_legs = []
                 for leg in legs:
                     order_legs.append({
                         "symbol": leg.symbol,
-                        "side": leg.side,
-                        "qty": str(leg.qty),
+                        "side": leg.side.lower(),
                         "ratio_qty": str(leg.ratio),
                     })
 
                 order_body = {
+                    "qty": str(legs[0].qty),
                     "order_class": "mleg",
-                    "type": "limit",
                     "time_in_force": "day",
                     "legs": order_legs,
                 }
 
-                # Set limit price based on debit/credit
-                if is_debit:
-                    order_body["limit_price"] = str(round(net_price, 2))
+                # Close orders use market; entry orders use limit
+                if trade_spec.strategy_type == "close":
+                    order_body["type"] = "market"
                 else:
-                    # Credit order: net_debit is negative, use absolute value
+                    order_body["type"] = "limit"
                     order_body["limit_price"] = str(round(net_price, 2))
 
                 # Submit via TradingClient's internal HTTP method
@@ -337,12 +340,29 @@ class AlpacaOptionsBroker:
                     )
                     return True
 
-                # Not filled -- cancel and retry at wider price
+                # Not filled -- check status once more, then cancel and retry
                 log.warning(
                     "[AlpacaOptionsBroker] mleg order %s not filled in %.0fs, cancelling (attempt %d/%d)",
                     order_id, FILL_TIMEOUT_SEC, attempt + 1, MAX_RETRIES + 1,
                 )
-                self.cancel_order(str(order_id))
+                cancelled = self.cancel_order(str(order_id))
+                if not cancelled:
+                    # Cancel failed — almost certainly filled. Verify and return.
+                    recheck = self.get_order_status(str(order_id))
+                    recheck_status = recheck.get("status", "").lower()
+                    if recheck_status == "filled":
+                        log.info(
+                            "[AlpacaOptionsBroker] FILLED mleg %s %s (detected after cancel race) | avg=$%.2f | %d legs",
+                            trade_spec.strategy_type, trade_spec.ticker,
+                            recheck["filled_avg_price"], len(legs),
+                        )
+                        return True
+                    # Cancel failed but not filled — don't retry (avoid duplicates)
+                    log.warning(
+                        "[AlpacaOptionsBroker] cancel failed and status=%s for %s — aborting to avoid duplicate",
+                        recheck_status, trade_spec.ticker,
+                    )
+                    return False
                 time.sleep(0.5)
 
                 # Widen net limit price for next attempt
@@ -379,11 +399,12 @@ class AlpacaOptionsBroker:
             # Try using the TradingClient's internal request method
             # alpaca-py exposes _request() or post() for raw API calls
             if hasattr(self._client, "_request"):
-                # alpaca-py v0.10+: _request(method, path, data)
-                response = self._client._request("POST", "/v2/orders", order_body)
+                # alpaca-py _request() prepends api_version (v2) to the path,
+                # so pass "/orders" not "/v2/orders" to avoid /v2/v2/orders
+                response = self._client._request("POST", "/orders", order_body)
                 return response
             elif hasattr(self._client, "post"):
-                response = self._client.post("/v2/orders", order_body)
+                response = self._client.post("/orders", order_body)
                 return response
             else:
                 # Direct httpx fallback using client's base_url and headers

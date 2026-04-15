@@ -51,12 +51,20 @@ class TradierBroker:
             }
         )
         self._sandbox = sandbox
+        self._broker_name = 'tradier'
 
         if subscribe:
             bus.subscribe(EventType.ORDER_REQ, self._on_order_req, priority=1)
 
         mode = "sandbox" if sandbox else "LIVE"
         log.info("[TradierBroker] ready | account=%s | mode=%s", account_id, mode)
+
+    def _emit_fill(self, fill_payload) -> None:
+        """Emit a FILL event tagged with tradier broker name."""
+        evt = Event(EventType.FILL, fill_payload)
+        evt._routed_broker = self._broker_name
+        self._bus.emit(evt)
+        log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
 
     # ── Event handler ────────────────────────────────────────────────
 
@@ -85,19 +93,23 @@ class TradierBroker:
             "[TradierBroker] SUBMIT BUY: %s qty=%d limit=$%.2f", ticker, qty, price
         )
 
+        # Tradier uses simple limit orders (no OTOCO brackets) — the strategy
+        # engine monitors exits in-process. Alpaca handles broker-side brackets.
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
+                order_data = {
+                    "class": "equity",
+                    "symbol": ticker,
+                    "side": "buy",
+                    "quantity": str(qty),
+                    "type": "limit",
+                    "price": f"{price:.2f}",
+                        "duration": "day",
+                    }
+
                 resp = self._session.post(
                     f"{self._base}/v1/accounts/{self._account}/orders",
-                    data={
-                        "class": "equity",
-                        "symbol": ticker,
-                        "side": "buy",
-                        "quantity": str(qty),
-                        "type": "limit",
-                        "price": f"{price:.2f}",
-                        "duration": "day",
-                    },
+                    data=order_data,
                     timeout=10,
                 )
 
@@ -130,24 +142,22 @@ class TradierBroker:
                         filled_qty,
                         fill_price,
                     )
-                    self._bus.emit(
-                        Event(
-                            type=EventType.FILL,
-                            payload=FillPayload(
-                                ticker=ticker,
-                                side="BUY",
-                                qty=filled_qty,
-                                fill_price=fill_price,
-                                order_id=order_id,
-                                reason=p.reason,
-                                stop_price=p.stop_price,
-                                target_price=p.target_price,
-                                atr_value=p.atr_value,
-                            ),
-                            correlation_id=parent_event.event_id,
-                        )
-                    )
-                    log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
+                    self._emit_fill(FillPayload(
+                        ticker=ticker,
+                        side="BUY",
+                        qty=filled_qty,
+                        fill_price=fill_price,
+                        order_id=order_id,
+                        reason=p.reason,
+                        stop_price=p.stop_price,
+                        target_price=p.target_price,
+                        atr_value=p.atr_value,
+                    ))
+
+                    # Submit standalone stop-loss order for crash protection
+                    if p.stop_price and p.stop_price > 0:
+                        self._submit_stop_order(ticker, filled_qty, p.stop_price)
+
                     return
 
                 # Not filled — cancel and retry
@@ -177,10 +187,78 @@ class TradierBroker:
 
     # ── Equity sell (market) ─────────────────────────────────────────
 
+    def _cancel_open_orders(self, ticker: str) -> None:
+        """Cancel any open orders for a ticker before selling (prevents bracket double-sell)."""
+        try:
+            resp = self._session.get(
+                f"{self._base}/v1/accounts/{self._account}/orders",
+                params={"filter": "open"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                orders = resp.json().get("orders", {})
+                if orders and orders != "null":
+                    order_list = orders.get("order", [])
+                    if isinstance(order_list, dict):
+                        order_list = [order_list]
+                    cancelled = 0
+                    for o in order_list:
+                        sym = o.get("symbol", "")
+                        side = o.get("side", "")
+                        if sym == ticker and side in ("sell", "sell_short"):
+                            oid = o.get("id")
+                            if oid:
+                                self._session.delete(
+                                    f"{self._base}/v1/accounts/{self._account}/orders/{oid}",
+                                    timeout=5,
+                                )
+                                cancelled += 1
+                    if cancelled:
+                        log.info("[TradierBroker] Cancelled %d open sell orders for %s", cancelled, ticker)
+        except Exception as exc:
+            log.warning("[TradierBroker] Failed to cancel orders for %s: %s", ticker, exc)
+
+    def _submit_stop_order(self, ticker: str, qty: int, stop_price: float) -> None:
+        """Submit a standalone stop-loss order for crash protection.
+
+        This is NOT an OTOCO bracket — it's a simple stop order that lives
+        independently. Easier to cancel before selling than OTOCO children.
+        """
+        try:
+            resp = self._session.post(
+                f"{self._base}/v1/accounts/{self._account}/orders",
+                data={
+                    "class": "equity",
+                    "symbol": ticker,
+                    "side": "sell",
+                    "quantity": str(qty),
+                    "type": "stop",
+                    "stop": f"{stop_price:.2f}",
+                    "duration": "day",
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                order_id = resp.json().get("order", {}).get("id", "")
+                log.info(
+                    "[TradierBroker] STOP ORDER placed: %s qty=%d stop=$%.2f (order %s)",
+                    ticker, qty, stop_price, order_id,
+                )
+            else:
+                log.warning(
+                    "[TradierBroker] STOP ORDER failed for %s: %s",
+                    ticker, resp.text[:200],
+                )
+        except Exception as exc:
+            log.warning("[TradierBroker] STOP ORDER error for %s: %s", ticker, exc)
+
     def _execute_sell(self, p: OrderRequestPayload, parent_event: Event) -> None:
         """Submit a market sell order via Tradier."""
         ticker = p.ticker
         qty = p.qty
+
+        # Cancel bracket child orders before selling
+        self._cancel_open_orders(ticker)
 
         log.info(
             "[TradierBroker] SUBMIT SELL: %s qty=%d type=market reason=%s",
@@ -226,21 +304,14 @@ class TradierBroker:
                     filled_qty,
                     fill_price,
                 )
-                self._bus.emit(
-                    Event(
-                        type=EventType.FILL,
-                        payload=FillPayload(
-                            ticker=ticker,
-                            side="SELL",
-                            qty=filled_qty,
-                            fill_price=fill_price,
-                            order_id=order_id,
-                            reason=p.reason,
-                        ),
-                        correlation_id=parent_event.event_id,
-                    )
-                )
-                log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
+                self._emit_fill(FillPayload(
+                    ticker=ticker,
+                    side="SELL",
+                    qty=filled_qty,
+                    fill_price=fill_price,
+                    order_id=order_id,
+                    reason=p.reason,
+                ))
             else:
                 log.warning("[TradierBroker] SELL %s not filled", ticker)
                 self._emit_order_fail(p, parent_event)
@@ -406,15 +477,41 @@ class TradierBroker:
                 order = resp.json().get("order", {})
                 status = order.get("status", "")
 
-                if status == "filled":
+                if status in ("filled", "partially_filled"):
                     fill_price = float(
                         order.get("avg_fill_price", fallback_price)
                     )
                     filled_qty = int(
                         float(order.get("exec_quantity", expected_qty))
                     )
+                    if status == "partially_filled":
+                        log.warning(
+                            "[TradierBroker] Partial fill: %d of %d — "
+                            "cancelling remainder",
+                            filled_qty, expected_qty,
+                        )
+                        # Cancel remaining to prevent untracked fills
+                        self._cancel_order(order_id)
+                        import time as _t; _t.sleep(0.5)
+                        # Re-check final qty
+                        try:
+                            resp2 = self._session.get(
+                                f"{self._base}/v1/accounts/{self._account}/orders/{order_id}",
+                                timeout=5,
+                            )
+                            if resp2.status_code == 200:
+                                final = resp2.json().get("order", {})
+                                filled_qty = int(float(final.get("exec_quantity", filled_qty)))
+                                fill_price = float(final.get("avg_fill_price", fill_price))
+                        except Exception:
+                            pass
                     return True, fill_price, filled_qty
                 elif status in ("canceled", "expired", "rejected"):
+                    # Check if any shares filled before cancel
+                    exec_qty = int(float(order.get("exec_quantity", 0)))
+                    if exec_qty > 0:
+                        fill_price = float(order.get("avg_fill_price", fallback_price))
+                        return True, fill_price, exec_qty
                     return False, fallback_price, 0
             except Exception:
                 continue

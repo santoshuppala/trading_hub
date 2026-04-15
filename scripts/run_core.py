@@ -105,6 +105,72 @@ def main():
              100000, 5.0, 1.0)
     portfolio_risk.reset_day()
 
+    # ── Smart routing (multi-broker) ──────────────────────────────────────
+    from config import BROKER_MODE
+    if BROKER_MODE == 'smart':
+        try:
+            from monitor.tradier_broker import TradierBroker
+            from monitor.smart_router import SmartRouter
+
+            tradier_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TRADING_TOKEN', '')
+            tradier_account = os.getenv('TRADIER_ACCOUNT_ID', '')
+            tradier_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+
+            if tradier_token and tradier_account:
+                tradier_broker = TradierBroker(
+                    bus=monitor._bus,
+                    token=tradier_token,
+                    account_id=tradier_account,
+                    sandbox=tradier_sandbox,
+                    subscribe=False,  # SmartRouter handles routing
+                )
+                alpaca_broker = getattr(monitor, '_broker', None)
+
+                smart_router = SmartRouter(
+                    bus=monitor._bus,
+                    alpaca_broker=alpaca_broker,
+                    tradier_broker=tradier_broker,
+                    default_broker='alpaca',
+                )
+                log.info("SmartRouter active | brokers=alpaca+tradier | mode=%s", BROKER_MODE)
+
+                # Seed position→broker mapping from current broker positions
+                try:
+                    import requests as _req
+                    alpaca_tickers = set()
+                    tradier_tickers = set()
+                    # Alpaca positions
+                    alpaca_client = getattr(monitor, '_broker', None)
+                    if alpaca_client and hasattr(alpaca_client, '_client') and alpaca_client._client:
+                        for p in alpaca_client._client.get_all_positions():
+                            alpaca_tickers.add(str(p.symbol))
+                    # Tradier positions
+                    t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '')
+                    t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+                    if t_token and t_acct:
+                        t_base = 'https://sandbox.tradier.com'
+                        t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+                        resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/positions',
+                                       headers=t_headers, timeout=5)
+                        if resp.status_code == 200:
+                            positions = resp.json().get('positions', {})
+                            if positions and positions != 'null':
+                                pos_list = positions.get('position', [])
+                                if isinstance(pos_list, dict):
+                                    pos_list = [pos_list]
+                                for p in pos_list:
+                                    if int(float(p.get('quantity', 0))) > 0:
+                                        tradier_tickers.add(p['symbol'])
+                    smart_router.seed_position_broker(alpaca_tickers, tradier_tickers)
+                except Exception as seed_exc:
+                    log.warning("SmartRouter position seed failed (non-fatal): %s", seed_exc)
+            else:
+                log.warning("BROKER_MODE=smart but Tradier credentials missing — using Alpaca only")
+        except Exception as exc:
+            log.warning("SmartRouter init failed (non-fatal): %s — using Alpaca only", exc)
+    else:
+        log.info("BROKER_MODE=%s — single broker mode", BROKER_MODE)
+
     # Hook: publish SIGNAL events to Redpanda for Options process
     def _on_signal_publish(event):
         if event.type == EventType.SIGNAL:

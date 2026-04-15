@@ -53,6 +53,22 @@ def main():
     log.info("PRO-SETUPS PROCESS STARTING")
     log.info("=" * 60)
 
+    # Initialize RVOL engine so Pro detectors get real RVOL values
+    try:
+        from monitor.rvol import init_global_rvol_engine
+        from monitor.data_client import make_data_client
+        rvol_engine = init_global_rvol_engine()
+        data_client = make_data_client(
+            os.getenv('DATA_SOURCE', 'tradier'),
+            tradier_token=os.getenv('TRADIER_TOKEN', ''),
+            alpaca_api_key=os.getenv('APCA_API_KEY_ID', ''),
+            alpaca_secret=os.getenv('APCA_API_SECRET_KEY', ''),
+        )
+        rvol_engine.seed_profiles(TICKERS, data_client)
+        log.info("[RVOLEngine] seeded profiles for %d tickers in Pro process", len(TICKERS))
+    except Exception as exc:
+        log.warning("[RVOLEngine] init failed in Pro — RVOL will be approximate: %s", exc)
+
     # Local EventBus for this process
     bus = EventBus()
 
@@ -73,6 +89,21 @@ def main():
         trade_budget=float(PRO_TRADE_BUDGET),
     )
     log.info("ProSetupEngine ready | max_pos=%d | budget=$%d", PRO_MAX_POSITIONS, PRO_TRADE_BUDGET)
+
+    # ── Lifecycle management ──────────────────────────────────────────
+    from lifecycle import EngineLifecycle
+    from lifecycle.adapters.pro_adapter import ProLifecycleAdapter
+    from config import PRO_MAX_DAILY_LOSS, ALERT_EMAIL
+
+    risk_adapter = getattr(pro_engine, '_risk_adapter', None)
+    lifecycle = EngineLifecycle(
+        engine_name='pro',
+        adapter=ProLifecycleAdapter(pro_engine, risk_adapter),
+        bus=bus,
+        alert_email=ALERT_EMAIL,
+        max_daily_loss=PRO_MAX_DAILY_LOSS,
+    )
+    lifecycle.startup()
 
     # Intercept ORDER_REQ from local bus → publish to Redpanda
     def _forward_order(event):
@@ -118,6 +149,7 @@ def main():
                     df = pd.DataFrame(df)
                 if df.empty:
                     continue
+                df.name = ticker  # so compute_rvol can look up the ticker
                 rvol_df = rvol_cache.get(ticker)
                 if isinstance(rvol_df, dict):
                     rvol_df = pd.DataFrame(rvol_df)
@@ -130,13 +162,18 @@ def main():
             if bar_events:
                 bus.emit_batch(bar_events)
 
+            # Lifecycle tick: heartbeat, kill switch, reconciliation, state save
+            if not lifecycle.tick():
+                log.error("Pro engine halted by kill switch.")
+                break
+
             # Wait for next cache update
             time.sleep(10)
 
     except KeyboardInterrupt:
         log.info("Pro process interrupted.")
     finally:
-        # bus has no stop() — dispatchers clean up on process exit
+        lifecycle.shutdown()
         publisher.stop()
         if db_cleanup:
             db_cleanup()

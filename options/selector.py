@@ -34,10 +34,10 @@ IV_RANK_HIGH          = 50    # above 50 → sell premium (IV is rich)
 IV_RANK_LOW           = 30    # below 30 → buy premium (IV is cheap)
 IV_RANK_VERY_HIGH     = 70    # above 70 → aggressive credit selling
 
-# ── Raw IV fallbacks (used when IV rank unavailable) ─────────────────────────
-IV_HIGH_THRESHOLD     = 0.35
-IV_MOD_THRESHOLD      = 0.25
-IV_LOW_THRESHOLD      = 0.15
+# ── Raw IV fallbacks (used when IV rank unavailable / thin history) ───────────
+IV_HIGH_THRESHOLD     = 0.25
+IV_MOD_THRESHOLD      = 0.20
+IV_LOW_THRESHOLD      = 0.18
 
 # ── RSI thresholds ───────────────────────────────────────────────────────────
 RSI_NEUTRAL_LOW       = 40
@@ -141,6 +141,7 @@ class OptionStrategySelector:
         rvol:        float,
         has_existing_position: bool,
         iv_rank:     float = 50.0,
+        iv_history_days: int = 0,
     ) -> Optional[str]:
         """
         BAR-driven neutral/volatility selection using IV rank.
@@ -149,21 +150,26 @@ class OptionStrategySelector:
           - IV rank < 30 + ATR spike → BUY vol (straddle/strangle) — IV will expand
           - IV rank > 50 + range-bound → SELL vol (iron condor) — IV will contract
           - IV rank > 70 + neutral RSI → aggressive credit selling
+
+        When IV history is thin (< 20 days), IV rank is blended toward neutral.
+        With < 2 days, we fall back to raw IV thresholds entirely.
         """
         if spot_price <= 0:
             return None
 
         atr_ratio = atr_value / spot_price
-        iv_is_rich = iv_rank >= IV_RANK_HIGH
-        iv_is_cheap = iv_rank < IV_RANK_LOW
-        iv_very_rich = iv_rank >= IV_RANK_VERY_HIGH
+        no_iv_history = iv_history_days < 2
 
-        # When IV rank is at default (no history), fall back to raw IV
-        no_iv_history = (iv_rank == 50.0)
         if no_iv_history:
+            # No meaningful IV rank — use raw IV thresholds
             iv_is_rich = iv_estimate >= IV_HIGH_THRESHOLD
             iv_is_cheap = iv_estimate <= IV_LOW_THRESHOLD
-            iv_very_rich = iv_estimate >= 0.40
+            iv_very_rich = iv_estimate >= IV_HIGH_THRESHOLD + 0.10
+        else:
+            # IV rank available (possibly blended if < 20 days)
+            iv_is_rich = iv_rank >= IV_RANK_HIGH
+            iv_is_cheap = iv_rank < IV_RANK_LOW
+            iv_very_rich = iv_rank >= IV_RANK_VERY_HIGH
 
         # ── 1. ATR spike + cheap/neutral IV → buy straddle ───────────
         if atr_ratio > ATR_SPIKE_THRESHOLD and not iv_is_rich:
@@ -176,7 +182,7 @@ class OptionStrategySelector:
 
         # ── 3. Range-bound + rich IV → sell premium ──────────────────
         if RSI_NEUTRAL_LOW <= rsi <= RSI_NEUTRAL_HIGH:
-            if (iv_very_rich or (iv_is_rich and not no_iv_history)) and not has_existing_position:
+            if (iv_very_rich or iv_is_rich) and not has_existing_position:
                 if RSI_VERY_NEUTRAL_LOW <= rsi <= RSI_VERY_NEUTRAL_HIGH:
                     return 'iron_butterfly'
                 else:

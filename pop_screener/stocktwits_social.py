@@ -40,7 +40,7 @@ from pop_screener.models import SocialData
 
 log = logging.getLogger(__name__)
 
-_CACHE_TTL = 300  # 5 minutes (aggressive caching for rate limits)
+_CACHE_TTL = 900  # 15 minutes — stay well within 200 req/hr limit
 
 
 class StockTwitsSocialSource:
@@ -75,7 +75,7 @@ class StockTwitsSocialSource:
         self._cache: Dict[str, Tuple[float, SocialData]] = {}
         # Rate limit tracking
         self._last_request_time = 0.0
-        self._min_interval = 0.3  # 300ms between requests (safe for 200/hr)
+        self._min_interval = 20.0  # 20s between requests → max 180/hr (under 200 limit)
         # Hourly request counter for rate limit monitoring
         self._request_count = 0
         self._request_window_start = time.time()
@@ -93,23 +93,24 @@ class StockTwitsSocialSource:
         if cached and (time.monotonic() - cached[0]) < _CACHE_TTL:
             return cached[1]
 
-        # --- Rate limit monitoring ---
-        self._request_count += 1
+        # --- Rate limit: non-blocking throttle ---
+        # If we made a request too recently, return cached/default instead of sleeping
+        elapsed = time.monotonic() - self._last_request_time
+        if elapsed < self._min_interval:
+            return self._get_cached_or_default(symbol)
+
+        # --- Hourly rate limit monitoring ---
         # Reset counter every hour
         if time.time() - self._request_window_start > 3600:
-            self._request_count = 1
+            self._request_count = 0
             self._request_window_start = time.time()
-        # Warn if approaching limit
-        if self._request_count >= 180:  # 90% of 200
-            log.warning(
-                "[StockTwits] Rate limit approaching: %d/200 requests this hour",
-                self._request_count,
-            )
         # Hard stop at limit
-        if self._request_count >= 195:
-            log.warning("[StockTwits] Rate limit reached — returning cached data")
-            self._rate_limit_warnings += 1
+        if self._request_count >= 180:
+            if self._request_count == 180:
+                log.warning("[StockTwits] Rate limit reached (180/200) — returning cached data until next hour")
+            self._request_count += 1
             return self._get_cached_or_default(symbol)
+        self._request_count += 1
 
         try:
             result = self._fetch(symbol)
@@ -141,11 +142,6 @@ class StockTwitsSocialSource:
 
     def _fetch(self, symbol: str) -> SocialData:
         """Call StockTwits API and parse response."""
-        # Rate limiting
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-
         url = f"{self._BASE_URL}/{symbol}.json"
         params = {}
         if self._access_token:

@@ -79,24 +79,28 @@ def _alert_worker() -> None:
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
 
-        # Try with connection reuse, fall back to new connection
-        if server is None:
-            server = _get_smtp_connection()
+        # Fresh connection per send — Yahoo drops idle connections
+        server = _get_smtp_connection()
 
         success = _deliver_with_connection(server, alert_email, message)
+
+        # Always close after send to avoid stale connections
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
+        server = None
+
         if not success:
-            # Connection failed — increment backoff counter
             _consecutive_failures += 1
-            # Exponential backoff: 2^failures seconds (1s, 2s, 4s, 8s, 16s max)
             backoff_secs = min(2 ** _consecutive_failures, 16)
             _backoff_until = time.time() + backoff_secs
             log.warning(
                 f"Alert delivery failed — backoff {backoff_secs}s "
                 f"({_consecutive_failures} consecutive failures)"
             )
-            server = None
         else:
-            # Success — reset failure counter
             _consecutive_failures = 0
             _backoff_until = 0.0
 

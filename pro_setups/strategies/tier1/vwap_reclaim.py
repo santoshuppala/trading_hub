@@ -82,6 +82,7 @@ class VWAPReclaim(BaseProStrategy):
         direction:   str,
         atr:         float,
         df:          pd.DataFrame,
+        outputs:     dict = None,
     ) -> float:
         # Use T4's reclaim-candle-low as a structural reference
         reclaim_low = float(df['low'].iloc[-1])

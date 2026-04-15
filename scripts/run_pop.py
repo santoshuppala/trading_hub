@@ -90,6 +90,20 @@ def main():
     log.info("PopStrategyEngine ready | paper=%s | max_pos=%d | budget=$%d",
              POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET)
 
+    # ── Lifecycle management ──────────────────────────────────────────
+    from lifecycle import EngineLifecycle
+    from lifecycle.adapters.pop_adapter import PopLifecycleAdapter
+    from config import POP_MAX_DAILY_LOSS
+
+    lifecycle = EngineLifecycle(
+        engine_name='pop',
+        adapter=PopLifecycleAdapter(pop_engine),
+        bus=bus,
+        alert_email=ALERT_EMAIL,
+        max_daily_loss=POP_MAX_DAILY_LOSS,
+    )
+    lifecycle.startup()
+
     # Forward POP_SIGNAL to Redpanda (for Options process)
     def _forward_pop_signal(event):
         if event.type == EventType.POP_SIGNAL:
@@ -111,6 +125,25 @@ def main():
             })
 
     bus.subscribe(EventType.POP_SIGNAL, _forward_pop_signal, priority=10)
+
+    # Forward ORDER_REQ to Redpanda → Core executes via SmartRouter (same as Pro)
+    from monitor.ipc import TOPIC_ORDERS
+    def _forward_order(event):
+        if event.type == EventType.ORDER_REQ:
+            p = event.payload
+            publisher.publish(TOPIC_ORDERS, p.ticker, {
+                'ticker': p.ticker,
+                'side': str(p.side),
+                'qty': p.qty,
+                'price': float(p.price),
+                'reason': str(getattr(p, 'reason', 'pop')),
+                'stop_price': float(getattr(p, 'stop_price', 0)),
+                'target_price': float(getattr(p, 'target_price', 0)),
+                'source': 'pop',
+            })
+            log.info("[IPC] Published ORDER_REQ: %s %s qty=%d", p.ticker, p.side, p.qty)
+
+    bus.subscribe(EventType.ORDER_REQ, _forward_order, priority=0)
 
     log.info("Pop process running.")
     try:
@@ -146,12 +179,16 @@ def main():
             if bar_events:
                 bus.emit_batch(bar_events)
 
+            if not lifecycle.tick():
+                log.error("Pop engine halted by kill switch.")
+                break
+
             time.sleep(10)
 
     except KeyboardInterrupt:
         log.info("Pop process interrupted.")
     finally:
-        # bus has no stop() — dispatchers clean up on process exit
+        lifecycle.shutdown()
         publisher.stop()
         if db_cleanup:
             db_cleanup()

@@ -444,3 +444,132 @@ A `MomentumGrindDetector` that fires when:
 This catches "quiet rally" patterns that existing detectors miss — stocks grinding up without a catalyst. Lower R:R than sharp breakouts (no clear stop from a breakout candle), but captures moves like QQQ's 1.3% day.
 
 **Decision**: Evaluate after 2026-04-15 session. If multiple ETFs/mega-caps have 1%+ moves with zero signals, build it. If the pop screener + ETF RVOL fix already catches these via UNUSUAL_VOLUME or SENTIMENT_POP, skip it.
+
+---
+
+## Live Session Fixes Applied — 2026-04-15
+
+### Summary
+98 trades executed, 46% win rate. ~35 files modified across 30+ fixes. System went from broken (watchdog crash loop, options blowup, zero pop trades, no Tradier execution) to stable (zero errors, zero shorts, bracket stop-losses, multi-broker routing, full DB persistence).
+
+### Critical Fixes
+
+| # | Fix | Files | Impact |
+|---|-----|-------|--------|
+| 1 | **Watchdog lock file loop** — pre-flight check + stale lock removal | `scripts/watchdog.py` | Prevented 6 crash reports from a single stale lock |
+| 2 | **Options poll race (.value enum fix)** — `str(OrderStatus.FILLED)` returned `"OrderStatus.FILLED"` not `"filled"` | `options/broker.py` | **Fixed 213 duplicate fills that blew $105K on paper account** |
+| 3 | **Options race condition (TOCTOU)** — multiple threads passed risk check simultaneously | `options/risk.py`, `options/engine.py` | Added `reserve()`/`unreserve()` atomic locking, daily trade limit (50) |
+| 4 | **Options close orders ($0.00 limit)** — close orders submitted with `limit_price=0` | `options/broker.py` | Changed to market orders for closes |
+| 5 | **Options mleg URL double /v2** — `_request("POST", "/v2/orders")` → `/v2/v2/orders` | `options/broker.py` | Path fixed to `/orders` |
+| 6 | **Options mleg qty format** — Alpaca needs top-level `qty`, per-leg `ratio_qty` only | `options/broker.py` | Fixed order body structure |
+| 7 | **Double SELL (broker + SmartRouter)** — AlpacaBroker subscribed to ORDER_REQ AND SmartRouter called it directly | `monitor/smart_router.py` | Unsubscribe broker when SmartRouter active |
+| 8 | **SELL routing to wrong broker** — round-robin split BUY/SELL across brokers creating shorts | `monitor/smart_router.py` | SELL routes to opening broker; round-robin only for BUY |
+| 9 | **Partial sell cleared broker mapping** — `_position_broker.pop()` on any SELL | `monitor/smart_router.py` | Only clear on POSITION CLOSED event |
+| 10 | **Position broker mapping lost on restart** — in-memory dict wiped | `monitor/smart_router.py` | Persisted to `data/position_broker_map.json`, loaded on startup |
+| 11 | **Bracket order double-sell** — strategy engine sells + bracket stop fires = short | `monitor/brokers.py`, `monitor/tradier_broker.py` | Cancel all bracket/stop orders before SELL |
+| 12 | **Stale positions after restart** — bot_state.json had positions closed by bracket stops | `monitor/monitor.py` | Reverse reconciliation removes local positions not at any broker |
+| 13 | **Tradier OTOCO orphans** — bracket stops on Tradier can't be reliably cancelled | `monitor/tradier_broker.py` | Disabled Tradier brackets; simple limit orders only |
+
+### Stop Loss Improvements
+
+| # | Fix | Files | Impact |
+|---|-----|-------|--------|
+| 14 | **Micro-stops (0.04% from entry)** — 1-minute ATR too small for meaningful stops | `pro_setups/strategies/base.py` | Added 0.3% minimum floor |
+| 15 | **Structure-aware stops** — full-day S/R levels with touch counting | `pro_setups/strategies/base.py` | Pivot detection, cluster scoring, strongest level wins |
+| 16 | **Dynamic ATR stops** — daily ATR instead of 1-minute ATR | `pro_setups/strategies/base.py` | `DAILY_ATR_MULT × daily_atr` as fallback when no SR |
+| 17 | **R:R validation** — reject trades where stop makes R:R < 1:1 | `pro_setups/engine.py` | Added in `_levels_valid()` |
+| 18 | **Engine-level stop floor** — safety net for all strategy overrides | `pro_setups/engine.py` | 0.3% min enforced after `generate_stop()` returns |
+| 19 | **VWAP stop floor** — core strategy engine had no minimum | `monitor/strategy_engine.py` | Added 0.3% floor on VWAP stop calculation |
+| 20 | **Bracket orders at broker** — positions protected if system crashes | `monitor/brokers.py` | Alpaca `OrderClass.BRACKET` with `StopLossRequest` + `TakeProfitRequest` |
+| 21 | **`outputs=` param on all 11 strategy overrides** — needed for S/R-based stops | 10 strategy files | `generate_stop(..., outputs=outputs)` |
+
+### Data & DB Fixes
+
+| # | Fix | Files | Impact |
+|---|-----|-------|--------|
+| 22 | **completed_trades not populating** — ProjectionBuilder never called | `db/event_sourcing_subscriber.py` | Inline `_write_completed_trade()` on PositionClosed (50 trades today) |
+| 23 | **completed_trades schema (trading schema)** — table only in public schema | DB DDL | Created `trading.completed_trades` + added `broker` column |
+| 24 | **PositionClosed qty=None** — snapshot is None by design for CLOSED | `monitor/events.py`, `monitor/position_manager.py` | Added `close_detail` dict with qty, entry_price, exit_price |
+| 25 | **Broker tag on all events** — which broker executed each trade | `monitor/brokers.py`, `monitor/tradier_broker.py`, `monitor/position_manager.py`, `db/event_sourcing_subscriber.py` | `broker=alpaca/tradier` on FillExecuted, PositionOpened/Closed, completed_trades |
+| 26 | **Bracket order tag in DB** — whether broker-side protection is active | `db/event_sourcing_subscriber.py` | `bracket_order=true/false` on FillExecuted |
+| 27 | **Session fragmentation (24 sessions)** — random UUID per restart | `scripts/_db_helper.py` | Deterministic daily `uuid5` (4 stable session IDs) |
+| 28 | **Session ID column type** — `uuid` rejected non-UUID IDs | DB DDL | Changed `session_id` from `uuid` to `text` |
+
+### Engine Fixes
+
+| # | Fix | Files | Impact |
+|---|-----|-------|--------|
+| 29 | **RVOL=0.00 in Pro** — RVOLEngine never initialized in Pro process | `scripts/run_pro.py` | Added `init_global_rvol_engine()` + `seed_profiles()` |
+| 30 | **RVOL update() never called** — engine seeded but never updated with intraday bars | `pro_setups/engine.py` | Added `_global_rvol_engine.update()` before `compute_rvol()` |
+| 31 | **Options IV rank (no history)** — 20-day minimum, 0 days available | `options/iv_tracker.py`, `options/selector.py` | Graduated confidence blend + relaxed raw IV thresholds |
+| 32 | **Pop candidates not executing** — router returns empty silently | `pop_strategy_engine.py`, `pop_screener/strategy_router.py` | Added rejection logging + `MomentumEntryEngine` fallback |
+| 33 | **SmartRouter + Tradier in isolated mode** — only existed in monolith | `scripts/run_core.py` | Added SmartRouter + TradierBroker init with round-robin |
+| 34 | **EOD gate missing** — Pro/Pop/Options had no time cutoff | `pro_setups/engine.py`, `pop_strategy_engine.py`, `options/engine.py` | Added 3:45 PM ET cutoff (no new entries, exits still monitored) |
+| 35 | **IndexError on bar data** — transient data gaps from Tradier | `monitor/strategy_engine.py` | Wrapped in try/except (IndexError, KeyError) |
+
+### Infrastructure Fixes
+
+| # | Fix | Files | Impact |
+|---|-----|-------|--------|
+| 36 | **Supervisor duplicate logs** — StreamHandler + file redirect | `scripts/supervisor.py` | Removed StreamHandler |
+| 37 | **Supervisor restarts clean exits** — bogus crash reports | `scripts/supervisor.py` | Skip crash analysis for status='stopped' |
+| 38 | **Supervisor restart counter** — never resets | `scripts/supervisor.py` | Reset after 60s stable uptime |
+| 39 | **SUPERVISED_MODE** — lock file bypass in isolated mode | `scripts/supervisor.py`, `monitor/monitor.py` | `os.environ['SUPERVISED_MODE'] = '1'` |
+| 40 | **StockTwits rate limiting** — 200 requests in 6 seconds | `pop_screener/stocktwits_social.py` | Non-blocking 20s throttle, 15min cache, 180/hr cap |
+| 41 | **SMTP alerts** — missing ALERT_EMAIL_TO + stale connections | `.env`, `monitor/alerts.py` | Added env var, fresh connection per send |
+| 42 | **SELL qty mismatch** — local state diverged from Alpaca | `monitor/monitor.py` | Startup reconciliation updates local qty from Alpaca |
+| 43 | **Reconciliation script** — detect orphaned manual closes | `scripts/reconcile_manual_closes.py` (NEW) | Writes synthetic PositionClosed + completed_trades for manual API closes |
+| 44 | **Pop heartbeat logging** — no visibility into data flow | `pop_strategy_engine.py` | 5-minute heartbeat: scans, news_hits, social_hits |
+
+### Files Modified (35 unique)
+
+```
+monitor/brokers.py              monitor/tradier_broker.py
+monitor/smart_router.py         monitor/position_manager.py
+monitor/strategy_engine.py      monitor/events.py
+monitor/monitor.py              monitor/alerts.py
+db/event_sourcing_subscriber.py scripts/_db_helper.py
+scripts/run_core.py             scripts/run_pro.py
+scripts/supervisor.py           scripts/watchdog.py
+options/engine.py               options/broker.py
+options/risk.py                 options/selector.py
+options/iv_tracker.py           pop_strategy_engine.py
+pop_screener/strategy_router.py pop_screener/stocktwits_social.py
+pop_screener/models.py          pro_setups/engine.py
+pro_setups/strategies/base.py   pro_setups/strategies/tier1/sr_flip.py
+pro_setups/strategies/tier1/trend_pullback.py
+pro_setups/strategies/tier1/vwap_reclaim.py
+pro_setups/strategies/tier2/*.py (4 files)
+pro_setups/strategies/tier3/*.py (4 files)
+pop_screener/strategies/momentum_entry_engine.py (NEW)
+scripts/reconcile_manual_closes.py (NEW)
+```
+
+### New Files Created
+
+| File | Purpose |
+|------|---------|
+| `pop_screener/strategies/momentum_entry_engine.py` | Simple momentum entry fallback for pop candidates |
+| `scripts/reconcile_manual_closes.py` | CLI tool to detect and fix orphaned manual closes |
+| `data/position_broker_map.json` | Persistent position→broker mapping (survives restarts) |
+
+### End-of-Day Stats
+
+| Account | Equity | P&L Today | Notes |
+|---------|--------|-----------|-------|
+| Alpaca Equity (paper) | $1,005,480 | -$47.38 | Started $1,005,527. 98 trades, 47% win |
+| Alpaca Options (paper) | $882,014 | -$117,986 | Started $1,000,000. Blowup from duplicate fills (poll race bug) |
+| Tradier (sandbox) | $100,009 | +$9 | Started $100,000. First day of Tradier execution |
+| **Total** | **$1,987,503** | **-$117,324** | Options loss is 99% of total loss |
+
+| Metric | Value |
+|--------|-------|
+| Total trades (equity, both brokers) | 98 |
+| Win rate | 47% |
+| SmartRouter distribution | Alpaca: ~55%, Tradier: ~45% |
+| Events persisted to DB | 485,917 |
+| completed_trades rows | 50 (was 0 at start of session) |
+| Unintended shorts created (all fixed) | ~15 (root causes: duplicate fills, cross-broker sells, stale state) |
+| Process restarts (debugging) | ~12 |
+| Options duplicate fills (before fix) | 213 orders, ~$105K paper loss |
+| Tradier orphaned positions (all closed) | ~10 (from OTOCO brackets — now disabled) |

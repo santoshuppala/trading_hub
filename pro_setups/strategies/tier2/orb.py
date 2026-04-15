@@ -55,6 +55,7 @@ class ORB(BaseProStrategy):
         direction:   str,
         atr:         float,
         df:          pd.DataFrame,
+        outputs:     dict = None,
     ) -> float:
         offset = self.SL_ATR * atr
         if direction == 'long':

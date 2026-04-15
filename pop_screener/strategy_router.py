@@ -33,6 +33,7 @@ from pop_screener.strategies.halt_resume_engine     import HaltResumeEngine
 from pop_screener.strategies.parabolic_reversal_engine import ParabolicReversalEngine
 from pop_screener.strategies.ema_trend_engine       import EMATrendEngine
 from pop_screener.strategies.bopb_engine            import BOPBEngine
+from pop_screener.strategies.momentum_entry_engine  import MomentumEntryEngine
 
 
 class StrategyRouter:
@@ -57,6 +58,7 @@ class StrategyRouter:
             StrategyType.PARABOLIC_REVERSAL:     ParabolicReversalEngine(),
             StrategyType.EMA_TREND_CONTINUATION: EMATrendEngine(),
             StrategyType.BREAKOUT_PULLBACK:      BOPBEngine(),
+            StrategyType.MOMENTUM_ENTRY:         MomentumEntryEngine(),
         }
 
     def route(
@@ -113,6 +115,20 @@ class StrategyRouter:
                 all_entries.extend(entries)
                 # Got entry signals from this strategy — stop trying others
                 break
+
+        # Last resort: try simple momentum entry if all strategies rejected
+        if not all_entries and StrategyType.MOMENTUM_ENTRY not in strategies_to_try:
+            momentum_engine = self._engines.get(StrategyType.MOMENTUM_ENTRY)
+            if momentum_engine:
+                entries, exits = momentum_engine.generate_signals(
+                    symbol=symbol,
+                    bars=bars,
+                    vwap_series=vwap_series,
+                    features=features,
+                    assignment=assignment,
+                )
+                all_exits.extend(exits)
+                all_entries.extend(entries)
 
         return all_entries, all_exits
 

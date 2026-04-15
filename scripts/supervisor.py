@@ -60,7 +60,6 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s [supervisor] %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger(__name__)
@@ -157,6 +156,15 @@ class ProcessManager:
 
         retcode = self.process.poll()
         if retcode is None:
+            # Process is alive — reset restart counter if it's been stable (>60s)
+            if self.restart_count > 0 and self.started_at:
+                try:
+                    started = datetime.fromisoformat(self.started_at)
+                    uptime = (datetime.now(ET) - started).total_seconds()
+                    if uptime > 60:
+                        self.restart_count = 0
+                except Exception:
+                    pass
             return 'running'
 
         # Process exited
@@ -259,12 +267,15 @@ class ProcessManager:
                       self.name, self.max_restarts)
             return False
 
-        # Try to diagnose and fix before restarting
-        fixed = self.diagnose_and_fix()
-        if fixed:
-            log.info("[%s] Bug fixed — restarting with patched code", self.name)
+        # Only run crash analysis if the process actually crashed (non-zero exit)
+        if self.status == 'crashed':
+            fixed = self.diagnose_and_fix()
+            if fixed:
+                log.info("[%s] Bug fixed — restarting with patched code", self.name)
+            else:
+                log.info("[%s] No fix applied — restarting as-is (may crash again)", self.name)
         else:
-            log.info("[%s] No fix applied — restarting as-is (may crash again)", self.name)
+            log.info("[%s] Clean exit — restarting without crash analysis", self.name)
 
         self.restart_count += 1
         log.info("[%s] Restarting (%d/%d) after %ds cooldown...",
@@ -328,6 +339,9 @@ def send_alert(subject: str, body: str):
 
 
 def main():
+    # Tell child processes they're running under supervisor (skip lock file)
+    os.environ['SUPERVISED_MODE'] = '1'
+
     log.info("=" * 60)
     log.info("SUPERVISOR STARTING — Process Isolation Mode")
     log.info("=" * 60)
@@ -388,8 +402,11 @@ def main():
             for name, manager in managers.items():
                 status = manager.check()
 
-                if status == 'crashed':
-                    log.error("[%s] CRASHED — attempting restart", name)
+                if status in ('crashed', 'stopped'):
+                    if status == 'crashed':
+                        log.error("[%s] CRASHED — attempting restart", name)
+                    else:
+                        log.warning("[%s] STOPPED unexpectedly — attempting restart", name)
 
                     if manager.critical:
                         # Core crashed — this is serious

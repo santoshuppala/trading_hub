@@ -36,17 +36,22 @@ class OptionsRiskGate:
         trade_budget:   float = 500.0,
         total_budget:   float = 10_000.0,
         order_cooldown: int   = 300,
+        max_daily_trades: int = 50,
     ) -> None:
-        self._max_positions  = max_positions
-        self._trade_budget   = trade_budget
-        self._total_budget   = total_budget
-        self._order_cooldown = order_cooldown
-        self._lock           = threading.Lock()
+        self._max_positions   = max_positions
+        self._trade_budget    = trade_budget
+        self._total_budget    = total_budget
+        self._order_cooldown  = order_cooldown
+        self._max_daily_trades = max_daily_trades
+        self._lock            = threading.Lock()
 
         # ticker → max_risk (NOT net debit)
         self._open_positions:  Dict[str, float] = {}
         self._last_order:      Dict[str, float] = {}
         self._deployed_capital: float           = 0.0
+        self._daily_trade_count: int            = 0
+        # Track tickers with pending execution (prevent TOCTOU race)
+        self._pending_tickers: set              = set()
 
     def check(
         self,
@@ -61,8 +66,14 @@ class OptionsRiskGate:
             if ticker in self._open_positions:
                 return f"options position already open for {ticker}"
 
+            if ticker in self._pending_tickers:
+                return f"execution already pending for {ticker}"
+
             if len(self._open_positions) >= self._max_positions:
                 return f"max positions ({self._max_positions}) reached"
+
+            if self._daily_trade_count >= self._max_daily_trades:
+                return f"daily trade limit ({self._max_daily_trades}) reached"
 
             last_order_ts = self._last_order.get(ticker, 0.0)
             elapsed = time.monotonic() - last_order_ts
@@ -78,6 +89,23 @@ class OptionsRiskGate:
 
             return None
 
+    def reserve(self, ticker: str) -> bool:
+        """Reserve a ticker for pending execution. Prevents TOCTOU race."""
+        with self._lock:
+            if ticker in self._pending_tickers or ticker in self._open_positions:
+                return False
+            if len(self._open_positions) + len(self._pending_tickers) >= self._max_positions:
+                return False
+            if self._daily_trade_count >= self._max_daily_trades:
+                return False
+            self._pending_tickers.add(ticker)
+            return True
+
+    def unreserve(self, ticker: str) -> None:
+        """Release a pending reservation (execution failed or was rejected)."""
+        with self._lock:
+            self._pending_tickers.discard(ticker)
+
     def acquire(self, ticker: str, cost: float, max_risk: float = 0.0) -> None:
         """
         Reserve position. Tracks max_risk (not cost) against budget.
@@ -92,11 +120,14 @@ class OptionsRiskGate:
             self._open_positions[ticker] = risk_amount
             self._last_order[ticker] = time.monotonic()
             self._deployed_capital += risk_amount
+            self._daily_trade_count += 1
+            self._pending_tickers.discard(ticker)
             log.info(
                 "[OptionsRiskGate] acquired %s | cost=$%.2f | max_risk=$%.2f | "
-                "deployed=$%.2f / $%.2f",
+                "deployed=$%.2f / $%.2f | daily_trades=%d/%d",
                 ticker, cost, risk_amount,
                 self._deployed_capital, self._total_budget,
+                self._daily_trade_count, self._max_daily_trades,
             )
 
     def release(self, ticker: str) -> None:

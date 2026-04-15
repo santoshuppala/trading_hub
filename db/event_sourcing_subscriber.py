@@ -248,6 +248,24 @@ class EventSourcingSubscriber:
                 event=event,
                 source_system="StrategyEngine",
             )
+
+            # Projection: signal_events
+            self._writer.enqueue('signal_events', {
+                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ticker': p.ticker, 'action': p.action.value,
+                'current_price': float(p.current_price),
+                'ask_price': _safe_float(p.ask_price) or 0,
+                'atr_value': _safe_float(p.atr_value) or 0,
+                'rsi_value': _safe_float(p.rsi_value) or 0,
+                'rvol': _safe_float(p.rvol) or 0,
+                'vwap': _safe_float(p.vwap) or 0,
+                'stop_price': _safe_float(p.stop_price) or 0,
+                'target_price': _safe_float(p.target_price) or 0,
+                'half_target': _safe_float(p.half_target) or 0,
+                'event_id': str(event.event_id),
+                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at': _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_signal error: %s", exc)
 
@@ -266,14 +284,31 @@ class EventSourcingSubscriber:
                 "atr_value":      _safe_float(p.atr_value),
             }
 
+            broker = getattr(event, '_routed_broker', None) or 'unknown'
+            payload["broker"] = broker
+
             self._write_event(
                 event_type="OrderRequested",
                 aggregate_type="Order",
                 aggregate_id=f"order_{p.ticker}_{event.timestamp.isoformat()}",
                 event_payload=payload,
                 event=event,
-                source_system="RiskEngine",
+                source_system=f"RiskEngine:{broker}",
             )
+
+            # Projection: order_req_events
+            self._writer.enqueue('order_req_events', {
+                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ticker': p.ticker, 'side': p.side.value,
+                'qty': int(p.qty), 'price': float(p.price),
+                'reason': p.reason,
+                'stop_price': _safe_float(p.stop_price) or 0,
+                'target_price': _safe_float(p.target_price) or 0,
+                'atr_value': _safe_float(p.atr_value) or 0,
+                'event_id': str(event.event_id),
+                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at': _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_order_req error: %s", exc)
 
@@ -281,6 +316,7 @@ class EventSourcingSubscriber:
         """Fill order executed."""
         try:
             p: FillPayload = event.payload
+            broker = getattr(event, '_routed_broker', None) or 'unknown'
             payload = {
                 "ticker":         p.ticker,
                 "side":           p.side.value,
@@ -291,6 +327,8 @@ class EventSourcingSubscriber:
                 "stop_price":     _safe_float(p.stop_price),
                 "target_price":   _safe_float(p.target_price),
                 "atr_value":      _safe_float(p.atr_value),
+                "broker":         broker,
+                "bracket_order":  bool(p.stop_price and p.stop_price > 0),
             }
 
             self._write_event(
@@ -299,8 +337,22 @@ class EventSourcingSubscriber:
                 aggregate_id=f"fill_{p.ticker}_{p.order_id}",
                 event_payload=payload,
                 event=event,
-                source_system="Broker",
+                source_system=f"Broker:{broker}",
             )
+
+            # Projection: fill_events
+            self._writer.enqueue('fill_events', {
+                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ticker': p.ticker, 'side': p.side.value,
+                'qty': int(p.qty), 'fill_price': float(p.fill_price),
+                'order_id': p.order_id, 'reason': p.reason,
+                'stop_price': _safe_float(p.stop_price) or 0,
+                'target_price': _safe_float(p.target_price) or 0,
+                'atr_value': _safe_float(p.atr_value) or 0,
+                'event_id': str(event.event_id),
+                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at': _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_fill error: %s", exc)
 
@@ -309,6 +361,7 @@ class EventSourcingSubscriber:
         try:
             p: PositionPayload = event.payload
             snap = p.position
+            cd = getattr(p, 'close_detail', None) or {}
 
             # Map position action to event type
             action_to_event = {
@@ -319,17 +372,24 @@ class EventSourcingSubscriber:
 
             event_type = action_to_event.get(p.action, 'PositionChanged')
 
+            broker = getattr(event, '_routed_broker', None) or cd.get('broker', 'unknown')
+
+            # For CLOSED events, pull qty/entry_price from close_detail
             payload = {
                 "ticker":         p.ticker,
                 "action":         p.action,
-                "qty":            int(snap.quantity) if snap else None,
-                "entry_price":    float(snap.entry_price) if snap else None,
-                "entry_time":     snap.entry_time if snap else None,
+                "qty":            int(snap.quantity) if snap else cd.get('qty'),
+                "entry_price":    float(snap.entry_price) if snap else cd.get('entry_price'),
+                "entry_time":     snap.entry_time if snap else cd.get('entry_time'),
+                "exit_price":     cd.get('exit_price'),
                 "current_price":  float(snap.current_price) if snap and hasattr(snap, "current_price") else None,
                 "stop_price":     float(snap.stop_price) if snap and snap.stop_price else None,
                 "target_price":   float(snap.target_price) if snap and snap.target_price else None,
                 "half_target":    float(snap.half_target) if snap and snap.half_target else None,
                 "pnl":            float(p.pnl) if p.pnl is not None else None,
+                "reason":         cd.get('reason'),
+                "strategy":       cd.get('strategy'),
+                "broker":         broker,
             }
 
             self._write_event(
@@ -340,8 +400,76 @@ class EventSourcingSubscriber:
                 event=event,
                 source_system="PositionManager",
             )
+
+            # Projection: position_events
+            self._writer.enqueue('position_events', {
+                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ticker': p.ticker, 'action': p.action,
+                'qty': payload.get('qty') or 0,
+                'entry_price': payload.get('entry_price') or 0,
+                'current_price': payload.get('current_price') or 0,
+                'stop_price': payload.get('stop_price') or 0,
+                'target_price': payload.get('target_price') or 0,
+                'unrealised_pnl': 0,
+                'realised_pnl': payload.get('pnl') or 0,
+                'event_id': str(event.event_id),
+                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at': _NOW().isoformat(),
+            })
+
+            # ── Inline projection: write to completed_trades ────────────
+            if event_type == 'PositionClosed' and cd:
+                self._write_completed_trade(p, cd, event)
+
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_position error: %s", exc)
+
+    def _write_completed_trade(self, p, cd: dict, event: Event) -> None:
+        """Write a completed trade record when a position is closed."""
+        try:
+            from datetime import datetime, timezone
+            entry_price = cd.get('entry_price', 0)
+            exit_price = cd.get('exit_price', 0)
+            qty = cd.get('qty', 0)
+            pnl = float(p.pnl) if p.pnl is not None else 0.0
+            pnl_pct = round(pnl / (entry_price * qty) * 100, 2) if entry_price and qty else 0.0
+
+            entry_time = cd.get('entry_time', '')
+            exit_time = datetime.now(timezone.utc).isoformat()
+
+            # Parse entry_time for duration
+            duration = 0
+            try:
+                if entry_time and entry_time != 'alpaca_restored':
+                    from dateutil.parser import parse as _parse_dt
+                    et = _parse_dt(entry_time)
+                    duration = int((datetime.now(timezone.utc) - et.replace(tzinfo=timezone.utc)).total_seconds())
+            except Exception:
+                pass
+
+            import uuid
+            trade_id = str(uuid.uuid4())
+
+            broker = cd.get('broker') or getattr(event, '_routed_broker', None) or 'unknown'
+
+            self._writer.enqueue('completed_trades', {
+                'trade_id':          trade_id,
+                'ticker':            p.ticker,
+                'entry_time':        entry_time,
+                'exit_time':         exit_time,
+                'entry_price':       entry_price,
+                'exit_price':        exit_price,
+                'qty':               qty,
+                'pnl':               pnl,
+                'pnl_pct':           pnl_pct,
+                'duration_seconds':  duration,
+                'strategy':          cd.get('strategy', 'vwap_reclaim'),
+                'opened_event_id':   str(getattr(event, 'correlation_id', None) or ''),
+                'closed_event_id':   str(getattr(event, 'event_id', trade_id)),
+                'broker':            broker,
+            })
+        except Exception as exc:
+            log.warning("_write_completed_trade error: %s", exc)
 
     def _on_risk_block(self, event: Event) -> None:
         """Risk adapter blocked a position."""
@@ -361,6 +489,17 @@ class EventSourcingSubscriber:
                 event=event,
                 source_system="RiskAdapter",
             )
+
+            # Projection: risk_block_events
+            self._writer.enqueue('risk_block_events', {
+                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ticker': p.ticker,
+                'reason': p.reason,
+                'signal_action': p.signal_action.value,
+                'event_id': str(event.event_id),
+                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at': _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_risk_block error: %s", exc)
 
@@ -395,6 +534,26 @@ class EventSourcingSubscriber:
                 event=event,
                 source_system="PopStrategyEngine",
             )
+
+            # Inline projection: write to pop_signal_events
+            self._writer.enqueue('pop_signal_events', {
+                'ts':                    event.timestamp.isoformat(),
+                'symbol':                p.symbol,
+                'strategy_type':         p.strategy_type,
+                'entry_price':           float(p.entry_price),
+                'stop_price':            float(p.stop_price),
+                'target_1':              float(p.target_1),
+                'target_2':              float(p.target_2),
+                'pop_reason':            p.pop_reason,
+                'atr_value':             _safe_float(p.atr_value) or 0,
+                'rvol':                  _safe_float(p.rvol) or 0,
+                'vwap_distance':         _safe_float(p.vwap_distance) or 0,
+                'strategy_confidence':   _safe_float(p.strategy_confidence) or 0,
+                'features_json':         json.dumps(features) if features else '{}',
+                'event_id':              str(event.event_id),
+                'correlation_id':        str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at':           _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_pop_signal error: %s", exc)
 
@@ -434,6 +593,28 @@ class EventSourcingSubscriber:
                 event=event,
                 source_system="ProSetupEngine",
             )
+
+            # Inline projection: write to pro_strategy_signal_events
+            self._writer.enqueue('pro_strategy_signal_events', {
+                'ts':                _ensure_aware(event.timestamp).isoformat(),
+                'ticker':            p.ticker,
+                'strategy_name':     p.strategy_name,
+                'tier':              int(p.tier),
+                'direction':         p.direction,
+                'entry_price':       float(p.entry_price),
+                'stop_price':        float(p.stop_price),
+                'target_1':          float(p.target_1),
+                'target_2':          float(p.target_2),
+                'atr_value':         _safe_float(p.atr_value) or 0,
+                'rvol':              _safe_float(p.rvol) or 0,
+                'rsi_value':         _safe_float(p.rsi_value) or 0,
+                'vwap':              _safe_float(p.vwap) or 0,
+                'confidence':        _safe_float(p.confidence) or 0,
+                'detector_signals':  json.dumps(det),
+                'event_id':          str(event.event_id),
+                'correlation_id':    str(getattr(event, 'correlation_id', '') or ''),
+                'ingested_at':       _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_pro_strategy_signal error: %s", exc)
 
@@ -457,6 +638,15 @@ class EventSourcingSubscriber:
                 event=event,
                 source_system="Monitor",
             )
+
+            # Projection: heartbeat_events
+            self._writer.enqueue('heartbeat_events', {
+                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'open_positions': int(payload.get('open_positions') or 0),
+                'scan_count': int(payload.get('scan_count') or 0),
+                'event_id': str(event.event_id),
+                'ingested_at': _NOW().isoformat(),
+            })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_heartbeat error: %s", exc)
 

@@ -127,16 +127,38 @@ class PositionManager:
         self._last_order_time[ticker] = _time.time()
         self._reclaimed_today.add(ticker)
 
+        # Use FillPayload's stop/target when present (Pro/Pop signals carry these).
+        # Fall back to percentage-based placeholders only if not provided.
+        has_stop = p.stop_price and p.stop_price > 0
+        has_target = p.target_price and p.target_price > 0
+
+        if has_stop:
+            stop_price = p.stop_price
+        else:
+            stop_price = fill_price * 0.995  # 0.5% fallback
+
+        if has_target:
+            target_price = p.target_price
+            half_target = (fill_price + target_price) / 2
+        else:
+            target_price = fill_price * 1.01  # 1% fallback
+            half_target = fill_price * 1.005
+
+        # Extract strategy origin from reason (e.g., "pro:sr_flip:T1:long" → "pro:sr_flip")
+        reason_str = str(p.reason or '')
+        strategy = reason_str.split(':')[0] + ':' + reason_str.split(':')[1] if ':' in reason_str else 'vwap_reclaim'
+
         pos = {
             'entry_price':  fill_price,
             'entry_time':   now.strftime('%H:%M:%S'),
             'quantity':     qty,
             'partial_done': False,
             'order_id':     p.order_id,
-            'stop_price':   fill_price * 0.995,   # 0.5% fallback; overwritten by StrategyEngine
-            'target_price': fill_price * 1.01,    # 1%   fallback; overwritten by StrategyEngine
-            'half_target':  fill_price * 1.005,   # 0.5% fallback; overwritten by StrategyEngine
-            'atr_value':    None,
+            'stop_price':   stop_price,
+            'target_price': target_price,
+            'half_target':  half_target,
+            'atr_value':    getattr(p, 'atr_value', None),
+            'strategy':     strategy,
         }
         self._positions[ticker] = pos
 
@@ -150,7 +172,7 @@ class PositionManager:
             f"order={p.order_id}"
         )
 
-        self._bus.emit(Event(
+        pos_event = Event(
             type=EventType.POSITION,
             payload=PositionPayload(
                 ticker=ticker,
@@ -168,7 +190,10 @@ class PositionManager:
                 ),
             ),
             correlation_id=parent.event_id,
-        ))
+        )
+        # Propagate broker tag from the FILL event
+        pos_event._routed_broker = getattr(parent, '_routed_broker', None)
+        self._bus.emit(pos_event)
         self._persist()
 
     # ── Close / partial ───────────────────────────────────────────────────────
@@ -223,7 +248,7 @@ class PositionManager:
                 f"remaining={remaining} pnl=${pnl:+.2f}"
             )
 
-            self._bus.emit(Event(
+            partial_event = Event(
                 type=EventType.POSITION,
                 payload=PositionPayload(
                     ticker=ticker,
@@ -242,7 +267,9 @@ class PositionManager:
                     pnl=pnl,
                 ),
                 correlation_id=parent.event_id,
-            ))
+            )
+            partial_event._routed_broker = getattr(parent, '_routed_broker', None)
+            self._bus.emit(partial_event)
             self._persist()
             return
 
@@ -266,16 +293,28 @@ class PositionManager:
             f"pnl=${pnl:+.2f} reason={reason}"
         )
 
-        self._bus.emit(Event(
+        broker = getattr(parent, '_routed_broker', None) or 'unknown'
+        close_event = Event(
             type=EventType.POSITION,
             payload=PositionPayload(
                 ticker=ticker,
                 action='CLOSED',
                 position=None,
                 pnl=pnl,
+                close_detail={
+                    'qty': qty,
+                    'entry_price': entry_price,
+                    'entry_time': pos.get('entry_time', ''),
+                    'exit_price': fill_price,
+                    'reason': reason,
+                    'strategy': pos.get('strategy', 'vwap_reclaim'),
+                    'broker': broker,
+                },
             ),
             correlation_id=parent.event_id,
-        ))
+        )
+        close_event._routed_broker = broker
+        self._bus.emit(close_event)
         self._persist()
 
     # ── Persistence ───────────────────────────────────────────────────────────

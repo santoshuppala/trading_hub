@@ -82,6 +82,20 @@ def main():
     log.info("OptionsEngine ready | paper=%s | max_pos=%d | budget=$%d",
              OPTIONS_PAPER_TRADING, OPTIONS_MAX_POSITIONS, OPTIONS_TRADE_BUDGET)
 
+    # ── Lifecycle management ──────────────────────────────────────────
+    from lifecycle import EngineLifecycle
+    from lifecycle.adapters.options_adapter import OptionsLifecycleAdapter
+    from config import OPTIONS_MAX_DAILY_LOSS, ALERT_EMAIL
+
+    lifecycle = EngineLifecycle(
+        engine_name='options',
+        adapter=OptionsLifecycleAdapter(options_engine),
+        bus=bus,
+        alert_email=ALERT_EMAIL,
+        max_daily_loss=OPTIONS_MAX_DAILY_LOSS,
+    )
+    lifecycle.startup()
+
     # IPC consumer: receive SIGNAL and POP_SIGNAL from other processes
     consumer = EventConsumer(
         group_id='options-signal-consumer',
@@ -166,12 +180,16 @@ def main():
                 if bar_events:
                     bus.emit_batch(bar_events)
 
+            if not lifecycle.tick():
+                log.error("Options engine halted by kill switch.")
+                break
+
             time.sleep(10)
 
     except KeyboardInterrupt:
         log.info("Options process interrupted.")
     finally:
-        # bus has no stop() — dispatchers clean up on process exit
+        lifecycle.shutdown()
         consumer.stop()
         if db_cleanup:
             db_cleanup()

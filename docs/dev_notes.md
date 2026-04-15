@@ -27,6 +27,7 @@
 19. [TimescaleDB Event Store — Database Layer](#19-timescaledb-event-store--database-layer)
 20. [Strategy Audit, Production Readiness & DB Optimization](#20-strategy-audit-production-readiness--db-optimization)
 21. [T3.7 Options Engine — 13-Strategy Subsystem](#21-t37-options-engine--13-strategy-subsystem)
+22. [Risk Hardening v2 & Process Isolation](#22-risk-hardening-v2--process-isolation-2026-04-14)
 
 ---
 
@@ -1756,4 +1757,54 @@ OPTIONS_LEAPS_DTE=365                   # LEAPS threshold (Diagonal strategy)
 Created: 14 new files (options/ package + strategies/)
 Modified: 4 files (event_bus, events, config, run_monitor)
 Impact: Zero breaking changes; fully isolated from equity layers
+
+---
+
+## 22. Risk Hardening v2 & Process Isolation (2026-04-14)
+
+### Summary
+Single-session overhaul: 3.9/10 → 7.6/10 hedge fund rating. ~11,000 lines across ~90 files.
+
+### Pop Screener Fix
+- `rvol_series` was always `[1.0]` — `_bar_payload_to_slice()` ignored `payload.rvol_df`
+- `gap_size` was always `0.0` — no prior close data used
+- Fixed: real RVOL from 14-day history, real gap from prior close
+- Debug logging at 6 decision points in `_on_bar`
+- Benzinga/StockTwits data persisted (NEWS_DATA/SOCIAL_DATA events)
+- Per-ticker sentiment baselines (replaces hardcoded 2.0/100.0)
+
+### Process Isolation
+- 4 processes: core (VWAP+broker), pro (11 detectors), pop (Benzinga/StockTwits), options
+- IPC via Redpanda (th-orders, th-signals, th-pop-signals topics)
+- Shared cache: `data/live_cache.pkl` (atomic write)
+- Distributed registry: `data/position_registry.json` (file-locked)
+- Supervisor: independent restart, CRITICAL alert if core dies
+- Tested: 38/38 integration checks passing
+
+### Multi-Broker
+- TradierBroker: equity + options via REST API (sandbox verified)
+- SmartRouter: health-based routing, circuit breaker (3 failures → 5min disable)
+- Aggregate buying power: $4M across 4 accounts
+
+### Risk Hardening (7→9/10)
+- PortfolioRiskGate: drawdown halt, notional cap ($100K), margin check, Greeks limits
+- RiskSizer: beta-adjusted (TQQQ 10→3), 14 correlation groups (max 3), ATR-scaled
+- News-aware correlation: ticker-specific catalysts override blocks
+- ETF RVOL thresholds: 0.7 across all engines (was 2.0)
+
+### Data Sources (9)
+- No key: Yahoo Finance, Fear & Greed, Finviz, SEC EDGAR
+- With key: FRED, Alpha Vantage, Polygon.io
+- Disabled: Reddit, Unusual Whales (signup pending)
+- SmartPersistence: hash-based dedup, ~100 writes/day
+
+### Self-Healing
+- Watchdog: process wrapper, crash analyzer, auto-fix, max 5 retries
+- Crash analyzer: 6 pattern matchers (kwarg, attribute, import, unbound, validation, args)
+- Supervisor: per-engine crash detection + fix + restart
+
+### Dashboard
+- Pro dashboard: dark terminal theme (Bloomberg-style)
+- 3 new tabs: Risk Analytics, Strategy Attribution, Market Regime
+- .env auto-loading for API keys
 

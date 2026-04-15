@@ -1,13 +1,33 @@
+# Core
 backtrader
-yfinance
 pandas
 numpy
 matplotlib
 streamlit
-alpaca-py
+plotly
 requests
-confluent-kafka
+python-dateutil
+psutil
+
+# Broker APIs
+alpaca-py
+
+# Market data
+yfinance
+
+# Database
 asyncpg>=0.29.0
 psycopg[binary]>=3.1
-psutil
-python-dateutil
+psycopg2-binary
+sqlalchemy
+
+# Message queue
+confluent-kafka
+
+# ML (optional — needed for pop classifier training)
+xgboost
+scikit-learn
+joblib
+
+# Web scraping (Finviz, Fear & Greed)
+beautifulsoup4

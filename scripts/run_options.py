@@ -60,6 +60,10 @@ def main():
     cache_reader = CacheReader()
     dist_registry = DistributedPositionRegistry(global_max=GLOBAL_MAX_POSITIONS)
 
+    # DB persistence (OPTIONS_SIGNAL → event_store)
+    from scripts._db_helper import init_satellite_db
+    db_cleanup = init_satellite_db(bus, process_name='options')
+
     # Options engine (subscribes to local bus for BAR, SIGNAL, POP_SIGNAL)
     options_engine = OptionsEngine(
         bus=bus,
@@ -169,6 +173,8 @@ def main():
     finally:
         bus.stop()
         consumer.stop()
+        if db_cleanup:
+            db_cleanup()
         log.info("Options process stopped.")
 
 

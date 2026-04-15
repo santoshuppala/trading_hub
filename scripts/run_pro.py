@@ -61,6 +61,10 @@ def main():
     cache_reader = CacheReader()
     dist_registry = DistributedPositionRegistry(global_max=GLOBAL_MAX_POSITIONS)
 
+    # DB persistence (so PRO_STRATEGY_SIGNAL events are stored in event_store)
+    from scripts._db_helper import init_satellite_db
+    db_cleanup = init_satellite_db(bus, process_name='pro')
+
     # Pro-setups engine (subscribes to BAR on local bus)
     pro_engine = ProSetupEngine(
         bus=bus,
@@ -134,6 +138,8 @@ def main():
     finally:
         bus.stop()
         publisher.stop()
+        if db_cleanup:
+            db_cleanup()
         log.info("Pro process stopped.")
 
 

@@ -59,6 +59,10 @@ def main():
     cache_reader = CacheReader()
     dist_registry = DistributedPositionRegistry(global_max=GLOBAL_MAX_POSITIONS)
 
+    # DB persistence (POP_SIGNAL, NEWS_DATA, SOCIAL_DATA → event_store)
+    from scripts._db_helper import init_satellite_db
+    db_cleanup = init_satellite_db(bus, process_name='pop')
+
     # News + social sources
     news_source = None
     if BENZINGA_API_KEY:
@@ -149,6 +153,8 @@ def main():
     finally:
         bus.stop()
         publisher.stop()
+        if db_cleanup:
+            db_cleanup()
         log.info("Pop process stopped.")
 
 

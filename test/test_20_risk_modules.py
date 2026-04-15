@@ -2,7 +2,21 @@
 import unittest
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+_project_root = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, _project_root)
+
+# Load .env so API keys and config are available
+_env_path = os.path.join(_project_root, '.env')
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.split('#')[0].strip()
+            if '=' in _line:
+                _k, _v = _line.split('=', 1)
+                _v = _v.strip().strip('"').strip("'")
+                if _k.strip() and _k.strip() not in os.environ:
+                    os.environ[_k.strip()] = _v
 
 
 class TestRiskSizer(unittest.TestCase):

@@ -33,6 +33,7 @@ log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"options_{datetime.now().strftime('%Y-%m-%d')}.log")
 
+logging.root.handlers = []
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [options] %(message)s',

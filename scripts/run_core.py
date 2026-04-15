@@ -35,6 +35,8 @@ log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"core_{datetime.now().strftime('%Y-%m-%d')}.log")
 
+# Clear any existing handlers to prevent double-logging
+logging.root.handlers = []
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [core] %(message)s',
@@ -42,6 +44,7 @@ logging.basicConfig(
         logging.FileHandler(log_file),
         logging.StreamHandler(sys.stdout),
     ],
+    force=True,
 )
 log = logging.getLogger(__name__)
 
@@ -90,6 +93,10 @@ def main():
         trade_budget=TRADE_BUDGET,
         data_source=DATA_SOURCE,
     )
+
+    # ── DB persistence for core events ─────────────────────────────────────
+    from scripts._db_helper import init_satellite_db
+    db_cleanup = init_satellite_db(monitor._bus, process_name='core')
 
     # ── Portfolio-level risk gate (aggregate limits across all engines) ─────
     from monitor.portfolio_risk import PortfolioRiskGate
@@ -191,6 +198,8 @@ def main():
         monitor.stop()
         consumer.stop()
         publisher.stop()
+        if db_cleanup:
+            db_cleanup()
         log.info("Core process stopped.")
 
 

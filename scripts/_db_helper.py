@@ -75,7 +75,7 @@ def init_satellite_db(bus, process_name: str = 'satellite'):
         db_sub = EventSourcingSubscriber(
             bus=bus,
             writer=db_writer,
-            session_id=f"{process_name}_{os.getpid()}",
+            session_id=str(__import__('uuid').uuid4()),
         )
         db_sub.register()
 

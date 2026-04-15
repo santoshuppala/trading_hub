@@ -143,13 +143,100 @@ class ProcessManager:
 
         return self.status
 
+    def get_crash_traceback(self) -> str:
+        """Read the process log file and extract the last traceback."""
+        log_path = os.path.join(log_dir, f"{self.name}_{datetime.now().strftime('%Y-%m-%d')}.log")
+        try:
+            with open(log_path, 'r') as f:
+                content = f.read()
+            # Find last traceback
+            tb_starts = [i for i, line in enumerate(content.split('\n'))
+                         if 'Traceback' in line]
+            if tb_starts:
+                lines = content.split('\n')
+                return '\n'.join(lines[tb_starts[-1]:])
+            return content[-3000:]  # last 3000 chars as fallback
+        except Exception:
+            return ''
+
+    def diagnose_and_fix(self) -> bool:
+        """Use CrashAnalyzer to diagnose and fix the crash. Returns True if fixed."""
+        from scripts.crash_analyzer import CrashAnalyzer
+
+        tb = self.get_crash_traceback()
+        if not tb.strip():
+            log.warning("[%s] No traceback found in log — cannot diagnose", self.name)
+            return False
+
+        analyzer = CrashAnalyzer()
+        diagnosis = analyzer.analyze(tb, attempt=self.restart_count)
+
+        log.info("[%s] Diagnosis: %s | %s", self.name, diagnosis.error_type, diagnosis.root_cause)
+
+        if not diagnosis.fix_applicable:
+            log.warning("[%s] Crash analyzer cannot auto-fix this error", self.name)
+            analyzer.write_crash_report(diagnosis)
+            return False
+
+        log.info("[%s] Fix available (confidence %.0f%%): %s",
+                 self.name, diagnosis.confidence * 100, diagnosis.fix_description)
+
+        # Apply the fix
+        fix_file = os.path.join(PROJECT_ROOT, diagnosis.fix_file)
+        if not os.path.exists(fix_file):
+            log.error("[%s] Fix target file not found: %s", self.name, fix_file)
+            return False
+
+        try:
+            with open(fix_file, 'r') as f:
+                content = f.read()
+
+            if diagnosis.fix_old not in content:
+                log.warning("[%s] Fix old_string not found in file — already fixed or file changed",
+                            self.name)
+                return False
+
+            new_content = content.replace(diagnosis.fix_old, diagnosis.fix_new, 1)
+
+            # Verify syntax before writing
+            import py_compile
+            import tempfile
+            fd, tmp = tempfile.mkstemp(suffix='.py')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(new_content)
+                py_compile.compile(tmp, doraise=True)
+            except py_compile.PyCompileError as exc:
+                log.error("[%s] Fix would break syntax — NOT applying: %s", self.name, exc)
+                return False
+            finally:
+                os.unlink(tmp)
+
+            # Apply
+            with open(fix_file, 'w') as f:
+                f.write(new_content)
+
+            log.info("[%s] Fix applied to %s: %s", self.name, diagnosis.fix_file, diagnosis.fix_description)
+            return True
+
+        except Exception as exc:
+            log.error("[%s] Failed to apply fix: %s", self.name, exc)
+            return False
+
     def restart(self) -> bool:
-        """Restart the process if under max_restarts limit."""
+        """Diagnose crash, fix if possible, then restart."""
         if self.restart_count >= self.max_restarts:
             self.status = 'disabled'
             log.error("[%s] Max restarts (%d) reached — DISABLED",
                       self.name, self.max_restarts)
             return False
+
+        # Try to diagnose and fix before restarting
+        fixed = self.diagnose_and_fix()
+        if fixed:
+            log.info("[%s] Bug fixed — restarting with patched code", self.name)
+        else:
+            log.info("[%s] No fix applied — restarting as-is (may crash again)", self.name)
 
         self.restart_count += 1
         log.info("[%s] Restarting (%d/%d) after %ds cooldown...",

@@ -302,3 +302,32 @@ LIMIT 20;
 | Sentiment baselines | `pop_screener/sentiment_baseline.py` (NEW) | Per-ticker baselines from DB history |
 | ETF RVOL thresholds | `sector_map.py`, `risk_engine.py`, `selector.py`, `screener.py`, `vwap_reclaim_engine.py`, `pop_strategy_engine.py`, `options/engine.py` | Lower thresholds for 21 ETFs |
 | Options ↔ Pop integration | `options/engine.py`, `events.py` | POP_SIGNAL → options entries |
+| Entry condition logging | `monitor/strategy_engine.py` | Debug logs showing exactly which condition failed per ticker |
+
+---
+
+## Post-Session Evaluation: Strategy Gaps to Investigate
+
+### Momentum Grind / Trend Continuation Detector (evaluate after this session)
+
+**Problem observed 2026-04-14**: QQQ moved $620→$628 (1.3%) but was never traded by any engine. The move was a slow, steady grind — no sharp gap, no opening range breakout, no VWAP dip-and-reclaim. All existing detectors are designed for sharp, catalyst-driven moves.
+
+**What to look for in tomorrow's logs**:
+```bash
+# Find ETFs/mega-caps that moved 1%+ but were never signaled
+grep "StrategyEngine.*SKIP.*QQQ\|StrategyEngine.*SKIP.*SPY\|StrategyEngine.*SKIP.*IWM" logs/monitor_2026-04-15.log | head -10
+# Check which condition blocked them
+grep "StrategyEngine.*SKIP" logs/monitor_2026-04-15.log | grep -o "SKIP:.*|" | sort | uniq -c | sort -rn
+```
+
+**Proposed detector (build only if pattern repeats)**:
+
+A `MomentumGrindDetector` that fires when:
+1. Price above VWAP for 30+ consecutive bars (steady trend, not a spike)
+2. Higher lows over the window (each 10-bar chunk's low > previous chunk's low)
+3. Cumulative move > 0.3% from session VWAP
+4. No sharp pullback > 0.5× ATR in the window
+
+This catches "quiet rally" patterns that existing detectors miss — stocks grinding up without a catalyst. Lower R:R than sharp breakouts (no clear stop from a breakout candle), but captures moves like QQQ's 1.3% day.
+
+**Decision**: Evaluate after 2026-04-15 session. If multiple ETFs/mega-caps have 1%+ moves with zero signals, build it. If the pop screener + ETF RVOL fix already catches these via UNUSUAL_VOLUME or SENTIMENT_POP, skip it.

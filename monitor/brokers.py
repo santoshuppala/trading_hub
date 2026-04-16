@@ -402,11 +402,14 @@ class AlpacaBroker(BaseBroker):
                 )
                 actual_qty = alpaca_qty
         except Exception as exc:
-            # Position may not exist at Alpaca (already closed)
-            log.debug("Position lookup for %s failed (may be already closed): %s", p.ticker, exc)
+            # V7.1: Position doesn't exist at Alpaca (likely closed by bracket stop).
+            # Set actual_qty = 0 to prevent selling shares we don't hold → creating short.
+            actual_qty = 0
+            log.warning("Position lookup for %s failed — setting qty=0 to prevent short: %s",
+                         p.ticker, exc)
 
         if actual_qty <= 0:
-            log.warning(f"SELL skipped for {p.ticker}: no position at Alpaca")
+            log.warning(f"SELL skipped for {p.ticker}: no position at Alpaca (prevents accidental short)")
             self._fail(p)
             return
 

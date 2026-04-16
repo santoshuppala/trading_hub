@@ -161,7 +161,7 @@ CIRCUIT_BREAKER_COOLDOWN  = 60.0
 # V7 P1-8: Handler execution timeout. Handlers exceeding this are forcibly
 # interrupted via concurrent.futures. Prevents hung handlers from blocking
 # the entire partition queue. Set to 0 to disable (original V6 behavior).
-HANDLER_TIMEOUT_SEC       = 30.0   # 30s — generous for broker API calls
+HANDLER_TIMEOUT_SEC       = 45.0   # 45s — must exceed options broker 15s×2 attempts + overhead
 LATENCY_WINDOW            = 100
 
 

@@ -257,6 +257,52 @@ class TradierBroker:
         ticker = p.ticker
         qty = p.qty
 
+        # V7.1: Verify position exists at Tradier before selling.
+        # If Tradier stop already fired, position is gone — don't submit a sell
+        # that will be rejected (and prevent Core from retrying on wrong broker).
+        try:
+            pos_resp = self._session.get(
+                f"{self._base}/v1/accounts/{self._account}/positions",
+                headers={"Authorization": f"Bearer {self._token}",
+                         "Accept": "application/json"},
+                timeout=5)
+            if pos_resp.status_code == 200:
+                positions = pos_resp.json().get('positions', {})
+                if positions and positions != 'null':
+                    pos_list = positions.get('position', [])
+                    if isinstance(pos_list, dict):
+                        pos_list = [pos_list]
+                    tradier_qty = 0
+                    for tp in pos_list:
+                        if tp.get('symbol') == ticker:
+                            tradier_qty = int(float(tp.get('quantity', 0)))
+                            break
+                    if tradier_qty <= 0:
+                        log.warning(
+                            "[TradierBroker] SELL skipped for %s: no position at Tradier "
+                            "(qty=%d, likely closed by stop order)", ticker, tradier_qty)
+                        from monitor.events import OrderFailPayload
+                        self._bus.emit(Event(EventType.ORDER_FAIL, OrderFailPayload(
+                            ticker=ticker, side='SELL', qty=qty,
+                            price=p.price, reason=f'{p.reason} (no position at tradier)')))
+                        return
+                    if tradier_qty != qty:
+                        log.warning(
+                            "[TradierBroker] SELL qty mismatch for %s: requested %d, "
+                            "Tradier has %d — using Tradier qty", ticker, qty, tradier_qty)
+                        qty = tradier_qty
+                else:
+                    log.warning(
+                        "[TradierBroker] SELL skipped for %s: no positions at Tradier", ticker)
+                    from monitor.events import OrderFailPayload
+                    self._bus.emit(Event(EventType.ORDER_FAIL, OrderFailPayload(
+                        ticker=ticker, side='SELL', qty=qty,
+                        price=p.price, reason=f'{p.reason} (no position at tradier)')))
+                    return
+        except Exception as exc:
+            log.debug("[TradierBroker] Position check failed for %s (proceeding with sell): %s",
+                      ticker, exc)
+
         # Cancel bracket child orders before selling
         self._cancel_open_orders(ticker)
 

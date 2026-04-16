@@ -329,72 +329,50 @@ class RealTimeMonitor:
 
     def _sync_broker_positions(self, trading_client) -> None:
         """
-        Import any Alpaca open positions that local state lost track of.
+        V7.1: Import open positions from BOTH Alpaca AND Tradier.
 
         Called once during __init__ — before engines are wired — so that
         RiskEngine, PositionManager, and StateEngine all start with a
         complete and accurate view of open positions.
 
-        For each Alpaca position NOT in self.positions we:
-          • Add a minimal position record to self.positions.
-          • Add the ticker to self._reclaimed_today so RiskEngine treats it
-            as an existing position and won't open a duplicate.
-          • Log a WARNING so the discrepancy is visible in the log.
+        For each broker position NOT in self.positions we:
+          - Add a minimal position record to self.positions
+          - Add ticker to self._reclaimed_today (prevents duplicate entry)
+          - Log WARNING so the discrepancy is visible
         """
-        if not trading_client:
-            return
-        try:
-            alpaca_positions = trading_client.get_all_positions()
-        except Exception as e:
-            log.warning(f"[reconcile] Could not fetch Alpaca positions: {e}")
-            return
-
         reconciled = 0
-        for ap in alpaca_positions:
-            ticker = str(ap.symbol)
+
+        def _import_position(ticker, avg_entry, qty, broker_name):
+            """Import a single broker position into local state."""
+            nonlocal reconciled
+
             if ticker in self.positions:
-                # Verify qty matches — fix if diverged (crash recovery, partial fills)
+                # Verify qty matches
                 try:
-                    alpaca_qty = int(float(ap.qty or 0))
                     local_qty = self.positions[ticker].get('quantity', 0)
-                    if alpaca_qty > 0 and alpaca_qty != local_qty:
+                    if qty > 0 and qty != local_qty:
                         log.warning(
-                            "[reconcile] qty mismatch for %s: local=%d Alpaca=%d — updating to Alpaca",
-                            ticker, local_qty, alpaca_qty,
-                        )
-                        self.positions[ticker]['quantity'] = alpaca_qty
-                        self.positions[ticker]['qty'] = alpaca_qty
+                            "[reconcile] qty mismatch for %s: local=%d %s=%d — updating",
+                            ticker, local_qty, broker_name, qty)
+                        self.positions[ticker]['quantity'] = qty
+                        self.positions[ticker]['qty'] = qty
                         reconciled += 1
                 except (TypeError, ValueError):
                     pass
-                continue
-
-            try:
-                avg_entry = float(ap.avg_entry_price or 0)
-                qty       = int(float(ap.qty or 0))
-            except (TypeError, ValueError):
-                log.warning(f"[reconcile] Bad position data from Alpaca for {ticker}; skipping")
-                continue
+                return
 
             if qty <= 0 or avg_entry <= 0:
-                continue
+                return
 
-            # Try ATR-based stop from event_store; fall back to fixed 3%
+            # Try ATR-based stop; fall back to fixed 3%/5%
             atr = self._fetch_last_atr(ticker)
             if atr and atr > 0:
                 stop_price   = round(avg_entry - 2.0 * atr, 4)
                 target_price = round(avg_entry + 3.0 * atr, 4)
-                log.warning(
-                    "Orphaned %s: ATR-based stop $%.2f (ATR=%.2f)",
-                    ticker, stop_price, atr,
-                )
             else:
                 stop_price   = round(avg_entry * (1 - ORPHAN_STOP_PCT), 4)
                 target_price = round(avg_entry * (1 + ORPHAN_TARGET_PCT), 4)
-                log.warning(
-                    "Orphaned %s: default 3%% stop $%.2f (no ATR available)",
-                    ticker, stop_price,
-                )
+
             self.positions[ticker] = {
                 'entry_price':  avg_entry,
                 'qty':          qty,
@@ -403,53 +381,71 @@ class RealTimeMonitor:
                 'target_price': target_price,
                 'half_target':  round((avg_entry + target_price) / 2, 4),
                 'partial_done': False,
-                'entry_time':   'alpaca_restored',
-                'order_id':     'alpaca_reconciliation',
+                'entry_time':   f'{broker_name}_restored',
+                'order_id':     f'{broker_name}_reconciliation',
                 'atr_value':    round((target_price - stop_price) / 2, 4),
             }
-            # Note: reclaimed_today mutations are GIL-atomic in CPython.
-            # Per-ticker partitioning in EventBus ensures no two threads check+add
-            # the same ticker simultaneously.
             self._reclaimed_today.add(ticker)
             log.warning(
-                f"[reconcile] Imported orphaned Alpaca position: "
-                f"{qty} {ticker} @ ${avg_entry:.2f} "
-                f"(was absent from bot_state.json)"
-            )
+                "[reconcile] Imported orphaned %s position: %d %s @ $%.2f "
+                "(stop=$%.2f target=$%.2f)",
+                broker_name, qty, ticker, avg_entry, stop_price, target_price)
             reconciled += 1
 
-        # Reverse reconciliation: remove local positions not at any broker
-        # Prevents selling positions that were already closed by bracket stops
-        alpaca_tickers = {str(ap.symbol) for ap in alpaca_positions}
+        # ── 1. Alpaca positions ───────────────────────────────────────
+        alpaca_tickers = set()
+        if trading_client:
+            try:
+                alpaca_positions = trading_client.get_all_positions()
+                for ap in alpaca_positions:
+                    ticker = str(ap.symbol)
+                    alpaca_tickers.add(ticker)
+                    try:
+                        avg_entry = float(ap.avg_entry_price or 0)
+                        qty = int(float(ap.qty or 0))
+                        _import_position(ticker, avg_entry, qty, 'alpaca')
+                    except (TypeError, ValueError):
+                        log.warning("[reconcile] Bad Alpaca data for %s", ticker)
+            except Exception as e:
+                log.warning("[reconcile] Could not fetch Alpaca positions: %s", e)
+
+        # ── 2. Tradier positions ──────────────────────────────────────
         tradier_tickers = set()
         try:
             import requests as _req
             t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '')
             t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
             if t_token and t_acct:
-                t_base = 'https://sandbox.tradier.com'
+                t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
                 t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
                 resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/positions',
                                headers=t_headers, timeout=5)
                 if resp.status_code == 200:
-                    t_positions = resp.json().get('positions', {})
-                    if t_positions and t_positions != 'null':
-                        t_list = t_positions.get('position', [])
+                    t_data = resp.json().get('positions', {})
+                    if t_data and t_data != 'null':
+                        t_list = t_data.get('position', [])
                         if isinstance(t_list, dict):
                             t_list = [t_list]
                         for p in t_list:
-                            if int(float(p.get('quantity', 0))) > 0:
-                                tradier_tickers.add(p['symbol'])
-        except Exception:
-            pass
+                            ticker = p.get('symbol', '')
+                            qty = int(float(p.get('quantity', 0)))
+                            if qty > 0 and ticker:
+                                tradier_tickers.add(ticker)
+                                avg_entry = float(p.get('cost_basis', 0)) / qty if qty > 0 else 0
+                                _import_position(ticker, avg_entry, qty, 'tradier')
+                        log.info("[reconcile] Tradier: %d positions found", len(tradier_tickers))
+        except Exception as e:
+            log.warning("[reconcile] Could not fetch Tradier positions: %s", e)
 
+        # ── 3. Reverse reconciliation ─────────────────────────────────
+        # Remove local positions not at ANY broker
         all_broker_tickers = alpaca_tickers | tradier_tickers
         stale = [t for t in list(self.positions.keys()) if t not in all_broker_tickers]
         for ticker in stale:
             log.warning(
                 "[reconcile] Removing stale position %s — not found at any broker "
-                "(may have been closed by bracket stop)", ticker
-            )
+                "(may have been closed by bracket stop)", ticker)
             del self.positions[ticker]
             reconciled += 1
 

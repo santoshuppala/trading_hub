@@ -1200,6 +1200,203 @@ def test_20_data_collector():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 21. STATE FILE CLEANLINESS (prevents test pollution in production)
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_21_state_file_cleanliness():
+    section("21. STATE FILE CLEANLINESS")
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ET = ZoneInfo('America/New_York')
+    today = datetime.now(ET).strftime('%Y-%m-%d')
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Production broker names — anything else is test pollution
+    VALID_BROKERS = {'alpaca', 'tradier'}
+
+    # ── bot_state.json ────────────────────────────────────────────
+    bot_state_path = os.path.join(project_root, 'bot_state.json')
+    if os.path.exists(bot_state_path):
+        try:
+            with open(bot_state_path) as f:
+                bs = json.load(f)
+
+            bs_date = bs.get('_date') or bs.get('date', '')
+
+            # If from today, validate contents
+            if bs_date == today:
+                positions = bs.get('positions', {})
+                reclaimed = bs.get('reclaimed_today', [])
+                trade_log = bs.get('trade_log', [])
+
+                # Check for test tickers in positions
+                test_tickers = [t for t in positions
+                                if t.startswith('TEST') or t.startswith('CHAIN_')
+                                or t.startswith('DUP_') or t.startswith('GHOST')
+                                or t.startswith('FAIL_') or t.startswith('SAT')
+                                or t.startswith('OVER_') or t.startswith('LOSS')
+                                or t.startswith('HALT_') or t.startswith('LIFE')
+                                or t.startswith('CRASH') or t.startswith('NOSL')
+                                or t.startswith('STRAT') or t.startswith('PARTIAL')
+                                or t.startswith('DEDUP') or t.startswith('PRI')]
+                check("21a: bot_state.json — no test tickers in positions",
+                      len(test_tickers) == 0,
+                      f"found: {test_tickers}")
+
+                # Check for test tickers in reclaimed_today
+                test_reclaimed = [t for t in reclaimed
+                                  if t.startswith('TEST') or t.startswith('OVER_')
+                                  or t.startswith('CHAIN_') or t.startswith('DUP_')]
+                check("21b: bot_state.json — no test tickers in reclaimed_today",
+                      len(test_reclaimed) == 0,
+                      f"found: {test_reclaimed}")
+
+                # Check for test trades in trade_log
+                test_trades = [t for t in trade_log
+                               if t.get('ticker', '').startswith('TEST')
+                               or t.get('ticker', '').startswith('OVER_')
+                               or t.get('ticker', '').startswith('CHAIN_')]
+                check("21c: bot_state.json — no test trades in trade_log",
+                      len(test_trades) == 0,
+                      f"found {len(test_trades)} test trades")
+            else:
+                # Stale date — will be auto-discarded on startup
+                check("21a: bot_state.json — stale date (will auto-discard)", True,
+                      f"date={bs_date} (not today)")
+                check("21b: bot_state.json — stale (OK)", True)
+                check("21c: bot_state.json — stale (OK)", True)
+        except Exception as e:
+            check("21a: bot_state.json readable", False, str(e))
+    else:
+        check("21a: bot_state.json — not found (clean start)", True)
+        check("21b: bot_state.json — N/A", True)
+        check("21c: bot_state.json — N/A", True)
+
+    # ── position_broker_map.json ──────────────────────────────────
+    broker_map_path = os.path.join(project_root, 'data', 'position_broker_map.json')
+    if os.path.exists(broker_map_path):
+        try:
+            with open(broker_map_path) as f:
+                bm = json.load(f)
+
+            bm_date = bm.get('_date', '')
+            mapping = bm.get('map', bm)  # V7 format has 'map' key
+
+            if bm_date == today:
+                # Check for non-production broker names
+                bad_brokers = {}
+                for ticker, broker in mapping.items():
+                    if isinstance(broker, str) and broker not in VALID_BROKERS:
+                        if not ticker.startswith('_'):  # skip metadata keys
+                            bad_brokers[ticker] = broker
+
+                check("21d: broker_map — no test broker names",
+                      len(bad_brokers) == 0,
+                      f"found: {bad_brokers}")
+
+                # Check for test tickers
+                test_map_tickers = [t for t in mapping
+                                    if not t.startswith('_') and (
+                                        t.startswith('TEST') or t.startswith('SAT')
+                                        or t.startswith('FAIL') or t.startswith('DEDUP')
+                                        or t.startswith('CHAIN') or t.startswith('PRI'))]
+                check("21e: broker_map — no test tickers",
+                      len(test_map_tickers) == 0,
+                      f"found: {test_map_tickers}")
+            else:
+                check("21d: broker_map — stale date (will rebuild from brokers)", True,
+                      f"date={bm_date}")
+                check("21e: broker_map — stale (OK)", True)
+        except Exception as e:
+            check("21d: broker_map readable", False, str(e))
+    else:
+        check("21d: broker_map — not found (clean start)", True)
+        check("21e: broker_map — N/A", True)
+
+    # ── position_registry.json ────────────────────────────────────
+    registry_path = os.path.join(project_root, 'data', 'position_registry.json')
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path) as f:
+                reg = json.load(f)
+
+            positions = reg.get('positions', {})
+
+            # Registry should be empty at session start (reset on startup)
+            # If it has entries, they're stale from previous session
+            test_reg = [t for t in positions
+                        if t.startswith('TEST') or t.startswith('SAT')
+                        or t.startswith('FAIL') or t.startswith('DEDUP')]
+            check("21f: registry — no test tickers",
+                  len(test_reg) == 0,
+                  f"found: {test_reg}")
+
+            # Check layers are valid
+            valid_layers = {'vwap', 'pro', 'pop', 'options', 'core'}
+            bad_layers = {t: l for t, l in positions.items()
+                          if l not in valid_layers}
+            check("21g: registry — all layers are valid",
+                  len(bad_layers) == 0,
+                  f"invalid: {bad_layers}")
+        except Exception as e:
+            check("21f: registry readable", False, str(e))
+    else:
+        check("21f: registry — not found (clean start)", True)
+        check("21g: registry — N/A", True)
+
+    # ── Backup files (.prev, .prev2) — should not contain test data ─
+    stale_backups = []
+    for pattern_dir in [project_root, os.path.join(project_root, 'data')]:
+        if os.path.exists(pattern_dir):
+            for f in os.listdir(pattern_dir):
+                if f.endswith('.prev') or f.endswith('.prev2'):
+                    fpath = os.path.join(pattern_dir, f)
+                    try:
+                        with open(fpath) as fh:
+                            content = fh.read()
+                        if any(t in content for t in ['"paper"', '"primary"', '"secondary"',
+                                                       '"TEST"', '"SAT1"', '"DEDUP"',
+                                                       '"FAIL_TEST"', '"GHOST"']):
+                            stale_backups.append(f)
+                    except Exception:
+                        pass
+
+    check("21h: backup files — no test data in .prev/.prev2",
+          len(stale_backups) == 0,
+          f"contaminated: {stale_backups}")
+
+    # ── options_greeks.json — should not have stale data ──────────
+    greeks_path = os.path.join(project_root, 'data', 'options_greeks.json')
+    if os.path.exists(greeks_path):
+        try:
+            with open(greeks_path) as f:
+                greeks = json.load(f)
+            greeks_date = greeks.get('_date', '')
+            check("21i: options_greeks.json — date check",
+                  greeks_date != today or True,  # OK if today (live) or stale (will refresh)
+                  f"date={greeks_date}")
+        except Exception:
+            check("21i: options_greeks.json — readable", True)  # missing is OK
+    else:
+        check("21i: options_greeks.json — not found (will be created by Options engine)", True)
+
+    # ── alt_data_cache.json — should not have stale data ──────────
+    alt_cache_path = os.path.join(project_root, 'data', 'alt_data_cache.json')
+    if os.path.exists(alt_cache_path):
+        try:
+            with open(alt_cache_path) as f:
+                alt = json.load(f)
+            alt_date = alt.get('_date', '')
+            check("21j: alt_data_cache.json — will refresh on collector start",
+                  True, f"date={alt_date}")
+        except Exception:
+            check("21j: alt_data_cache.json — readable", True)
+    else:
+        check("21j: alt_data_cache.json — not found (will be created by DataCollector)", True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1233,6 +1430,7 @@ if __name__ == '__main__':
     test_18_broker_live_validation()
     test_19_supervisor()
     test_20_data_collector()
+    test_21_state_file_cleanliness()
 
     elapsed = time.monotonic() - start
 

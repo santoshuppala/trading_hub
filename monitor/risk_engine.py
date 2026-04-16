@@ -127,15 +127,17 @@ class RiskEngine:
     def _handle_buy(self, p: SignalPayload, event: Event) -> None:
         ticker = p.ticker
 
-        # 0. Cross-layer dedup — reject if another layer already holds this ticker
+        # 0. Cross-layer dedup (READ-ONLY pre-flight)
+        # V7: Core's RegistryGate handles the actual acquire when ORDER_REQ
+        # reaches the bus. This is a fast pre-flight to avoid unnecessary work.
         from .position_registry import registry
-        if not registry.try_acquire(ticker, layer="vwap"):
+        holder = registry.held_by(ticker)
+        if holder and holder != 'vwap':
             self._block(ticker, p.action,
-                        f"held by another strategy layer ({registry.held_by(ticker)})", event)
+                        f"held by layer '{holder}' (pre-flight)", event)
             return
 
-        # All checks after acquire must release on failure to prevent registry leak.
-        # Use _approved flag: only True if ORDER_REQ is emitted.
+        # V7: No registry release needed — RegistryGate owns acquire/release
         _approved = False
         try:
             # 1. Max positions
@@ -236,13 +238,13 @@ class RiskEngine:
                     stop_price=p.stop_price,
                     target_price=p.target_price,
                     atr_value=p.atr_value,
+                    layer='vwap',  # V7: RegistryGate acquires
                 ),
                 correlation_id=event.event_id,
             ))
             _approved = True
         finally:
-            if not _approved:
-                registry.release(ticker)
+            pass  # V7: RegistryGate handles acquire/release
 
     # ── Sell pass-through ────────────────────────────────────────────────────
 

@@ -20,6 +20,21 @@ trade_log.json
 test/logs/
 logs/
 
+# --- V7 State Files (generated at runtime, never commit) ---
+bot_state.*
+position_registry.*
+position_broker_map.*
+data/*.json
+data/*.pkl
+data/*.flock
+data/*.sha256
+data/*.prev
+data/*.prev2
+data/*.tmp
+data/*.lock
+*.heartbeat.json
+.monitor.lock
+
 # --- Docker / Database ---
 docker/data/
 *.sql.bak

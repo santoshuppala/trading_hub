@@ -64,8 +64,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Process definitions
-PROCESSES = {
+# V7 P4-2: Config-driven engine registration.
+# Default engines defined here. To add a new engine:
+#   1. Create scripts/run_{name}.py
+#   2. Add entry to PROCESSES dict below (or set ENGINE_CONFIG env var)
+#   3. Add engine-specific config to config.py
+# No other code changes required — supervisor, registry, IPC are generic.
+_DEFAULT_PROCESSES = {
     'core': {
         'script': os.path.join(SCRIPTS_DIR, 'run_core.py'),
         'critical': True,    # If core dies, all trading stops
@@ -91,6 +96,58 @@ PROCESSES = {
         'restart_delay': 20,
     },
 }
+
+
+def _load_engine_config() -> dict:
+    """V7 P4-2: Load engine config from ENGINE_CONFIG env var (JSON) or defaults.
+
+    To add a new engine without modifying code:
+        export ENGINE_CONFIG='{"arbitrage": {"script": "scripts/run_arbitrage.py",
+                               "critical": false, "max_restarts": 5, "restart_delay": 15}}'
+
+    Merges with defaults — custom engines are ADDED, not replacing defaults.
+    To disable a default engine, set its value to null:
+        export ENGINE_CONFIG='{"pop": null}'
+    """
+    import json as _json
+    processes = dict(_DEFAULT_PROCESSES)
+
+    custom = os.getenv('ENGINE_CONFIG', '')
+    if custom:
+        try:
+            overrides = _json.loads(custom)
+            for name, cfg in overrides.items():
+                if cfg is None:
+                    processes.pop(name, None)  # disable engine
+                    log.info("[supervisor] Engine '%s' disabled via ENGINE_CONFIG", name)
+                else:
+                    if 'script' not in cfg:
+                        cfg['script'] = os.path.join(SCRIPTS_DIR, f'run_{name}.py')
+                    cfg.setdefault('critical', False)
+                    cfg.setdefault('max_restarts', 5)
+                    cfg.setdefault('restart_delay', 15)
+                    processes[name] = cfg
+                    log.info("[supervisor] Engine '%s' registered via ENGINE_CONFIG", name)
+        except Exception as exc:
+            log.warning("[supervisor] ENGINE_CONFIG parse failed: %s — using defaults", exc)
+
+    # V7: Auto-discover run_*.py scripts not in config
+    for f in sorted(os.listdir(SCRIPTS_DIR)):
+        if f.startswith('run_') and f.endswith('.py') and f != 'run_monitor.py':
+            engine_name = f[4:-3]  # run_arbitrage.py → arbitrage
+            if engine_name not in processes:
+                log.info("[supervisor] Auto-discovered engine '%s' from %s", engine_name, f)
+                processes[engine_name] = {
+                    'script': os.path.join(SCRIPTS_DIR, f),
+                    'critical': False,
+                    'max_restarts': 5,
+                    'restart_delay': 15,
+                }
+
+    return processes
+
+
+PROCESSES = _load_engine_config()
 
 STATUS_FILE = os.path.join(PROJECT_ROOT, 'data', 'supervisor_status.json')
 
@@ -149,8 +206,15 @@ class ProcessManager:
             log.error("[%s] Failed to start: %s", self.name, exc)
             return False
 
+    # V7 P3-2: Heartbeat staleness threshold for hung process detection
+    _HEARTBEAT_STALE_SEC = 120.0  # 2x normal heartbeat interval
+
     def check(self) -> str:
-        """Check process health. Returns status: running, crashed, stopped."""
+        """Check process health. Returns status: running, crashed, stopped, hung.
+
+        V7 P3-2: If process PID is alive but heartbeat file is stale (>120s),
+        returns 'hung' — supervisor should force-kill and restart.
+        """
         if self.process is None:
             return 'stopped'
 
@@ -165,6 +229,26 @@ class ProcessManager:
                         self.restart_count = 0
                 except Exception:
                     pass
+
+            # V7 P3-2: Check heartbeat file for hung process detection.
+            # Only check for 'core' process (has HeartbeatEmitter).
+            if self.name == 'core':
+                try:
+                    hb_path = os.path.join(PROJECT_ROOT, 'data', 'heartbeat.json')
+                    if os.path.exists(hb_path):
+                        import time as _time
+                        hb_age = _time.time() - os.path.getmtime(hb_path)
+                        if hb_age > self._HEARTBEAT_STALE_SEC:
+                            log.error(
+                                "[%s] HUNG: heartbeat stale for %.0fs "
+                                "(threshold %.0fs) — PID alive but not responding",
+                                self.name, hb_age, self._HEARTBEAT_STALE_SEC)
+                            self.status = 'hung'
+                            self.last_error = f"Heartbeat stale {hb_age:.0f}s"
+                            return 'hung'
+                except Exception:
+                    pass
+
             return 'running'
 
         # Process exited
@@ -402,9 +486,25 @@ def main():
             for name, manager in managers.items():
                 status = manager.check()
 
-                if status in ('crashed', 'stopped'):
-                    if status == 'crashed':
-                        log.error("[%s] CRASHED — attempting restart", name)
+                # V7 P3-2: Handle 'hung' status (force-kill then restart)
+                if status == 'hung':
+                    log.error("[%s] HUNG — force-killing (PID %s)",
+                              name, manager.process.pid if manager.process else '?')
+                    try:
+                        import signal as _sig
+                        os.killpg(os.getpgid(manager.process.pid), _sig.SIGKILL)
+                    except Exception:
+                        try:
+                            manager.process.kill()
+                        except Exception:
+                            pass
+                    manager.process = None
+                    manager.status = 'crashed'
+                    # Fall through to restart logic below
+
+                if status in ('crashed', 'stopped', 'hung'):
+                    if status == 'crashed' or status == 'hung':
+                        log.error("[%s] %s — attempting restart", name, status.upper())
                     else:
                         log.warning("[%s] STOPPED unexpectedly — attempting restart", name)
 

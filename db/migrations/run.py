@@ -35,6 +35,22 @@ log = logging.getLogger(__name__)
 _SQL_DIR = Path(__file__).parent / "sql"
 _ADVISORY_LOCK_ID = 8675309  # arbitrary, unique to this app
 
+# V7 P5-1: Dangerous SQL patterns that break running systems.
+# Migrations containing these (without override) are rejected.
+_DANGEROUS_PATTERNS = [
+    ('NOT NULL', 'without DEFAULT',
+     "Adding NOT NULL column without DEFAULT breaks running INSERTs. "
+     "Use: ADD COLUMN col TYPE DEFAULT val; then ALTER SET NOT NULL after backfill."),
+    ('DROP TABLE', None,
+     "DROP TABLE destroys data permanently. Use RENAME + scheduled drop instead."),
+    ('DROP COLUMN', None,
+     "DROP COLUMN destroys data. Use -- V7_OVERRIDE:DROP_COLUMN to acknowledge."),
+    ('RENAME COLUMN', None,
+     "RENAME COLUMN breaks running queries. Add new column, backfill, drop old."),
+    ('ALTER.*TYPE', None,
+     "ALTER TYPE can fail on existing data. Add new column with correct type instead."),
+]
+
 _BOOTSTRAP = """
 CREATE SCHEMA IF NOT EXISTS trading;
 CREATE TABLE IF NOT EXISTS trading.schema_migrations (
@@ -45,10 +61,44 @@ CREATE TABLE IF NOT EXISTS trading.schema_migrations (
 """
 
 
+def validate_migration(filename: str, content: str) -> list[str]:
+    """V7 P5-1: Check migration SQL for dangerous patterns.
+
+    Returns list of warning strings. Empty = safe to apply.
+    Patterns can be overridden with '-- V7_OVERRIDE:PATTERN' comments.
+    """
+    import re
+    warnings = []
+    upper = content.upper()
+
+    for pattern, context, message in _DANGEROUS_PATTERNS:
+        override_key = f"V7_OVERRIDE:{pattern.split('*')[0].strip()}"
+        if override_key in content:
+            continue  # explicitly acknowledged
+
+        if re.search(pattern, upper):
+            # Check context (e.g., NOT NULL requires "without DEFAULT")
+            if context == 'without DEFAULT':
+                # NOT NULL is OK if same statement has DEFAULT
+                # Simple heuristic: check if DEFAULT appears near NOT NULL
+                for line in content.split('\n'):
+                    line_upper = line.upper().strip()
+                    if 'NOT NULL' in line_upper and 'DEFAULT' not in line_upper:
+                        if 'ADD COLUMN' in upper or 'ADD ' in line_upper:
+                            warnings.append(
+                                f"[{filename}] {message}")
+                            break
+            else:
+                warnings.append(f"[{filename}] {message}")
+
+    return warnings
+
+
 async def run_migrations(dsn: str | None = None) -> int:
     """
     Apply all pending SQL migrations.
 
+    V7 P5-1: Validates each migration for dangerous patterns before applying.
     Returns the number of migrations applied.
     """
     url = dsn or os.getenv(
@@ -83,6 +133,20 @@ async def run_migrations(dsn: str | None = None) -> int:
 
             content = sql_file.read_text(encoding="utf-8")
             checksum = hashlib.sha256(content.encode()).hexdigest()[:16]
+
+            # V7 P5-1: Validate migration for dangerous patterns
+            warnings = validate_migration(sql_file.name, content)
+            if warnings:
+                for w in warnings:
+                    log.warning("[MIGRATION SAFETY] %s", w)
+                log.error(
+                    "Migration %s has %d safety warning(s). "
+                    "Add '-- V7_OVERRIDE:PATTERN' comment to acknowledge, "
+                    "or fix the migration to be backward-compatible.",
+                    sql_file.name, len(warnings))
+                raise RuntimeError(
+                    f"Migration {sql_file.name} blocked by safety check: "
+                    + "; ".join(warnings))
 
             log.info("Applying migration: %s", sql_file.name)
             try:

@@ -293,14 +293,23 @@ class AlpacaOptionChainClient:
         self._set_cached(cache_key, contracts)
         return contracts
 
+    # V7 P1-7: Timeout for snapshot API calls (prevents infinite hang)
+    _SNAPSHOT_TIMEOUT_SEC = 15.0
+
     def _get_snapshots_batched(
         self, symbols: List[str], batch_size: int = 100
     ) -> Dict:
         """
         Fetch option snapshots in batches to respect API limits.
 
+        V7 P1-7: Each batch has a 15s timeout. If Alpaca hangs, the batch
+        is skipped and the next batch proceeds. Prevents Options engine
+        from blocking indefinitely on a single API call.
+
         Returns dict of symbol -> snapshot.
         """
+        import concurrent.futures
+
         all_snapshots: Dict = {}
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i : i + batch_size]
@@ -308,10 +317,26 @@ class AlpacaOptionChainClient:
                 try:
                     self._rate_limiter.wait()
                     req = OptionSnapshotRequest(symbol_or_symbols=batch)
-                    snaps = self._data_client.get_option_snapshot(req)
+
+                    # V7: Wrap SDK call in timeout
+                    with concurrent.futures.ThreadPoolExecutor(1) as ex:
+                        future = ex.submit(
+                            self._data_client.get_option_snapshot, req
+                        )
+                        snaps = future.result(
+                            timeout=self._SNAPSHOT_TIMEOUT_SEC
+                        )
+
                     if snaps:
                         all_snapshots.update(snaps)
                     break  # success
+                except concurrent.futures.TimeoutError:
+                    log.error(
+                        "[chain] snapshot batch %d TIMED OUT after %.0fs "
+                        "(attempt %d) — skipping batch",
+                        i, self._SNAPSHOT_TIMEOUT_SEC, attempt + 1,
+                    )
+                    break  # don't retry timeouts — API is likely hung
                 except Exception as exc:
                     exc_str = str(exc)
                     if '429' in exc_str and attempt < 2:

@@ -1,47 +1,58 @@
 """
-Distributed Position Registry — file-locked cross-process position tracking.
+Distributed Position Registry — hardened cross-process position tracking.
 
-Replaces the in-memory GlobalPositionRegistry for process isolation.
-Uses file-based locking (fcntl.flock) to ensure atomic read-modify-write
-across multiple processes.
+V7: Uses SafeStateFile for:
+  - fcntl.flock on ALL reads (shared) AND writes (exclusive)
+  - SHA256 checksums to detect corruption
+  - Rolling backups (current → .prev → .prev2)
+  - Monotonic version numbers
 
 State file: data/position_registry.json
-Format: {"positions": {ticker: layer_name}, "updated_at": ISO-string}
+Format: {"positions": {ticker: layer_name}, ...}
 """
-import fcntl
-import json
 import logging
 import os
-import time
 from typing import Dict, Optional, Set
+
+from lifecycle.safe_state import SafeStateFile
 
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY_PATH = os.path.join(PROJECT_ROOT, 'data', 'position_registry.json')
-LOCK_PATH = REGISTRY_PATH + '.lock'
 
 
 class DistributedPositionRegistry:
-    """File-locked position registry for cross-process deduplication."""
+    """File-locked position registry for cross-process deduplication.
+
+    V7: All reads use shared fcntl lock, all writes use exclusive fcntl lock.
+    No unlocked reads — eliminates stale-read race conditions.
+    """
 
     def __init__(self, global_max: int = 75, registry_path: str = None):
-        self._path = registry_path or REGISTRY_PATH
-        self._lock_path = LOCK_PATH
+        path = registry_path or REGISTRY_PATH
         self._global_max = global_max
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        # SafeStateFile handles directory creation, locking, checksums, backups
+        self._sf = SafeStateFile(path, max_age_seconds=60.0)
 
         # Initialize file if it doesn't exist
-        if not os.path.exists(self._path):
-            self._write({'positions': {}, 'updated_at': ''})
+        data, _ = self._sf.read()
+        if data is None:
+            self._sf.write({'positions': {}})
 
     def try_acquire(self, ticker: str, layer: str) -> bool:
-        """Atomically try to acquire a ticker for a layer. Returns True on success."""
-        with self._file_lock():
-            state = self._read()
-            positions = state.get('positions', {})
+        """Atomically try to acquire a ticker for a layer.
 
-            # Already held by this layer
+        Uses exclusive fcntl lock for read-modify-write.
+        Returns True on success, False if held by another layer or at capacity.
+        """
+        with self._sf._exclusive_lock():
+            data = self._sf._read_raw_unlocked()
+            if data is None:
+                data = {'positions': {}}
+            positions = data.get('positions', {})
+
+            # Already held by this layer (idempotent)
             if positions.get(ticker) == layer:
                 return True
 
@@ -55,69 +66,57 @@ class DistributedPositionRegistry:
 
             # Acquire
             positions[ticker] = layer
-            state['positions'] = positions
-            state['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
-            self._write(state)
+            data['positions'] = positions
+            self._sf.write(data, _already_locked=True)
             return True
 
     def release(self, ticker: str) -> None:
-        """Release a ticker."""
-        with self._file_lock():
-            state = self._read()
-            positions = state.get('positions', {})
+        """Release a ticker. Uses exclusive lock."""
+        with self._sf._exclusive_lock():
+            data = self._sf._read_raw_unlocked()
+            if data is None:
+                return
+            positions = data.get('positions', {})
             if ticker in positions:
                 del positions[ticker]
-                state['positions'] = positions
-                state['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
-                self._write(state)
+                data['positions'] = positions
+                self._sf.write(data, _already_locked=True)
 
     def is_held(self, ticker: str) -> bool:
-        state = self._read()
-        return ticker in state.get('positions', {})
+        """Check if ticker is held. Uses shared fcntl lock."""
+        data, _ = self._sf.read()
+        if data is None:
+            return False
+        return ticker in data.get('positions', {})
 
     def held_by(self, ticker: str) -> Optional[str]:
-        state = self._read()
-        return state.get('positions', {}).get(ticker)
+        """Return layer name holding ticker. Uses shared fcntl lock."""
+        data, _ = self._sf.read()
+        if data is None:
+            return None
+        return data.get('positions', {}).get(ticker)
 
     def count(self) -> int:
-        state = self._read()
-        return len(state.get('positions', {}))
+        """Return total position count. Uses shared fcntl lock."""
+        data, _ = self._sf.read()
+        if data is None:
+            return 0
+        return len(data.get('positions', {}))
 
     def all_positions(self) -> Dict[str, str]:
-        state = self._read()
-        return dict(state.get('positions', {}))
+        """Return copy of all positions. Uses shared fcntl lock."""
+        data, _ = self._sf.read()
+        if data is None:
+            return {}
+        return dict(data.get('positions', {}))
 
     def tickers_for_layer(self, layer: str) -> Set[str]:
-        state = self._read()
-        return {t for t, l in state.get('positions', {}).items() if l == layer}
+        """Return set of tickers held by specific layer. Uses shared fcntl lock."""
+        data, _ = self._sf.read()
+        if data is None:
+            return set()
+        return {t for t, l in data.get('positions', {}).items() if l == layer}
 
     def reset(self) -> None:
-        """Clear all positions (called at session start)."""
-        with self._file_lock():
-            self._write({'positions': {}, 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S')})
-
-    def _read(self) -> dict:
-        try:
-            with open(self._path, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {'positions': {}, 'updated_at': ''}
-
-    def _write(self, state: dict) -> None:
-        try:
-            with open(self._path, 'w') as f:
-                json.dump(state, f)
-        except Exception as exc:
-            log.error("[DistributedRegistry] Write failed: %s", exc)
-
-    class _file_lock:
-        """Context manager for file-based locking."""
-        def __enter__(self):
-            os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
-            self._fd = open(LOCK_PATH, 'w')
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
-            return self
-
-        def __exit__(self, *args):
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            self._fd.close()
+        """Clear all positions (called at session start). Uses exclusive lock."""
+        self._sf.write({'positions': {}})

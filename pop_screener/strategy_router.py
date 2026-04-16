@@ -36,9 +36,29 @@ from pop_screener.strategies.bopb_engine            import BOPBEngine
 from pop_screener.strategies.momentum_entry_engine  import MomentumEntryEngine
 
 
+# V7 P4-3: Strategy Registry — single place to add new Pop strategies.
+# To add a new strategy:
+#   1. Create engine class in pop_screener/strategies/
+#   2. Add StrategyType enum entry to models.py
+#   3. Add entry here: STRATEGY_REGISTRY[StrategyType.NEW_TYPE] = NewEngine
+# No other code changes required — router discovers from registry.
+STRATEGY_REGISTRY: Dict[StrategyType, object] = {
+    StrategyType.VWAP_RECLAIM:           VWAPReclaimEngine(),
+    StrategyType.ORB:                    ORBEngine(),
+    StrategyType.HALT_RESUME_BREAKOUT:   HaltResumeEngine(),
+    StrategyType.PARABOLIC_REVERSAL:     ParabolicReversalEngine(),
+    StrategyType.EMA_TREND_CONTINUATION: EMATrendEngine(),
+    StrategyType.BREAKOUT_PULLBACK:      BOPBEngine(),
+    StrategyType.MOMENTUM_ENTRY:         MomentumEntryEngine(),
+}
+
+
 class StrategyRouter:
     """
     Routes a StrategyAssignment to the correct engine and returns signals.
+
+    V7 P4-3: Uses STRATEGY_REGISTRY for pluggable strategy discovery.
+    To add a new strategy, add to STRATEGY_REGISTRY above — no router changes.
 
     Parameters
     ----------
@@ -50,16 +70,8 @@ class StrategyRouter:
 
     def __init__(self, try_secondaries: bool = True):
         self._try_secondaries = try_secondaries
-        # Engine instances are re-used across calls (all are stateless)
-        self._engines = {
-            StrategyType.VWAP_RECLAIM:           VWAPReclaimEngine(),
-            StrategyType.ORB:                    ORBEngine(),
-            StrategyType.HALT_RESUME_BREAKOUT:   HaltResumeEngine(),
-            StrategyType.PARABOLIC_REVERSAL:     ParabolicReversalEngine(),
-            StrategyType.EMA_TREND_CONTINUATION: EMATrendEngine(),
-            StrategyType.BREAKOUT_PULLBACK:      BOPBEngine(),
-            StrategyType.MOMENTUM_ENTRY:         MomentumEntryEngine(),
-        }
+        # V7: Engine instances from registry (pluggable, not hardcoded)
+        self._engines = dict(STRATEGY_REGISTRY)
 
     def route(
         self,

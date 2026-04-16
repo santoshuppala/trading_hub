@@ -55,8 +55,14 @@ class BaseBroker(ABC):
         bus.subscribe(EventType.ORDER_REQ, self._on_order_request)
 
     def _emit_fill(self, fill_payload: FillPayload, correlation_id=None) -> None:
-        """Emit a FILL event tagged with this broker's name."""
-        evt = Event(EventType.FILL, fill_payload, correlation_id=correlation_id)
+        """Emit a FILL event tagged with this broker's name.
+
+        V7 P2-2: Auto-sets correlation_id from _current_causation_id,
+        linking FILL back to the ORDER_REQ that triggered it.
+        Enables end-to-end tracing: SIGNAL → ORDER_REQ → FILL → POSITION.
+        """
+        cid = correlation_id or getattr(self, '_current_causation_id', None)
+        evt = Event(EventType.FILL, fill_payload, correlation_id=cid)
         evt._routed_broker = self._broker_name
         self._bus.emit(evt)
 
@@ -65,10 +71,17 @@ class BaseBroker(ABC):
         if getattr(event, '_portfolio_blocked', False):
             return
         p: OrderRequestPayload = event.payload
+        # V7 P0-1: Tag payload with event_id for deterministic client_order_id
+        # (frozen dataclass — use object.__setattr__ to bypass)
+        object.__setattr__(p, '_source_event_id', event.event_id)
+        # V7 P2-2: Store ORDER_REQ event_id for causation chain.
+        # _emit_fill() reads this to set correlation_id on FILL events.
+        self._current_causation_id = event.event_id
         if p.side == 'BUY':
             self._execute_buy(p)
         else:
             self._execute_sell(p)
+        self._current_causation_id = None
 
     @abstractmethod
     def _execute_buy(self, p: OrderRequestPayload) -> None: ...
@@ -146,12 +159,20 @@ class AlpacaBroker(BaseBroker):
 
             # ── Submit ────────────────────────────────────────────────
             try:
+                # V7 P0-1: Deterministic client_order_id from event context.
+                # If process crashes after submit but before FILL confirmation,
+                # restart + replay will generate the SAME client_order_id.
+                # Alpaca rejects duplicate client_order_id → no double orders.
+                event_id = getattr(p, '_source_event_id', '') or uuid.uuid4().hex
+                client_oid = f"th-buy-{p.ticker}-{event_id[:12]}-{attempt}"
+
                 req = LimitOrderRequest(
                     symbol=p.ticker,
                     qty=p.qty,
                     side=OrderSide.BUY,
                     limit_price=limit_price,
                     time_in_force=TimeInForce.DAY,
+                    client_order_id=client_oid,
                     **bracket_kwargs,
                 )
                 order    = self._client.submit_order(req)
@@ -424,44 +445,64 @@ class AlpacaBroker(BaseBroker):
                     fill_price=fill_price, order_id=order_id, reason=p.reason,
                 ))
             else:
-                # Check for partial fill before emitting optimistically
-                try:
-                    final = self._client.get_order_by_id(order_id)
-                    final_status = final.status.value if hasattr(final.status, 'value') else str(final.status)
-                    final_qty = int(float(final.filled_qty or 0))
-                    if final_status == 'partially_filled' and final_qty > 0:
-                        fill_price = float(final.filled_avg_price or p.price)
-                        log.warning(
-                            f"SELL {p.ticker} partial fill: {final_qty} of {actual_qty} — "
-                            f"emitting FILL for {final_qty} only"
-                        )
-                        self._emit_fill(FillPayload(
-                            ticker=p.ticker, side='SELL', qty=final_qty,
-                            fill_price=fill_price, order_id=order_id, reason=p.reason,
-                        ))
-                    else:
-                        log.warning(
-                            f"SELL {p.ticker} not confirmed within 5s (status={final_status}) — "
-                            f"emitting FILL optimistically (order {order_id})"
-                        )
-                        self._emit_fill(FillPayload(
-                            ticker=p.ticker, side='SELL', qty=actual_qty,
-                            fill_price=p.price, order_id=order_id, reason=p.reason,
-                        ))
-                except Exception:
-                    # Fallback: emit optimistically if we can't check
-                    log.warning(
-                        f"SELL {p.ticker} not confirmed within 5s — "
-                        f"emitting FILL optimistically (order {order_id})"
+                # V7 P0-5: Do NOT emit optimistic FILL. Verify with extended poll.
+                # Optimistic fills caused phantom position closes in V6 when
+                # order was actually pending/cancelled.
+                verified = False
+                for retry in range(3):
+                    time.sleep(1.0)  # 1s, 2s, 3s extra wait
+                    try:
+                        final = self._client.get_order_by_id(order_id)
+                        final_status = final.status.value if hasattr(final.status, 'value') else str(final.status)
+                        final_qty = int(float(final.filled_qty or 0))
+
+                        if final_status == 'filled':
+                            fill_price = float(final.filled_avg_price or p.price)
+                            filled_qty = int(float(final.filled_qty or actual_qty))
+                            self._emit_fill(FillPayload(
+                                ticker=p.ticker, side='SELL', qty=filled_qty,
+                                fill_price=fill_price, order_id=order_id, reason=p.reason,
+                            ))
+                            verified = True
+                            break
+                        elif final_status == 'partially_filled' and final_qty > 0:
+                            fill_price = float(final.filled_avg_price or p.price)
+                            log.warning(
+                                f"SELL {p.ticker} partial fill: {final_qty} of {actual_qty}"
+                            )
+                            self._emit_fill(FillPayload(
+                                ticker=p.ticker, side='SELL', qty=final_qty,
+                                fill_price=fill_price, order_id=order_id, reason=p.reason,
+                            ))
+                            verified = True
+                            break
+                        elif final_status in ('cancelled', 'expired', 'rejected'):
+                            log.error(
+                                f"SELL {p.ticker} terminal status={final_status} — "
+                                f"NOT emitting FILL (order {order_id})"
+                            )
+                            self._fail(p)
+                            verified = True
+                            break
+                    except Exception as exc:
+                        log.warning("SELL verify retry %d failed for %s: %s",
+                                    retry + 1, p.ticker, exc)
+
+                if not verified:
+                    # After 3 retries (8s total extra), still no confirmation.
+                    # Emit ORDER_FAIL instead of optimistic FILL.
+                    log.error(
+                        f"SELL {p.ticker} UNVERIFIED after 8s — "
+                        f"emitting ORDER_FAIL (order {order_id}). "
+                        f"Manual check required!"
                     )
                     send_alert(
                         self._alert_email,
-                        f"SELL {actual_qty} {p.ticker} at market (order {order_id})",
+                        f"SELL UNVERIFIED: {actual_qty} {p.ticker} order {order_id} — "
+                        f"check Alpaca manually!",
+                        severity='CRITICAL',
                     )
-                    self._emit_fill(FillPayload(
-                        ticker=p.ticker, side='SELL', qty=actual_qty,
-                        fill_price=p.price, order_id=order_id, reason=p.reason,
-                    ))
+                    self._fail(p)
 
         except Exception as e:
             log.error(

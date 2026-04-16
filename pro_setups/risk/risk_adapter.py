@@ -111,22 +111,24 @@ class RiskAdapter:
         """
         tag = f"[RiskAdapter][{ticker}][{strategy_name}][T{tier}]"
 
-        # ── Check 0: cross-layer dedup ──────────────────────────────────────────
+        # ── Check 0: cross-layer dedup (READ-ONLY pre-flight) ──────────────────
+        # V7: Satellite does NOT write to registry. Core's RegistryGate acquires.
+        # This is a fast read-only check to avoid sending unnecessary ORDER_REQs.
         from monitor.position_registry import registry
-        if not registry.try_acquire(ticker, layer="pro_setups"):
+        holder = registry.held_by(ticker)
+        if holder and holder != 'pro':
             log.info(
-                "%s BLOCKED: held by another strategy layer (%s)",
-                tag, registry.held_by(ticker),
+                "%s BLOCKED (pre-flight): held by layer '%s'",
+                tag, holder,
             )
             return
 
         # ── Check 1: only long entries go through (short execution not yet wired) ──
         if direction != 'long':
             log.info("%s SKIPPED: direction=%s (short execution not enabled)", tag, direction)
-            registry.release(ticker)
             return
 
-        # All checks after acquire must release on failure (try/finally with _approved flag)
+        # V7: No registry release needed — satellite doesn't own the lock
         _approved = False
         try:
             # ── Check 1b: minimum confidence by tier ─────────────────────────────
@@ -213,8 +215,7 @@ class RiskAdapter:
 
             _approved = True
         finally:
-            if not _approved:
-                registry.release(ticker)
+            pass  # V7: No registry release — Core owns the lock
 
         # ── Emit ORDER_REQ ────────────────────────────────────────────────────────
         reason  = f"pro:{strategy_name}:T{tier}:long"
@@ -228,6 +229,7 @@ class RiskAdapter:
             stop_price       = round(stop_price,  4),
             target_price     = round(target_2,    4),
             atr_value        = round(atr_value,   4),
+            layer            = 'pro',  # V7: Core acquires registry
         )
 
         log.info(

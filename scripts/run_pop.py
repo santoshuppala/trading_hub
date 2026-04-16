@@ -140,7 +140,8 @@ def main():
                 'stop_price': float(getattr(p, 'stop_price', 0)),
                 'target_price': float(getattr(p, 'target_price', 0)),
                 'source': 'pop',
-            })
+                'layer': 'pop',
+            }, correlation_id=event.event_id)  # V7 P3-1: cross-process tracing
             log.info("[IPC] Published ORDER_REQ: %s %s qty=%d", p.ticker, p.side, p.qty)
 
     bus.subscribe(EventType.ORDER_REQ, _forward_order, priority=0)

@@ -158,6 +158,10 @@ _WALL_CLOCK = WallClockTimeSource()
 SLOW_THRESHOLD_SEC        = 0.50   # 500ms (was 100ms — too noisy with API calls in handlers)
 CIRCUIT_BREAKER_THRESHOLD = 5
 CIRCUIT_BREAKER_COOLDOWN  = 60.0
+# V7 P1-8: Handler execution timeout. Handlers exceeding this are forcibly
+# interrupted via concurrent.futures. Prevents hung handlers from blocking
+# the entire partition queue. Set to 0 to disable (original V6 behavior).
+HANDLER_TIMEOUT_SEC       = 30.0   # 30s — generous for broker API calls
 LATENCY_WINDOW            = 100
 
 
@@ -906,6 +910,10 @@ class Event:
     deadline:       Optional[float] = None  # monotonic() deadline; None = no SLA
     expiry_ts:      Optional[float] = None  # monotonic() hard TTL; delivery is SKIPPED (not just logged) if now > expiry_ts
     coalesced:      bool           = False  # set True by _deliver() when per-handler coalescing drops this event
+    # V7 P5-2: Payload versioning for schema evolution.
+    # Increment when payload fields change. Projection builder can use this
+    # to handle old events with different field sets during replay/rebuild.
+    payload_version: int           = 1
 
     def __repr__(self) -> str:
         cid    = f" corr={self.correlation_id[:8]}" if self.correlation_id else ""
@@ -1576,12 +1584,36 @@ class EventBus:
                     self._retried_deliveries += 1
             try:
                 call_lock = state._call_lock if state else None
-                if call_lock is not None:
-                    # thread_safe=False: serialise concurrent calls to this handler
-                    with call_lock:
-                        key(event)
+                # V7 P1-8: Handler execution timeout.
+                # If HANDLER_TIMEOUT_SEC > 0, wrap call in futures with timeout.
+                # On timeout, the handler thread continues (Python can't kill threads)
+                # but we count it as a failure and move on, preventing queue blockage.
+                if HANDLER_TIMEOUT_SEC > 0:
+                    import concurrent.futures
+                    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    try:
+                        if call_lock is not None:
+                            fut = _executor.submit(lambda: (call_lock.__enter__(), key(event), call_lock.__exit__(None, None, None)))
+                        else:
+                            fut = _executor.submit(key, event)
+                        fut.result(timeout=HANDLER_TIMEOUT_SEC)
+                    except concurrent.futures.TimeoutError:
+                        log.error(
+                            f"[handler-timeout] {key.__qualname__}[{ticker}] "
+                            f"exceeded {HANDLER_TIMEOUT_SEC}s on {event.type.name} "
+                            f"seq={event.sequence} — skipping"
+                        )
+                        raise TimeoutError(
+                            f"Handler {key.__qualname__} timed out after {HANDLER_TIMEOUT_SEC}s"
+                        )
+                    finally:
+                        _executor.shutdown(wait=False)
                 else:
-                    key(event)
+                    if call_lock is not None:
+                        with call_lock:
+                            key(event)
+                    else:
+                        key(event)
                 success    = True
                 elapsed_ms = (self._time_source.monotonic() - t0) * 1000
                 break

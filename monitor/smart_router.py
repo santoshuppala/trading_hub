@@ -24,6 +24,7 @@ from typing import Optional, Dict
 from dataclasses import dataclass
 
 from monitor.event_bus import EventBus, EventType, Event
+from lifecycle.safe_state import SafeStateFile
 
 log = logging.getLogger(__name__)
 
@@ -66,43 +67,48 @@ class SmartRouter:
         alpaca_broker=None,
         tradier_broker=None,
         default_broker: str = 'alpaca',
+        brokers: Dict[str, object] = None,
     ):
+        """
+        V7 P4-1: Generic broker registration.
+
+        Two ways to register brokers:
+          1. Legacy: alpaca_broker=, tradier_broker= (backward compat)
+          2. V7: brokers={'alpaca': broker1, 'tradier': broker2, 'ibkr': broker3}
+             Pass any Dict[str, BaseBroker]. No hardcoded broker names.
+        """
         self._bus = bus
         self._brokers: Dict[str, object] = {}
         self._health: Dict[str, BrokerHealth] = {}
 
-        if alpaca_broker:
-            self._brokers['alpaca'] = alpaca_broker
-            self._health['alpaca'] = BrokerHealth(name='alpaca')
-            # Unsubscribe broker's own ORDER_REQ handler — SmartRouter calls it directly
-            try:
-                bus.unsubscribe(EventType.ORDER_REQ, alpaca_broker._on_order_request)
-            except Exception:
-                pass
-
-        if tradier_broker:
-            self._brokers['tradier'] = tradier_broker
-            self._health['tradier'] = BrokerHealth(name='tradier')
-            # Tradier uses _on_order_req (not _on_order_request)
-            handler = getattr(tradier_broker, '_on_order_request', None) or \
-                      getattr(tradier_broker, '_on_order_req', None)
-            if handler:
-                try:
-                    bus.unsubscribe(EventType.ORDER_REQ, handler)
-                except Exception:
-                    pass
+        # V7 P4-1: Generic broker registration via dict
+        if brokers:
+            for name, broker in brokers.items():
+                self._register_broker(name, broker, bus)
+        else:
+            # Legacy path: named parameters (backward compat)
+            if alpaca_broker:
+                self._register_broker('alpaca', alpaca_broker, bus)
+            if tradier_broker:
+                self._register_broker('tradier', tradier_broker, bus)
 
         self._default = default_broker
         self._lock = threading.Lock()
+        self._registry_gate = None  # V7: set via set_registry_gate()
+        # V7 P0-2: ORDER_REQ dedup — prevent replayed events from routing twice
+        self._routed_event_ids: dict = {}  # {event_id: monotonic_time} — bounded LRU
+        self._ROUTED_MAX = 5000
         self._all_brokers_down_alerted = False
         self._order_counter = 0  # for round-robin routing
         # Track which broker opened each position (ticker → broker_name)
-        # Persisted to disk so it survives restarts
+        # V7: Uses SafeStateFile for fcntl locking, checksums, backups
         self._position_broker: Dict[str, str] = {}
         self._broker_map_file = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'data', 'position_broker_map.json',
         )
+        self._broker_map_sf = SafeStateFile(self._broker_map_file,
+                                            max_age_seconds=300.0)
         self._load_broker_map()
 
         # Subscribe to ORDER_REQ (we handle routing, individual brokers don't)
@@ -116,8 +122,43 @@ class SmartRouter:
         broker_names = list(self._brokers.keys())
         log.info("[SmartRouter] ready | brokers=%s | default=%s", broker_names, default_broker)
 
+    def _register_broker(self, name: str, broker, bus: EventBus) -> None:
+        """V7 P4-1: Register a broker generically. Unsubscribes its ORDER_REQ handler."""
+        self._brokers[name] = broker
+        self._health[name] = BrokerHealth(name=name)
+        # Unsubscribe broker's own ORDER_REQ handler (SmartRouter calls directly)
+        for method_name in ('_on_order_request', '_on_order_req'):
+            handler = getattr(broker, method_name, None)
+            if handler:
+                try:
+                    bus.unsubscribe(EventType.ORDER_REQ, handler)
+                except Exception:
+                    pass
+                break
+
     def _on_order_req(self, event: Event) -> None:
         """Route an order to the best broker."""
+        # Skip if PortfolioRiskGate blocked this order
+        if getattr(event, '_portfolio_blocked', False):
+            return
+        # V7: Skip if RegistryGate blocked this order
+        if self._registry_gate and self._registry_gate.is_blocked(event.event_id):
+            return
+        # V7 P0-2: ORDER_REQ dedup — skip if we already routed this event_id
+        # Protects against Redpanda replay after crash (at-least-once delivery)
+        eid = event.event_id
+        with self._lock:
+            if eid in self._routed_event_ids:
+                log.warning("[SmartRouter] Duplicate ORDER_REQ skipped: %s", eid[:12])
+                return
+            self._routed_event_ids[eid] = time.monotonic()
+            # Prune oldest entries if over capacity
+            if len(self._routed_event_ids) > self._ROUTED_MAX:
+                oldest = sorted(self._routed_event_ids.items(),
+                                key=lambda kv: kv[1])[:self._ROUTED_MAX // 2]
+                for k, _ in oldest:
+                    del self._routed_event_ids[k]
+
         p = event.payload
         ticker = p.ticker
 
@@ -176,10 +217,17 @@ class SmartRouter:
             opening_broker = self._position_broker.get(ticker)
             if opening_broker and opening_broker in self._brokers:
                 return opening_broker
-            # Fallback: check which broker actually has the position
+            # V7 P4-1: Generic position detection — try has_position() first,
+            # fall back to broker-specific APIs if not available.
             for broker_name, broker in self._brokers.items():
                 try:
-                    if broker_name == 'alpaca' and hasattr(broker, '_client') and broker._client:
+                    # V7: Generic interface — brokers can implement has_position()
+                    if hasattr(broker, 'has_position'):
+                        if broker.has_position(ticker):
+                            log.info("[SmartRouter] SELL %s → %s (has_position)", ticker, broker_name)
+                            return broker_name
+                    # Legacy fallback: Alpaca-specific
+                    elif hasattr(broker, '_client') and broker._client:
                         pos = broker._client.get_open_position(ticker)
                         if pos and int(float(pos.qty or 0)) > 0:
                             log.info("[SmartRouter] SELL %s → %s (detected open position)", ticker, broker_name)
@@ -322,25 +370,20 @@ class SmartRouter:
         return None
 
     def _load_broker_map(self) -> None:
-        """Load position→broker mapping from disk."""
-        try:
-            if os.path.exists(self._broker_map_file):
-                with open(self._broker_map_file) as f:
-                    self._position_broker = json.load(f)
-                log.info("[SmartRouter] Loaded broker map: %s", self._position_broker or '{}')
-        except Exception as exc:
-            log.warning("[SmartRouter] Failed to load broker map: %s", exc)
+        """Load position→broker mapping from disk. V7: shared fcntl lock + checksum."""
+        data, _ = self._broker_map_sf.read()
+        if data and 'map' in data:
+            self._position_broker = data['map']
+            log.info("[SmartRouter] Loaded broker map (v%d): %s",
+                     data.get('_version', 0), self._position_broker or '{}')
+        elif data:
+            # Backward compat: old format was flat {ticker: broker}
+            self._position_broker = {k: v for k, v in data.items()
+                                     if not k.startswith('_')}
 
     def _save_broker_map(self) -> None:
-        """Persist position→broker mapping to disk."""
-        try:
-            os.makedirs(os.path.dirname(self._broker_map_file), exist_ok=True)
-            tmp = self._broker_map_file + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(self._position_broker, f)
-            os.replace(tmp, self._broker_map_file)
-        except Exception as exc:
-            log.debug("[SmartRouter] Failed to save broker map: %s", exc)
+        """Persist position→broker mapping. V7: exclusive fcntl lock + checksum + backup."""
+        self._broker_map_sf.write({'map': self._position_broker})
 
     def seed_position_broker(self, alpaca_tickers: set, tradier_tickers: set) -> None:
         """Seed position→broker mapping from broker open positions on startup.
@@ -354,6 +397,10 @@ class SmartRouter:
         if alpaca_tickers or tradier_tickers:
             log.info("[SmartRouter] Seeded position_broker: alpaca=%s tradier=%s",
                      alpaca_tickers or '{}', tradier_tickers or '{}')
+
+    def set_registry_gate(self, gate) -> None:
+        """V7: Connect RegistryGate so SmartRouter can check blocked orders."""
+        self._registry_gate = gate
 
     def status(self) -> dict:
         """Return router status for monitoring."""

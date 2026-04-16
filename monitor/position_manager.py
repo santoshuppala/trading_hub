@@ -278,9 +278,8 @@ class PositionManager:
         import time as _time
         self._last_order_time[ticker] = _time.time()
 
-        # Release cross-layer position lock
-        from .position_registry import registry
-        registry.release(ticker)
+        # V7: Registry release handled by RegistryGate on POSITION CLOSED event
+        # (centralized — only Core writes to registry)
 
         self._trade_log.append(trade)
         send_alert(

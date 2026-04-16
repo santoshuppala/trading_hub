@@ -48,11 +48,16 @@ class EventPublisher:
         self._flush_thread = threading.Thread(target=self._bg_flush, daemon=True)
         self._flush_thread.start()
 
-    def publish(self, topic: str, key: str, payload: dict, headers: dict = None) -> None:
-        """Publish a message to a topic. Non-blocking."""
+    def publish(self, topic: str, key: str, payload: dict,
+                headers: dict = None, correlation_id: str = None) -> None:
+        """Publish a message to a topic. Non-blocking.
+
+        V7 P3-1: correlation_id included in envelope for cross-process tracing.
+        """
         envelope = {
             'source': self._source,
             'timestamp': datetime.now(timezone.utc).isoformat(),
+            'correlation_id': correlation_id or '',  # V7: cross-process tracing
             'payload': payload,
         }
         msg_headers = [(k, str(v).encode()) for k, v in (headers or {}).items()]
@@ -97,12 +102,14 @@ class EventConsumer:
                  topics: list = None, source_name: str = 'unknown'):
         from confluent_kafka import Consumer
         self._source = source_name
+        # V7 P0-4: Manual commit — only commit offset AFTER handler succeeds.
+        # Prevents at-least-once replay from creating duplicate orders on crash.
+        # Auto-commit race: handler processes event → crash before 3s commit → replay.
         self._consumer = Consumer({
             'bootstrap.servers': brokers or DEFAULT_BROKERS,
             'group.id': group_id,
             'auto.offset.reset': 'latest',
-            'enable.auto.commit': True,
-            'auto.commit.interval.ms': 3000,
+            'enable.auto.commit': False,   # V7: manual commit after handler
             'session.timeout.ms': 15000,
             'max.poll.interval.ms': 60000,
         })
@@ -146,15 +153,25 @@ class EventConsumer:
                 topic = msg.topic()
                 handler = self._handlers.get(topic)
                 if handler is None:
+                    # V7: Commit even for unhandled topics to advance offset
+                    self._consumer.commit(msg, asynchronous=True)
                     continue
 
                 key = msg.key().decode('utf-8') if msg.key() else ''
                 try:
                     envelope = json.loads(msg.value().decode('utf-8'))
                     payload = envelope.get('payload', envelope)
+                    # V7 P3-1: Propagate correlation_id from envelope into payload
+                    # so downstream handlers can trace across process boundaries.
+                    corr_id = envelope.get('correlation_id', '')
+                    if corr_id:
+                        payload['_ipc_correlation_id'] = corr_id
                     handler(key, payload)
+                    # V7 P0-4: Commit AFTER handler succeeds.
+                    self._consumer.commit(msg, asynchronous=True)
                 except Exception as exc:
-                    log.warning("[IPC] Handler error on %s: %s", topic, exc)
+                    log.warning("[IPC] Handler error on %s: %s — "
+                                "offset NOT committed (will replay)", topic, exc)
             except Exception as exc:
                 log.warning("[IPC] Consume loop error: %s", exc)
                 time.sleep(1)

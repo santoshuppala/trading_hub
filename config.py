@@ -177,3 +177,90 @@ POLYGON_API_KEY      = os.getenv('POLYGON_KEY', os.getenv('POLYGON_API_KEY', '')
 # UNUSUAL_WHALES_KEY — disabled for now (no account)
 # REDDIT_* — disabled for now (signup pending)
 SEC_EDGAR_EMAIL      = os.getenv('SEC_EDGAR_EMAIL', os.getenv('ALERT_EMAIL_TO', 'tradinghub@example.com'))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V7 P4-4: Configuration Validation
+# ══════════════════════════════════════════════════════════════════════════════
+# Fail-fast on startup if config values are invalid.
+# Prevents silent propagation of bad env vars into trading logic.
+
+_CONFIG_ERRORS = []
+
+
+def _validate_positive(name, value):
+    if value <= 0:
+        _CONFIG_ERRORS.append(f"{name}={value} must be positive")
+
+
+def _validate_non_negative(name, value):
+    if value < 0:
+        _CONFIG_ERRORS.append(f"{name}={value} must be non-negative")
+
+
+def _validate_range(name, value, lo, hi):
+    if not (lo <= value <= hi):
+        _CONFIG_ERRORS.append(f"{name}={value} must be in [{lo}, {hi}]")
+
+
+def _validate_choice(name, value, choices):
+    if value not in choices:
+        _CONFIG_ERRORS.append(f"{name}='{value}' must be one of {choices}")
+
+
+# ── Validate risk parameters ──────────────────────────────────────────────
+_validate_positive('TRADE_BUDGET', TRADE_BUDGET)
+_validate_positive('MAX_POSITIONS', MAX_POSITIONS)
+_validate_positive('GLOBAL_MAX_POSITIONS', GLOBAL_MAX_POSITIONS)
+_validate_positive('ORDER_COOLDOWN', ORDER_COOLDOWN)
+_validate_range('MAX_SLIPPAGE_PCT', MAX_SLIPPAGE_PCT, 0.0, 0.10)
+_validate_range('DEFAULT_STOP_PCT', DEFAULT_STOP_PCT, 0.0, 0.50)
+_validate_positive('MIN_BARS_REQUIRED', MIN_BARS_REQUIRED)
+
+# ── Validate kill switches (must be negative) ────────────────────────────
+if MAX_DAILY_LOSS >= 0:
+    _CONFIG_ERRORS.append(f"MAX_DAILY_LOSS={MAX_DAILY_LOSS} must be negative")
+if PRO_MAX_DAILY_LOSS >= 0:
+    _CONFIG_ERRORS.append(f"PRO_MAX_DAILY_LOSS={PRO_MAX_DAILY_LOSS} must be negative")
+if POP_MAX_DAILY_LOSS >= 0:
+    _CONFIG_ERRORS.append(f"POP_MAX_DAILY_LOSS={POP_MAX_DAILY_LOSS} must be negative")
+if OPTIONS_MAX_DAILY_LOSS >= 0:
+    _CONFIG_ERRORS.append(f"OPTIONS_MAX_DAILY_LOSS={OPTIONS_MAX_DAILY_LOSS} must be negative")
+
+# ── Validate per-engine budgets ────────────────────────────────────────────
+_validate_positive('POP_TRADE_BUDGET', POP_TRADE_BUDGET)
+_validate_positive('PRO_TRADE_BUDGET', PRO_TRADE_BUDGET)
+_validate_positive('OPTIONS_TRADE_BUDGET', OPTIONS_TRADE_BUDGET)
+_validate_positive('OPTIONS_TOTAL_BUDGET', OPTIONS_TOTAL_BUDGET)
+_validate_positive('POP_MAX_POSITIONS', POP_MAX_POSITIONS)
+_validate_positive('PRO_MAX_POSITIONS', PRO_MAX_POSITIONS)
+_validate_positive('OPTIONS_MAX_POSITIONS', OPTIONS_MAX_POSITIONS)
+
+# ── Validate options DTE ──────────────────────────────────────────────────
+if OPTIONS_MIN_DTE >= OPTIONS_MAX_DTE:
+    _CONFIG_ERRORS.append(
+        f"OPTIONS_MIN_DTE={OPTIONS_MIN_DTE} must be < OPTIONS_MAX_DTE={OPTIONS_MAX_DTE}")
+
+# ── Validate broker/data source choices ────────────────────────────────────
+_validate_choice('BROKER', BROKER, ('alpaca', 'paper'))
+_validate_choice('DATA_SOURCE', DATA_SOURCE, ('tradier', 'alpaca'))
+_validate_choice('BROKER_MODE', BROKER_MODE, ('alpaca', 'tradier', 'smart'))
+
+# ── Validate portfolio limits ──────────────────────────────────────────────
+_validate_positive('MAX_NOTIONAL_EXPOSURE', MAX_NOTIONAL_EXPOSURE)
+_validate_positive('MAX_PORTFOLIO_DELTA', MAX_PORTFOLIO_DELTA)
+_validate_positive('MAX_PORTFOLIO_GAMMA', MAX_PORTFOLIO_GAMMA)
+if MAX_INTRADAY_DRAWDOWN >= 0:
+    _CONFIG_ERRORS.append(f"MAX_INTRADAY_DRAWDOWN={MAX_INTRADAY_DRAWDOWN} must be negative")
+
+# ── Report errors ─────────────────────────────────────────────────────────
+if _CONFIG_ERRORS:
+    import logging as _logging
+    _log = _logging.getLogger('config')
+    for err in _CONFIG_ERRORS:
+        _log.error("[CONFIG VALIDATION] %s", err)
+    # Fail-fast: raise on startup so bad config never reaches trading logic
+    raise ValueError(
+        f"Configuration validation failed ({len(_CONFIG_ERRORS)} error(s)):\n"
+        + "\n".join(f"  - {e}" for e in _CONFIG_ERRORS)
+    )

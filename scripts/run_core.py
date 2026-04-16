@@ -60,6 +60,7 @@ def main():
     log.info("=" * 60)
 
     # Initialize distributed registry (replaces in-memory singleton)
+    # V7: Core is the ONLY writer — satellites send layer tag in ORDER_REQ
     dist_registry = DistributedPositionRegistry(global_max=GLOBAL_MAX_POSITIONS)
     dist_registry.reset()  # Clean slate at session start
     log.info("Distributed position registry initialized (max=%d)", GLOBAL_MAX_POSITIONS)
@@ -105,7 +106,12 @@ def main():
              100000, 5.0, 1.0)
     portfolio_risk.reset_day()
 
+    # ── V7: Centralized registry gate (acquires positions for all layers) ──
+    from monitor.registry_gate import RegistryGate
+    registry_gate = RegistryGate(bus=monitor._bus, registry=dist_registry)
+
     # ── Smart routing (multi-broker) ──────────────────────────────────────
+    # Note: SmartRouter created below; registry_gate wired after creation
     from config import BROKER_MODE
     if BROKER_MODE == 'smart':
         try:
@@ -171,6 +177,10 @@ def main():
     else:
         log.info("BROKER_MODE=%s — single broker mode", BROKER_MODE)
 
+    # V7: Wire RegistryGate to SmartRouter (if created)
+    if 'smart_router' in dir():
+        smart_router.set_registry_gate(registry_gate)
+
     # Hook: publish SIGNAL events to Redpanda for Options process
     def _on_signal_publish(event):
         if event.type == EventType.SIGNAL:
@@ -200,7 +210,13 @@ def main():
     monitor._bus.subscribe(EventType.FILL, _on_fill_publish, priority=10)
     monitor._bus.subscribe(EventType.POSITION, _on_fill_publish, priority=10)
 
-    # Consumer: ORDER_REQ from satellite processes
+    # V7 P2-1: IPC inbox queue — consumer thread enqueues, main loop drains.
+    # Prevents cross-thread emit() races between IPC consumer and main loop.
+    # Consumer daemon thread puts ORDER_REQ payloads into _ipc_inbox.
+    # Main loop calls _drain_ipc_inbox() each tick to emit on the main thread.
+    import queue as _queue
+    _ipc_inbox = _queue.Queue(maxsize=500)
+
     consumer = EventConsumer(
         group_id='core-order-consumer',
         topics=[TOPIC_ORDERS],
@@ -208,28 +224,57 @@ def main():
     )
 
     def _on_remote_order(key, payload):
-        """Receive ORDER_REQ from satellite processes and route to broker."""
-        log.info("[IPC] Received ORDER_REQ from satellite: %s %s",
-                 payload.get('ticker', '?'), payload.get('side', '?'))
-        # Inject into local EventBus as an ORDER_REQ event
-        from monitor.events import OrderRequestPayload
+        """Receive ORDER_REQ from satellite — enqueue for main-thread processing.
+
+        V7 P2-1: Does NOT call bus.emit() directly (wrong thread).
+        Puts payload into inbox queue. Main loop drains it.
+        """
         try:
-            order_payload = OrderRequestPayload(
-                ticker=payload['ticker'],
-                side=payload['side'],
-                qty=int(payload['qty']),
-                price=float(payload['price']),
-                reason=payload.get('reason', 'remote'),
-                stop_price=float(payload.get('stop_price', 0)),
-                target_price=float(payload.get('target_price', 0)),
-            )
-            monitor._bus.emit(Event(type=EventType.ORDER_REQ, payload=order_payload))
-        except Exception as exc:
-            log.warning("[IPC] Failed to process remote ORDER_REQ: %s", exc)
+            _ipc_inbox.put_nowait(payload)
+            log.debug("[IPC] Enqueued ORDER_REQ: %s %s",
+                      payload.get('ticker', '?'), payload.get('side', '?'))
+        except _queue.Full:
+            log.error("[IPC] Inbox FULL — dropping ORDER_REQ for %s",
+                      payload.get('ticker', '?'))
+
+    def _drain_ipc_inbox():
+        """Drain all queued IPC ORDER_REQs onto the EventBus (main thread).
+
+        Called from the main loop each tick cycle. Single-threaded emit()
+        ensures correct ordering with local BAR → SIGNAL → ORDER_REQ chain.
+        """
+        drained = 0
+        while not _ipc_inbox.empty():
+            try:
+                payload = _ipc_inbox.get_nowait()
+            except _queue.Empty:
+                break
+            try:
+                from monitor.events import OrderRequestPayload
+                order_payload = OrderRequestPayload(
+                    ticker=payload['ticker'],
+                    side=payload['side'],
+                    qty=int(payload['qty']),
+                    price=float(payload['price']),
+                    reason=payload.get('reason', 'remote'),
+                    stop_price=float(payload.get('stop_price', 0)),
+                    target_price=float(payload.get('target_price', 0)),
+                    layer=payload.get('layer', payload.get('source')),
+                )
+                # V7 P3-1: Propagate correlation_id from IPC envelope
+                ipc_corr = payload.get('_ipc_correlation_id', '')
+                monitor._bus.emit(Event(
+                    type=EventType.ORDER_REQ, payload=order_payload,
+                    correlation_id=ipc_corr or None))
+                drained += 1
+            except Exception as exc:
+                log.warning("[IPC] Failed to process remote ORDER_REQ: %s", exc)
+        if drained:
+            log.info("[IPC] Drained %d ORDER_REQ(s) from inbox", drained)
 
     consumer.on(TOPIC_ORDERS, _on_remote_order)
     consumer.start()
-    log.info("IPC consumer started (listening for satellite ORDER_REQ)")
+    log.info("IPC consumer started (inbox queue mode — main-thread drain)")
 
     # Start monitor
     monitor.start()
@@ -247,6 +292,11 @@ def main():
             if now.hour >= 16:
                 log.info("4:00 PM ET reached — stopping core process.")
                 break
+
+            # V7 P2-1: Drain IPC inbox on main thread BEFORE cache update.
+            # This ensures satellite ORDER_REQs are processed in the same
+            # thread as local BAR → SIGNAL → ORDER_REQ, preventing races.
+            _drain_ipc_inbox()
 
             # Update shared cache after each cycle
             if hasattr(monitor, '_bars_cache') and monitor._bars_cache:

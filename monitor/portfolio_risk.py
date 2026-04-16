@@ -59,10 +59,12 @@ class PortfolioRiskGate:
         self._halted = False
         self._block_count = 0
 
-        # Subscribe at priority 0 (before brokers at priority 1)
-        bus.subscribe(EventType.ORDER_REQ, self._on_order_req, priority=0)
-        bus.subscribe(EventType.FILL, self._on_fill, priority=0)
-        bus.subscribe(EventType.POSITION, self._on_position, priority=0)
+        # V7: priority=3 — gates that BLOCK must run BEFORE components that EXECUTE.
+        # EventBus SYNC dispatch: higher priority number = runs first.
+        # Chain: PortfolioRiskGate(3) → RegistryGate(2) → SmartRouter(1) → Broker(default)
+        bus.subscribe(EventType.ORDER_REQ, self._on_order_req, priority=3)
+        bus.subscribe(EventType.FILL, self._on_fill, priority=3)
+        bus.subscribe(EventType.POSITION, self._on_position, priority=3)
 
         log.info(
             "[PortfolioRisk] ready | max_drawdown=$%.0f | max_notional=$%.0f | "
@@ -116,8 +118,24 @@ class PortfolioRiskGate:
             return
 
         # ── Check 3: Pre-trade margin check ────────────────────────────
+        # V7 P1-9: Fail-closed — if buying power is unavailable, BLOCK the order.
+        # V6 silently skipped this check when all account queries timed out.
         buying_power = self._get_buying_power()
-        if buying_power is not None and order_notional > buying_power:
+        if buying_power is None:
+            log.error("[PortfolioRisk] Buying power UNAVAILABLE — "
+                      "blocking order (fail-closed)")
+            try:
+                from monitor.alerts import send_alert
+                send_alert(None,
+                           f"BUYING POWER UNAVAILABLE: blocked {ticker} "
+                           f"${order_notional:,.0f} order. All account queries failed.",
+                           severity='CRITICAL')
+            except Exception:
+                pass
+            self._block(ticker, event,
+                        "buying power unavailable — all account queries failed (fail-closed)")
+            return
+        if order_notional > buying_power:
             self._block(ticker, event,
                         f"order ${order_notional:,.0f} exceeds buying power ${buying_power:,.0f}")
             return

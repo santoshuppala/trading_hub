@@ -383,6 +383,8 @@ class OrderRequestPayload:
     stop_price:        Optional[float] = None
     target_price:      Optional[float] = None
     atr_value:         Optional[float] = None
+    # V7: Layer tag for centralized registry — Core acquires on behalf of sender
+    layer:             Optional[str] = None  # 'vwap', 'pro', 'pop', 'options'
 
     def __post_init__(self):
         _require_ticker(self.ticker)

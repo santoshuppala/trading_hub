@@ -172,11 +172,13 @@ class PopExecutor:
         now    = time.monotonic()
 
         # ── Risk gate (protected by _lock) ───────────────────────────────────
-        # Cross-layer dedup: check global registry first
+        # V7: READ-ONLY pre-flight — satellite doesn't write to registry.
+        # Core's RegistryGate acquires when ORDER_REQ arrives.
         from monitor.position_registry import registry
-        if not registry.try_acquire(symbol, layer="pop"):
-            log.info("POP risk block %s: held by another strategy layer (%s)",
-                     symbol, registry.held_by(symbol))
+        holder = registry.held_by(symbol)
+        if holder and holder != 'pop':
+            log.info("POP risk block %s: held by layer '%s' (pre-flight)",
+                     symbol, holder)
             return
 
         _approved = False
@@ -218,8 +220,7 @@ class PopExecutor:
                 self._positions.add(symbol)
                 _approved = True
         finally:
-            if not _approved:
-                registry.release(symbol)
+            pass  # V7: No registry release — Core owns the lock
 
         # Emit ORDER_REQ on local bus → forwarded to Core via IPC (like Pro)
         # Core's SmartRouter handles broker execution, bracket orders, and exit monitoring.
@@ -245,11 +246,10 @@ class PopExecutor:
 
     def close_position(self, symbol: str, reason: str, current_price: float) -> None:
         """Mark a pop position as closed in local tracking.
-        Actual sell is handled by Core's SmartRouter (same execution path as Pro)."""
+        Actual sell is handled by Core's SmartRouter (same execution path as Pro).
+        V7: Registry release handled by Core's RegistryGate on POSITION CLOSED."""
         with self._lock:
             self._positions.discard(symbol)
-        from monitor.position_registry import registry
-        registry.release(symbol)
         log.info("POP position closed: %s @ $%.4f reason=%s", symbol, current_price, reason)
 
     # ── Private execution methods ──────────────────────────────────────────────

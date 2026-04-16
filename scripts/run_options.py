@@ -85,7 +85,7 @@ def main():
     # ── Lifecycle management ──────────────────────────────────────────
     from lifecycle import EngineLifecycle
     from lifecycle.adapters.options_adapter import OptionsLifecycleAdapter
-    from config import OPTIONS_MAX_DAILY_LOSS, ALERT_EMAIL
+    from config import OPTIONS_MAX_DAILY_LOSS
 
     lifecycle = EngineLifecycle(
         engine_name='options',

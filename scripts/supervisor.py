@@ -112,6 +112,7 @@ def _load_engine_config() -> dict:
     import json as _json
     processes = dict(_DEFAULT_PROCESSES)
 
+    _disabled = set()  # track explicitly disabled engines (don't auto-discover them)
     custom = os.getenv('ENGINE_CONFIG', '')
     if custom:
         try:
@@ -119,6 +120,7 @@ def _load_engine_config() -> dict:
             for name, cfg in overrides.items():
                 if cfg is None:
                     processes.pop(name, None)  # disable engine
+                    _disabled.add(name)
                     log.info("[supervisor] Engine '%s' disabled via ENGINE_CONFIG", name)
                 else:
                     if 'script' not in cfg:
@@ -131,11 +133,11 @@ def _load_engine_config() -> dict:
         except Exception as exc:
             log.warning("[supervisor] ENGINE_CONFIG parse failed: %s — using defaults", exc)
 
-    # V7: Auto-discover run_*.py scripts not in config
+    # V7: Auto-discover run_*.py scripts not in config (skip explicitly disabled)
     for f in sorted(os.listdir(SCRIPTS_DIR)):
         if f.startswith('run_') and f.endswith('.py') and f != 'run_monitor.py':
             engine_name = f[4:-3]  # run_arbitrage.py → arbitrage
-            if engine_name not in processes:
+            if engine_name not in processes and engine_name not in _disabled:
                 log.info("[supervisor] Auto-discovered engine '%s' from %s", engine_name, f)
                 processes[engine_name] = {
                     'script': os.path.join(SCRIPTS_DIR, f),
@@ -541,6 +543,28 @@ def main():
             managers[name].stop()
 
         write_status(managers)
+
+        # V7.1: Run post-session analytics (ML features, strategy scoring)
+        try:
+            import subprocess
+            analytics_script = os.path.join(SCRIPTS_DIR, 'post_session_analytics.py')
+            if os.path.exists(analytics_script):
+                log.info("Running post-session analytics...")
+                result = subprocess.run(
+                    [sys.executable, analytics_script],
+                    capture_output=True, text=True, timeout=300,  # 5 min timeout
+                    cwd=PROJECT_ROOT,
+                    env={**os.environ, 'PYTHONPATH': PROJECT_ROOT},
+                )
+                if result.returncode == 0:
+                    log.info("Post-session analytics completed successfully")
+                else:
+                    log.warning("Post-session analytics failed (exit %d): %s",
+                                result.returncode, result.stderr[:500])
+        except subprocess.TimeoutExpired:
+            log.warning("Post-session analytics timed out (5 min limit)")
+        except Exception as exc:
+            log.warning("Post-session analytics error: %s", exc)
 
         log.info("=" * 60)
         log.info("SUPERVISOR SHUTDOWN COMPLETE")

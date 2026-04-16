@@ -131,6 +131,18 @@ class RiskAdapter:
         # V7: No registry release needed — satellite doesn't own the lock
         _approved = False
         try:
+            # V7.1: Conviction boost from alt data (Finviz + SEC + Yahoo)
+            # Only boosts (0.0 to +0.3), never penalizes. Helps marginal setups pass.
+            try:
+                from data_sources.market_regime import conviction
+                boost = conviction.score(ticker)
+                if boost > 0:
+                    log.info("%s conviction boost: +%.2f (%s)",
+                             tag, boost, conviction.detail(ticker))
+                    confidence = min(1.0, confidence + boost)
+            except Exception:
+                pass
+
             # ── Check 1b: minimum confidence by tier ─────────────────────────────
             min_conf = _MIN_CONFIDENCE.get(tier, 0.50)
             if confidence < min_conf:
@@ -208,6 +220,15 @@ class RiskAdapter:
             qty_by_risk     = int(max_dollar_risk / risk)
             qty_by_budget   = int(self._trade_budget / entry_price)
             qty             = min(max(qty_by_risk, 1), max(qty_by_budget, 1))
+
+            # V7.1: Market regime sizing (F&G + VIX)
+            try:
+                from data_sources.market_regime import regime
+                mult = regime.position_size_multiplier()
+                if mult < 1.0:
+                    qty = max(1, int(qty * mult))
+            except Exception:
+                pass
 
             if qty <= 0:
                 log.warning("%s BLOCKED: qty=0 (budget=%.0f entry=%.4f)", tag, self._trade_budget, entry_price)

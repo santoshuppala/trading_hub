@@ -146,6 +146,27 @@ def main():
 
     bus.subscribe(EventType.ORDER_REQ, _forward_order, priority=0)
 
+    # V7.1: Subscribe to discovered tickers from DataCollector
+    from monitor.ipc import EventConsumer, TOPIC_DISCOVERY
+    _extra_tickers = set()  # dynamically discovered tickers
+
+    discovery_consumer = EventConsumer(
+        group_id='pop-discovery-consumer',
+        topics=[TOPIC_DISCOVERY],
+        source_name='pop',
+    )
+
+    def _on_discovery(key, payload):
+        ticker = payload.get('ticker', '')
+        if ticker and ticker not in TICKERS and ticker not in _extra_tickers:
+            _extra_tickers.add(ticker)
+            log.info("[Discovery] Added %s to Pop scan universe (total extras: %d)",
+                     ticker, len(_extra_tickers))
+
+    discovery_consumer.on(TOPIC_DISCOVERY, _on_discovery)
+    discovery_consumer.start()
+    log.info("Discovery consumer started (listening for new tickers)")
+
     log.info("Pop process running.")
     try:
         while True:
@@ -159,9 +180,12 @@ def main():
                 time.sleep(2)
                 continue
 
+            # V7.1: Scan both static TICKERS + dynamically discovered tickers
+            all_tickers = list(TICKERS) + [t for t in _extra_tickers if t not in TICKERS]
+
             import pandas as pd
             bar_events = []
-            for ticker in TICKERS:
+            for ticker in all_tickers:
                 if ticker not in bars_cache:
                     continue
                 df = bars_cache[ticker]

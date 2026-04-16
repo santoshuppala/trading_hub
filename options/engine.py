@@ -432,10 +432,25 @@ class OptionsEngine:
         from options.selector import (
             ATR_MOD_THRESHOLD, RSI_NEUTRAL_LOW, RSI_NEUTRAL_HIGH, IV_RANK_HIGH,
         )
+
+        # V7.1: Unusual options flow as an additional entry trigger.
+        # If smart money is active on this ticker, scan for options strategies
+        # even if technical thresholds don't meet the normal bar.
+        uof_active = False
+        uof_data = None
+        try:
+            from data_sources.alt_data_reader import alt_data
+            uof_data = alt_data.unusual_options_flow(p.ticker)
+            if uof_data and float(uof_data.get('confidence', 0)) > 0.3:
+                uof_active = True
+        except Exception:
+            pass
+
         might_trade = (
             atr_ratio > ATR_MOD_THRESHOLD                          # straddle/strangle
             or (RSI_NEUTRAL_LOW <= rsi_value <= RSI_NEUTRAL_HIGH)  # iron condor/butterfly
             or has_pos                                              # calendar spread
+            or uof_active                                           # V7.1: smart money detected
         )
         if not might_trade:
             return
@@ -458,6 +473,28 @@ class OptionsEngine:
             iv_rank=iv_rank,
             iv_history_days=iv_days,
         )
+
+        # V7.1: If no strategy from normal scan but unusual flow detected,
+        # select a directional strategy based on the flow direction.
+        if strategy_type is None and uof_active and uof_data:
+            uof_signal = uof_data.get('signal', '')
+            uof_conf = float(uof_data.get('confidence', 0))
+            iv_is_rich = iv_rank >= 50
+
+            if uof_signal == 'bullish' and uof_conf > 0.5:
+                # Smart money buying calls → follow with directional bullish
+                strategy_type = 'bull_call_spread' if iv_is_rich else 'long_call'
+                log.info("[OptionsEngine] UOF-triggered entry: %s %s "
+                         "(vol/oi=%.1fx, confidence=%.2f, IV_rank=%d)",
+                         p.ticker, strategy_type,
+                         uof_data.get('volume_oi_ratio', 0), uof_conf, iv_rank)
+            elif uof_signal == 'bearish' and uof_conf > 0.5:
+                # Smart money buying puts → follow with directional bearish
+                strategy_type = 'bear_put_spread' if iv_is_rich else 'long_put'
+                log.info("[OptionsEngine] UOF-triggered entry: %s %s "
+                         "(vol/oi=%.1fx, confidence=%.2f, IV_rank=%d)",
+                         p.ticker, strategy_type,
+                         uof_data.get('volume_oi_ratio', 0), uof_conf, iv_rank)
 
         if strategy_type is None:
             return
@@ -912,7 +949,11 @@ class OptionsEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _recalculate_portfolio_greeks(self) -> None:
-        """Recalculate aggregate portfolio Greeks from all open positions."""
+        """Recalculate aggregate portfolio Greeks from all open positions.
+
+        V7.1: Writes real Greeks to alt_data_cache.json so Core's
+        PortfolioRiskGate reads accurate data (not rough estimates).
+        """
         with self._portfolio_lock:
             self._portfolio_delta = 0.0
             self._portfolio_theta = 0.0
@@ -923,6 +964,24 @@ class OptionsEngine:
                     self._portfolio_delta += pos.portfolio_delta
                     self._portfolio_theta += pos.portfolio_theta
                     self._portfolio_vega  += pos.portfolio_vega
+
+        # V7.1: Write real Greeks to shared cache for PortfolioRiskGate
+        try:
+            from lifecycle.safe_state import SafeStateFile
+            import os
+            cache_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'data', 'options_greeks.json')
+            sf = SafeStateFile(cache_path, max_age_seconds=120.0)
+            sf.write({
+                'delta': round(self._portfolio_delta, 4),
+                'gamma': 0.0,  # gamma tracked per-position in _evaluate_greeks_exit
+                'theta': round(self._portfolio_theta, 4),
+                'vega': round(self._portfolio_vega, 4),
+                'positions': len(self._positions),
+            })
+        except Exception:
+            pass  # non-critical — Core falls back to API query
 
     @property
     def portfolio_greeks(self) -> Dict[str, float]:

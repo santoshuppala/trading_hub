@@ -75,19 +75,34 @@ class PortfolioRiskGate:
 
     def _on_order_req(self, event: Event) -> None:
         """Pre-trade risk check — block if portfolio limits breached."""
-        if self._halted:
-            self._block("HALTED", event, "portfolio risk halt active")
-            return
-
         p = event.payload
         ticker = p.ticker
         side = str(getattr(p, 'side', '')).upper()
         qty = getattr(p, 'qty', 0)
         price = float(getattr(p, 'price', 0))
 
-        # Sells always pass (reducing risk)
+        # Sells ALWAYS pass — exits must never be blocked, even during halt.
+        # Capital protection overrides all risk checks.
         if side == 'SELL':
             return
+
+        # BUY blocked if halted
+        if self._halted:
+            self._block("HALTED", event, "portfolio risk halt active")
+            return
+
+        # V7.1: Unified market regime — adjusts order notional based on F&G + VIX.
+        # Never halts — only reduces size. Kill switch handles true emergencies.
+        try:
+            from data_sources.market_regime import regime
+            size_mult = regime.position_size_multiplier()  # 0.5 to 1.0
+            if size_mult < 1.0:
+                qty = max(1, int(qty * size_mult))
+                price = price  # price unchanged, qty reduced
+                log.info("[PortfolioRisk] Market regime: %s → qty adjusted to %d",
+                         regime.summary(), qty)
+        except Exception:
+            pass  # alt data unavailable — full size
 
         # ── Check 1: Intraday drawdown ─────────────────────────────────
         total_pnl = self._get_total_pnl()
@@ -264,15 +279,62 @@ class PortfolioRiskGate:
         return total_bp if found_any else None
 
     def _get_portfolio_greeks(self) -> tuple:
-        """Get aggregate portfolio delta and gamma from options positions."""
+        """Get aggregate portfolio delta and gamma from options positions.
+
+        V7.1: Reads REAL Greeks from options_greeks.json (written by Options engine
+        after every entry/exit via _recalculate_portfolio_greeks).
+        Falls back to (0, 0) if unavailable — never blocks on missing data.
+        """
+        # Try 1: Read real Greeks from Options engine's shared file (ACCURATE)
         try:
-            from options.portfolio_greeks import PortfolioGreeksTracker
-            # Try to get the last snapshot
-            tracker = PortfolioGreeksTracker()
-            snap = tracker.snapshot()
-            return snap.get('total_delta', 0), snap.get('total_gamma', 0)
+            from lifecycle.safe_state import SafeStateFile
+            greeks_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'data', 'options_greeks.json')
+            sf = SafeStateFile(greeks_path, max_age_seconds=120.0)
+            data, fresh = sf.read()
+            if data and fresh:
+                delta = float(data.get('delta', 0))
+                gamma = abs(float(data.get('gamma', 0)))
+                if delta != 0 or gamma != 0:
+                    log.debug("[PortfolioRisk] Options Greeks (real): delta=%.2f gamma=%.2f "
+                              "theta=%.2f positions=%d",
+                              delta, gamma,
+                              float(data.get('theta', 0)),
+                              int(data.get('positions', 0)))
+                    return delta, gamma
         except Exception:
-            return 0.0, 0.0
+            pass
+
+        # Try 2: Query Alpaca options positions API (rough fallback)
+        try:
+            import requests
+            options_key = os.getenv('APCA_OPTIONS_KEY', '')
+            options_secret = os.getenv('APCA_OPTIONS_SECRET', '')
+            base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
+
+            if options_key and options_secret:
+                r = requests.get(
+                    f'{base}/v2/positions',
+                    headers={'APCA-API-KEY-ID': options_key,
+                             'APCA-API-SECRET-KEY': options_secret},
+                    timeout=3)
+                if r.status_code == 200:
+                    positions = r.json()
+                    total_delta = 0.0
+                    for pos in positions:
+                        if pos.get('asset_class') == 'us_option':
+                            qty = float(pos.get('qty', 0))
+                            if qty != 0:
+                                total_delta += qty * 0.5  # rough estimate
+                    if total_delta != 0:
+                        log.debug("[PortfolioRisk] Options Greeks (estimated): delta=%.2f",
+                                  total_delta)
+                        return total_delta, 0.0
+        except Exception:
+            pass
+
+        return 0.0, 0.0
 
     def _block(self, ticker: str, event: Event, reason: str) -> None:
         """Block an order and emit RISK_BLOCK event."""

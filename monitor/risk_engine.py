@@ -220,6 +220,18 @@ class RiskEngine:
                          ticker, qty, sizing.adjusted_qty, sizing.adjustment_reason)
                 qty = sizing.adjusted_qty
 
+            # V7.1: Market regime position sizing (F&G + VIX)
+            try:
+                from data_sources.market_regime import regime
+                mult = regime.position_size_multiplier()
+                if mult < 1.0:
+                    old_qty = qty
+                    qty = max(1, int(qty * mult))
+                    log.info("[RiskEngine] Regime sizing %s: %d → %d (%s)",
+                             ticker, old_qty, qty, regime.summary())
+            except Exception:
+                pass
+
             log.info(
                 f"[RiskEngine] BUY approved: {ticker} "
                 f"qty={qty} ask=${ask_price:.2f} entry=${effective_entry:.2f} "

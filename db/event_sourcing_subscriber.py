@@ -67,6 +67,20 @@ def _ensure_aware(dt):
     return dt.replace(tzinfo=timezone.utc)
 
 
+def _to_uuid(val):
+    """Convert string to UUID object for asyncpg parameterized queries.
+    Returns None if conversion fails (asyncpg rejects str for uuid columns)."""
+    if val is None or val == '':
+        return None
+    try:
+        import uuid
+        if isinstance(val, uuid.UUID):
+            return val
+        return uuid.UUID(str(val))
+    except (ValueError, AttributeError):
+        return None
+
+
 class EventSourcingSubscriber:
     """
     Wires all EventBus subscriptions to the event store.
@@ -251,7 +265,7 @@ class EventSourcingSubscriber:
 
             # Projection: signal_events
             self._writer.enqueue('signal_events', {
-                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ts': _ensure_aware(event.timestamp),
                 'ticker': p.ticker, 'action': p.action.value,
                 'current_price': float(p.current_price),
                 'ask_price': _safe_float(p.ask_price) or 0,
@@ -262,9 +276,9 @@ class EventSourcingSubscriber:
                 'stop_price': _safe_float(p.stop_price) or 0,
                 'target_price': _safe_float(p.target_price) or 0,
                 'half_target': _safe_float(p.half_target) or 0,
-                'event_id': str(event.event_id),
-                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at': _NOW().isoformat(),
+                'event_id': _to_uuid(event.event_id),
+                'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at': _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_signal error: %s", exc)
@@ -298,16 +312,16 @@ class EventSourcingSubscriber:
 
             # Projection: order_req_events
             self._writer.enqueue('order_req_events', {
-                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ts': _ensure_aware(event.timestamp),
                 'ticker': p.ticker, 'side': p.side.value,
                 'qty': int(p.qty), 'price': float(p.price),
                 'reason': p.reason,
                 'stop_price': _safe_float(p.stop_price) or 0,
                 'target_price': _safe_float(p.target_price) or 0,
                 'atr_value': _safe_float(p.atr_value) or 0,
-                'event_id': str(event.event_id),
-                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at': _NOW().isoformat(),
+                'event_id': _to_uuid(event.event_id),
+                'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at': _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_order_req error: %s", exc)
@@ -342,16 +356,16 @@ class EventSourcingSubscriber:
 
             # Projection: fill_events
             self._writer.enqueue('fill_events', {
-                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ts': _ensure_aware(event.timestamp),
                 'ticker': p.ticker, 'side': p.side.value,
                 'qty': int(p.qty), 'fill_price': float(p.fill_price),
                 'order_id': p.order_id, 'reason': p.reason,
                 'stop_price': _safe_float(p.stop_price) or 0,
                 'target_price': _safe_float(p.target_price) or 0,
                 'atr_value': _safe_float(p.atr_value) or 0,
-                'event_id': str(event.event_id),
-                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at': _NOW().isoformat(),
+                'event_id': _to_uuid(event.event_id),
+                'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at': _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_fill error: %s", exc)
@@ -403,7 +417,7 @@ class EventSourcingSubscriber:
 
             # Projection: position_events
             self._writer.enqueue('position_events', {
-                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ts': _ensure_aware(event.timestamp),
                 'ticker': p.ticker, 'action': p.action,
                 'qty': payload.get('qty') or 0,
                 'entry_price': payload.get('entry_price') or 0,
@@ -412,9 +426,9 @@ class EventSourcingSubscriber:
                 'target_price': payload.get('target_price') or 0,
                 'unrealised_pnl': 0,
                 'realised_pnl': payload.get('pnl') or 0,
-                'event_id': str(event.event_id),
-                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at': _NOW().isoformat(),
+                'event_id': _to_uuid(event.event_id),
+                'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at': _NOW(),
             })
 
             # ── Inline projection: write to completed_trades ────────────
@@ -492,13 +506,13 @@ class EventSourcingSubscriber:
 
             # Projection: risk_block_events
             self._writer.enqueue('risk_block_events', {
-                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ts': _ensure_aware(event.timestamp),
                 'ticker': p.ticker,
                 'reason': p.reason,
                 'signal_action': p.signal_action.value,
-                'event_id': str(event.event_id),
-                'correlation_id': str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at': _NOW().isoformat(),
+                'event_id': _to_uuid(event.event_id),
+                'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at': _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_risk_block error: %s", exc)
@@ -537,7 +551,7 @@ class EventSourcingSubscriber:
 
             # Inline projection: write to pop_signal_events
             self._writer.enqueue('pop_signal_events', {
-                'ts':                    event.timestamp.isoformat(),
+                'ts':                    _ensure_aware(event.timestamp),
                 'symbol':                p.symbol,
                 'strategy_type':         p.strategy_type,
                 'entry_price':           float(p.entry_price),
@@ -550,9 +564,9 @@ class EventSourcingSubscriber:
                 'vwap_distance':         _safe_float(p.vwap_distance) or 0,
                 'strategy_confidence':   _safe_float(p.strategy_confidence) or 0,
                 'features_json':         json.dumps(features) if features else '{}',
-                'event_id':              str(event.event_id),
-                'correlation_id':        str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at':           _NOW().isoformat(),
+                'event_id':              _to_uuid(event.event_id),
+                'correlation_id':        _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at':           _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_pop_signal error: %s", exc)
@@ -596,7 +610,7 @@ class EventSourcingSubscriber:
 
             # Inline projection: write to pro_strategy_signal_events
             self._writer.enqueue('pro_strategy_signal_events', {
-                'ts':                _ensure_aware(event.timestamp).isoformat(),
+                'ts':                _ensure_aware(event.timestamp),
                 'ticker':            p.ticker,
                 'strategy_name':     p.strategy_name,
                 'tier':              int(p.tier),
@@ -611,9 +625,9 @@ class EventSourcingSubscriber:
                 'vwap':              _safe_float(p.vwap) or 0,
                 'confidence':        _safe_float(p.confidence) or 0,
                 'detector_signals':  json.dumps(det),
-                'event_id':          str(event.event_id),
-                'correlation_id':    str(getattr(event, 'correlation_id', '') or ''),
-                'ingested_at':       _NOW().isoformat(),
+                'event_id':          _to_uuid(event.event_id),
+                'correlation_id':    _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at':       _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_pro_strategy_signal error: %s", exc)
@@ -641,11 +655,11 @@ class EventSourcingSubscriber:
 
             # Projection: heartbeat_events
             self._writer.enqueue('heartbeat_events', {
-                'ts': _ensure_aware(event.timestamp).isoformat(),
+                'ts': _ensure_aware(event.timestamp),
                 'open_positions': int(payload.get('open_positions') or 0),
                 'scan_count': int(payload.get('scan_count') or 0),
-                'event_id': str(event.event_id),
-                'ingested_at': _NOW().isoformat(),
+                'event_id': _to_uuid(event.event_id),
+                'ingested_at': _NOW(),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_heartbeat error: %s", exc)

@@ -172,6 +172,9 @@ class DataSourceCollector:
         for ticker in batch:
             self._collect_finviz_screener(ticker)
 
+        # V7.1: Alpha Vantage technical indicators (25 req/day — very selective)
+        self._collect_alpha_vantage(tickers)
+
     def collect_session_end(self, tickers: list, max_tickers: int = 30):
         """Collect at session end. Final snapshot for the day."""
         log.info("[Collector] Session end collection")
@@ -363,6 +366,36 @@ class DataSourceCollector:
         except Exception as exc:
             self._record_source_failure('polygon_prev')
             log.debug("[Collector] Polygon %s: %s", ticker, exc)
+
+    def _collect_alpha_vantage(self, tickers: list):
+        """V7.1: Collect Alpha Vantage technical indicators.
+
+        25 req/day free tier — only fetch for top 5 most active tickers per cycle.
+        Provides SMA, EMA, RSI as cross-validation for our internal calculations.
+        """
+        if not self._is_source_healthy('alpha_vantage'):
+            return
+        source = self._sources.get('alpha_vantage')
+        if not source:
+            return
+        try:
+            for ticker in tickers[:5]:  # max 5 per cycle (25/day ÷ ~5 cycles)
+                try:
+                    tech = source.technical_snapshot(ticker)
+                    if tech:
+                        from dataclasses import asdict
+                        data = asdict(tech) if hasattr(tech, '__dataclass_fields__') else (
+                            tech if isinstance(tech, dict) else {'raw': str(tech)})
+                        self._persistence.persist_if_changed(
+                            'alpha_vantage', ticker, data,
+                            lambda old, new: (True, 'updated'),
+                        )
+                except Exception:
+                    pass
+            self._record_source_success('alpha_vantage')
+        except Exception as exc:
+            self._record_source_failure('alpha_vantage')
+            log.debug("[Collector] Alpha Vantage failed: %s", exc)
 
     # -- Direct DB writer ------------------------------------------------------
 

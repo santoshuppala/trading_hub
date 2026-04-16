@@ -25,6 +25,7 @@ TOPIC_SIGNALS    = 'th-signals'      # Core VWAP → Options: SIGNAL events
 TOPIC_POP        = 'th-pop-signals'  # Pop → Options: POP_SIGNAL
 TOPIC_BAR_READY  = 'th-bar-ready'    # Core → All: "new bars available" notification
 TOPIC_REGISTRY   = 'th-registry'     # All: position registry acquire/release
+TOPIC_DISCOVERY  = 'th-discovery'    # V7.1: DataCollector → All: discovered tickers
 
 DEFAULT_BROKERS = os.getenv('REDPANDA_BROKERS', '127.0.0.1:9092')
 

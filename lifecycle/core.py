@@ -177,17 +177,33 @@ class EngineLifecycle:
         # 1. Final state save
         self._state.save(self._adapter.get_state())
 
-        # 2. Close all positions (options must be closed at EOD)
-        positions = self._adapter.get_positions()
-        if positions:
-            log.info("[%s] Closing %d open positions at shutdown",
-                     self._name, len(positions))
-            self._adapter.force_close_all('eod_shutdown')
+        # 2. Close all positions ONLY at EOD (4:00 PM ET), NOT on mid-session restart.
+        # A supervisor restart should preserve positions — broker-side stops protect them.
+        # Force-close only if we're past market close.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo('America/New_York'))
+        is_eod = now_et.hour >= 16 or (now_et.hour == 15 and now_et.minute >= 50)
 
-        # 3. EOD report
-        self._eod.generate()
+        if is_eod:
+            positions = self._adapter.get_positions()
+            if positions:
+                log.info("[%s] EOD: Closing %d open positions",
+                         self._name, len(positions))
+                self._adapter.force_close_all('eod_shutdown')
+        else:
+            positions = self._adapter.get_positions()
+            if positions:
+                log.info("[%s] Mid-session shutdown: PRESERVING %d open positions "
+                         "(broker stops protect them)", self._name, len(positions))
 
-        # 4. Final state save (after closes)
+        # 3. EOD report (generate regardless — useful for partial-day analysis)
+        try:
+            self._eod.generate()
+        except Exception:
+            pass
+
+        # 4. Final state save (after any closes)
         self._state.save(self._adapter.get_state())
 
         log.info("[%s] Lifecycle shutdown complete", self._name)

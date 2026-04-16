@@ -233,21 +233,29 @@ class ProcessManager:
                     pass
 
             # V7 P3-2: Check heartbeat file for hung process detection.
-            # Only check for 'core' process (has HeartbeatEmitter).
+            # Only check during market hours (9:30-16:00 ET).
+            # Pre-market: Core sleeps for 30+ min waiting for open — no heartbeats
+            # emitted during sleep. This is intentional, not a hang.
             if self.name == 'core':
                 try:
-                    hb_path = os.path.join(PROJECT_ROOT, 'data', 'heartbeat.json')
-                    if os.path.exists(hb_path):
-                        import time as _time
-                        hb_age = _time.time() - os.path.getmtime(hb_path)
-                        if hb_age > self._HEARTBEAT_STALE_SEC:
-                            log.error(
-                                "[%s] HUNG: heartbeat stale for %.0fs "
-                                "(threshold %.0fs) — PID alive but not responding",
-                                self.name, hb_age, self._HEARTBEAT_STALE_SEC)
-                            self.status = 'hung'
-                            self.last_error = f"Heartbeat stale {hb_age:.0f}s"
-                            return 'hung'
+                    now_et = datetime.now(ET)
+                    market_open = (now_et.hour > 9 or
+                                   (now_et.hour == 9 and now_et.minute >= 30))
+                    market_closed = now_et.hour >= 16
+
+                    if market_open and not market_closed:
+                        hb_path = os.path.join(PROJECT_ROOT, 'data', 'heartbeat.json')
+                        if os.path.exists(hb_path):
+                            import time as _time
+                            hb_age = _time.time() - os.path.getmtime(hb_path)
+                            if hb_age > self._HEARTBEAT_STALE_SEC:
+                                log.error(
+                                    "[%s] HUNG: heartbeat stale for %.0fs "
+                                    "(threshold %.0fs) — PID alive but not responding",
+                                    self.name, hb_age, self._HEARTBEAT_STALE_SEC)
+                                self.status = 'hung'
+                                self.last_error = f"Heartbeat stale {hb_age:.0f}s"
+                                return 'hung'
                 except Exception:
                     pass
 
@@ -419,7 +427,10 @@ def send_alert(subject: str, body: str):
     try:
         sys.path.insert(0, PROJECT_ROOT)
         from monitor.alerts import send_alert as _send
-        _send(subject, body, severity='CRITICAL')
+        from config import ALERT_EMAIL
+        # monitor.alerts.send_alert(alert_email, message, severity)
+        message = f"{subject}\n\n{body}" if body else subject
+        _send(ALERT_EMAIL, message, severity='CRITICAL')
     except Exception:
         pass
 

@@ -162,10 +162,17 @@ class PositionManager:
         }
         self._positions[ticker] = pos
 
+        # Extract engine/strategy/broker for rich alerts
+        _broker = getattr(parent, '_routed_broker', 'unknown') if parent else 'unknown'
+        _engine = strategy.split(':')[0] if ':' in strategy else 'core'
+        _strat = strategy.split(':')[1] if ':' in strategy else strategy
+
         send_alert(
             self._alert_email,
-            f"POSITION opened: {ticker} {qty} shares @ ${fill_price:.2f} "
-            f"(order {p.order_id}) reason={p.reason}"
+            f"POSITION OPENED: {ticker} {qty} shares @ ${fill_price:.2f}\n"
+            f"  Engine: {_engine.upper()} | Strategy: {_strat} | Broker: {_broker}\n"
+            f"  Stop: ${pos['stop_price']:.2f} | Target: ${pos['target_price']:.2f}\n"
+            f"  Order: {p.order_id} | Reason: {p.reason}"
         )
         log.info(
             f"[PositionManager] Opened {ticker}: qty={qty} entry=${fill_price:.2f} "
@@ -214,6 +221,7 @@ class PositionManager:
 
         pos = self._positions[ticker]
         entry_price = pos['entry_price']
+        pos_strategy = pos.get('strategy', 'unknown')
         pnl         = round((fill_price - entry_price) * qty, 2)
 
         trade = {
@@ -237,11 +245,15 @@ class PositionManager:
             pos['stop_price']   = max(pos.get('stop_price', 0), entry_price)
 
             self._trade_log.append(trade)
+            _broker = getattr(parent, '_routed_broker', 'unknown') if parent else 'unknown'
+            _strategy = pos.get('strategy', 'unknown')
+            _engine = _strategy.split(':')[0] if ':' in _strategy else 'core'
+
             send_alert(
                 self._alert_email,
-                f"POSITION partial exit: {ticker} sold {qty} @ ${fill_price:.2f} "
-                f"PnL ${pnl:+.2f} | holding {remaining} shares | "
-                f"stop moved to breakeven ${entry_price:.2f}"
+                f"PARTIAL EXIT: {ticker} sold {qty} @ ${fill_price:.2f} PnL ${pnl:+.2f}\n"
+                f"  Engine: {_engine.upper()} | Strategy: {_strategy} | Broker: {_broker}\n"
+                f"  Remaining: {remaining} shares | Stop: breakeven ${entry_price:.2f}"
             )
             log.info(
                 f"[PositionManager] Partial exit {ticker}: sold {qty}, "
@@ -282,10 +294,17 @@ class PositionManager:
         # (centralized — only Core writes to registry)
 
         self._trade_log.append(trade)
+        _broker = getattr(parent, '_routed_broker', 'unknown') if parent else 'unknown'
+        _strategy = trade.get('strategy', pos_strategy) if 'strategy' in trade else pos_strategy
+        _engine = _strategy.split(':')[0] if ':' in _strategy else 'core'
+        _win = 'WIN' if pnl >= 0 else 'LOSS'
+
         send_alert(
             self._alert_email,
-            f"POSITION closed ({reason}): {ticker} {qty} shares @ ${fill_price:.2f} "
-            f"PnL ${pnl:+.2f}"
+            f"POSITION CLOSED ({_win}): {ticker} {qty} shares @ ${fill_price:.2f}\n"
+            f"  Engine: {_engine.upper()} | Strategy: {_strategy} | Broker: {_broker}\n"
+            f"  Entry: ${entry_price:.2f} → Exit: ${fill_price:.2f} | PnL: ${pnl:+.2f}\n"
+            f"  Reason: {reason}"
         )
         log.info(
             f"[PositionManager] Closed {ticker}: qty={qty} exit=${fill_price:.2f} "

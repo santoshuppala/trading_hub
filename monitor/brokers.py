@@ -232,10 +232,19 @@ class AlpacaBroker(BaseBroker):
                 # Wait 1s for Alpaca to fully settle the buy order.
                 time.sleep(1.0)
 
+                # Extract engine/strategy from reason for rich alerts
+                _reason = getattr(p, 'reason', '') or ''
+                _engine = _reason.split(':')[0] if ':' in _reason else 'core'
+                _strat = _reason.split(':')[1] if ':' in _reason and len(_reason.split(':')) > 1 else _reason
+
                 send_alert(
                     self._alert_email,
-                    f"BUY filled: {filled_qty} {p.ticker} avg ${avg_price:.2f} "
-                    f"(limit ${limit_price:.2f}, attempt {attempt})",
+                    f"BUY FILLED: {filled_qty} {p.ticker} @ ${avg_price:.2f}\n"
+                    f"  Engine: {_engine.upper()} | Strategy: {_strat} | Broker: {self._broker_name}\n"
+                    f"  Limit: ${limit_price:.2f} | Attempt: {attempt}/{self.MAX_RETRIES}\n"
+                    f"  Stop: ${p.stop_price:.2f} | Target: ${p.target_price:.2f}" if p.stop_price else
+                    f"BUY FILLED: {filled_qty} {p.ticker} @ ${avg_price:.2f} | "
+                    f"Engine: {_engine.upper()} | Strategy: {_strat} | Broker: {self._broker_name}",
                 )
 
                 # Bracket order: if partial fill, cancel bracket children and resubmit
@@ -436,9 +445,11 @@ class AlpacaBroker(BaseBroker):
                     break
 
             if filled:
+                _reason = getattr(p, 'reason', '') or ''
                 send_alert(
                     self._alert_email,
-                    f"SELL {filled_qty} {p.ticker} at market (order {order_id})",
+                    f"SELL FILLED: {filled_qty} {p.ticker} @ ${fill_price:.2f} | "
+                    f"Broker: {self._broker_name} | Reason: {_reason}",
                 )
                 self._emit_fill(FillPayload(
                     ticker=p.ticker, side='SELL', qty=filled_qty,

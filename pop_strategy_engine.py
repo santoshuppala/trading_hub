@@ -16,7 +16,7 @@ Position in the 10-layer pipeline
 Execution account separation
 ------------------------------
   Main VWAP strategy  → APCA_API_KEY_ID / APCA_API_SECRET_KEY  (existing broker)
-  Pop strategies      → APCA_POPUP_KEY  / APCA_PUPUP_SECRET_KEY (PopExecutor)
+  Pop strategies      → APCA_POPUP_KEY  / APCA_POPUP_SECRET_KEY (PopExecutor)
 
 The pop strategy engine has its own Alpaca TradingClient so its trades never
 touch the main strategy's account capital, margin, or position count.
@@ -27,7 +27,7 @@ touch the main strategy's account capital, margin, or position count.
     - POP_ORDER_COOLDOWN  (default 300s) — per-ticker cooldown
     - Spread check using the pop account's quote (live ask price)
 
-  If APCA_POPUP_KEY / APCA_PUPUP_SECRET_KEY are absent or POP_PAPER_TRADING=true,
+  If APCA_POPUP_KEY / APCA_POPUP_SECRET_KEY are absent or POP_PAPER_TRADING=true,
   PopExecutor silently runs in paper mode (logs fills, no real orders).
 
 Design principles
@@ -49,14 +49,14 @@ How to integrate into the main monitor loop
     # In run_monitor.py, after building the EventBus — add one block:
     from pop_strategy_engine import PopStrategyEngine
     from config import (
-        ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
+        ALPACA_POPUP_KEY, ALPACA_POPUP_SECRET_KEY,
         POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
     )
 
     pop_engine = PopStrategyEngine(
         bus=bus,
         pop_alpaca_key=ALPACA_POPUP_KEY,
-        pop_alpaca_secret=ALPACA_PUPUP_SECRET_KEY,
+        pop_alpaca_secret=ALPACA_POPUP_SECRET_KEY,
         pop_paper=POP_PAPER_TRADING,
         pop_max_positions=POP_MAX_POSITIONS,
         pop_trade_budget=POP_TRADE_BUDGET,
@@ -414,7 +414,7 @@ class PopStrategyEngine:
     ----------
     bus                 : EventBus (shared with the rest of the pipeline)
     pop_alpaca_key      : APCA_POPUP_KEY — pop-account API key ID
-    pop_alpaca_secret   : APCA_PUPUP_SECRET_KEY — pop-account secret key
+    pop_alpaca_secret   : APCA_POPUP_SECRET_KEY — pop-account secret key
     pop_paper           : if True (or keys absent), run in paper mode
     pop_max_positions   : max concurrent pop positions (default 3)
     pop_trade_budget    : dollars per pop trade (default $500)
@@ -503,7 +503,7 @@ class PopStrategyEngine:
         else:
             if not pop_paper:
                 log.warning(
-                    "PopStrategyEngine: APCA_POPUP_KEY or APCA_PUPUP_SECRET_KEY "
+                    "PopStrategyEngine: APCA_POPUP_KEY or APCA_POPUP_SECRET_KEY "
                     "not set — running pop orders in paper mode"
                 )
             effective_paper = True

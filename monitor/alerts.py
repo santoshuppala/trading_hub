@@ -96,10 +96,25 @@ def _alert_worker() -> None:
             _consecutive_failures += 1
             backoff_secs = min(2 ** _consecutive_failures, 16)
             _backoff_until = time.time() + backoff_secs
-            log.warning(
+            log.error(
                 f"Alert delivery failed — backoff {backoff_secs}s "
                 f"({_consecutive_failures} consecutive failures)"
             )
+            # V8: Stop hammering SMTP after 10 failures (Yahoo rate-limits us)
+            if _consecutive_failures >= 10:
+                log.critical(
+                    "Alert delivery permanently disabled after %d consecutive failures. "
+                    "Fix SMTP config and restart.", _consecutive_failures)
+                # Drain queue to log only
+                while not _alert_queue.empty():
+                    try:
+                        item = _alert_queue.get_nowait()
+                        if item:
+                            log.info("ALERT (email disabled): %s", item[1][:200])
+                        _alert_queue.task_done()
+                    except Exception:
+                        break
+                return  # stop worker thread
         else:
             _consecutive_failures = 0
             _backoff_until = 0.0
@@ -248,6 +263,21 @@ def _deliver_with_connection(server, alert_email: str, message: str) -> bool:
     except Exception as e:
         log.error(f"Failed to send alert: {e}")
         return False
+
+
+def validate_smtp() -> bool:
+    """V8: Test SMTP credentials at startup. Returns True if working."""
+    server = _get_smtp_connection()
+    if server is None:
+        log.critical("SMTP validation FAILED — alerts will not be delivered! "
+                     "Check ALERT_EMAIL_USER / ALERT_EMAIL_PASS.")
+        return False
+    try:
+        server.quit()
+    except Exception:
+        pass
+    log.info("SMTP validation OK — alerts will be delivered")
+    return True
 
 
 def _deliver(alert_email: str, message: str) -> None:

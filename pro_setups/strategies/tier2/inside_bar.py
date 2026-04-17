@@ -22,7 +22,7 @@ from ...detectors._compute import compute_ema
 
 class InsideBar(BaseProStrategy):
     TIER:      int   = 2
-    SL_ATR:    float = 1.0
+    SL_ATR:    float = 1.5    # V8: widened from 1.0 (survives overnight gap)
     PARTIAL_R: float = 1.5
     FULL_R:    float = 3.0
 

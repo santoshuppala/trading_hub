@@ -22,7 +22,7 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
-    TICKERS, ALPACA_POPUP_KEY, ALPACA_PUPUP_SECRET_KEY,
+    TICKERS, ALPACA_POPUP_KEY, ALPACA_POPUP_SECRET_KEY,
     POP_PAPER_TRADING, POP_MAX_POSITIONS, POP_TRADE_BUDGET, POP_ORDER_COOLDOWN,
     ALERT_EMAIL, BENZINGA_API_KEY, STOCKTWITS_TOKEN, GLOBAL_MAX_POSITIONS,
 )
@@ -78,7 +78,7 @@ def main():
     pop_engine = PopStrategyEngine(
         bus=bus,
         pop_alpaca_key=ALPACA_POPUP_KEY,
-        pop_alpaca_secret=ALPACA_PUPUP_SECRET_KEY,
+        pop_alpaca_secret=ALPACA_POPUP_SECRET_KEY,
         pop_paper=POP_PAPER_TRADING,
         pop_max_positions=POP_MAX_POSITIONS,
         pop_trade_budget=float(POP_TRADE_BUDGET),

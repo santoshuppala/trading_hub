@@ -48,49 +48,88 @@ class AlpacaDataClient(BaseDataClient):
         return df
 
     def _fetch_minute_bars(self, tickers, start, end):
-        """Batch minute bars for multiple tickers → {ticker: DataFrame}."""
+        """Batch minute bars for multiple tickers → {ticker: DataFrame}.
+
+        V8: Splits into chunks of 200 symbols (Alpaca limit) and retries
+        each chunk up to 3 times with exponential backoff.
+        """
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=list(tickers),
-                timeframe=TimeFrame.Minute,
-                start=start,
-                end=end,
-                feed='iex',
-            )
-            result = self._client.get_stock_bars(req)
-            out = {}
-            for sym, bars in (result.data or {}).items():
-                df = self._bars_to_df(bars)
-                if not df.empty:
-                    out[sym] = df
-            return out
-        except Exception as e:
-            log.error(f"Alpaca minute bars error: {e}")
-            return {}
+        import time as _time
+
+        _CHUNK_SIZE = 200
+        ticker_list = list(tickers)
+        out = {}
+
+        for i in range(0, len(ticker_list), _CHUNK_SIZE):
+            chunk = ticker_list[i:i + _CHUNK_SIZE]
+            for attempt in range(3):
+                try:
+                    req = StockBarsRequest(
+                        symbol_or_symbols=chunk,
+                        timeframe=TimeFrame.Minute,
+                        start=start,
+                        end=end,
+                        feed='iex',
+                    )
+                    result = self._client.get_stock_bars(req)
+                    for sym, bars in (result.data or {}).items():
+                        df = self._bars_to_df(bars)
+                        if not df.empty:
+                            out[sym] = df
+                    break  # success
+                except Exception as e:
+                    if attempt < 2:
+                        wait = 2 ** attempt
+                        log.warning("Alpaca minute bars chunk %d/%d error (attempt %d/3): %s — retrying in %ds",
+                                    i // _CHUNK_SIZE + 1, (len(ticker_list) + _CHUNK_SIZE - 1) // _CHUNK_SIZE,
+                                    attempt + 1, e, wait)
+                        _time.sleep(wait)
+                    else:
+                        log.error("Alpaca minute bars chunk failed after 3 attempts: %s", e)
+
+        return out
 
     def _fetch_daily_bars_batch(self, tickers, start, end):
-        """Batch daily bars for multiple tickers → {ticker: DataFrame}."""
+        """Batch daily bars for multiple tickers → {ticker: DataFrame}.
+
+        V8: Splits into chunks of 200 symbols and retries each chunk
+        up to 3 times with exponential backoff.
+        """
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
-        try:
-            req = StockBarsRequest(
-                symbol_or_symbols=list(tickers),
-                timeframe=TimeFrame.Day,
-                start=start,
-                end=end,
-            )
-            result = self._client.get_stock_bars(req)
-            out = {}
-            for sym, bars in (result.data or {}).items():
-                df = self._bars_to_df(bars)
-                if not df.empty:
-                    out[sym] = df
-            return out
-        except Exception as e:
-            log.error(f"Alpaca daily bars error: {e}")
-            return {}
+        import time as _time
+
+        _CHUNK_SIZE = 200
+        ticker_list = list(tickers)
+        out = {}
+
+        for i in range(0, len(ticker_list), _CHUNK_SIZE):
+            chunk = ticker_list[i:i + _CHUNK_SIZE]
+            for attempt in range(3):
+                try:
+                    req = StockBarsRequest(
+                        symbol_or_symbols=chunk,
+                        timeframe=TimeFrame.Day,
+                        start=start,
+                        end=end,
+                    )
+                    result = self._client.get_stock_bars(req)
+                    for sym, bars in (result.data or {}).items():
+                        df = self._bars_to_df(bars)
+                        if not df.empty:
+                            out[sym] = df
+                    break  # success
+                except Exception as e:
+                    if attempt < 2:
+                        wait = 2 ** attempt
+                        log.warning("Alpaca daily bars chunk %d error (attempt %d/3): %s — retrying in %ds",
+                                    i // _CHUNK_SIZE + 1, attempt + 1, e, wait)
+                        _time.sleep(wait)
+                    else:
+                        log.error("Alpaca daily bars chunk failed after 3 attempts: %s", e)
+
+        return out
 
     # ------------------------------------------------------------------
     # BaseDataClient public interface

@@ -119,11 +119,21 @@ class StrategyEngine:
         if (hour, minute) >= _FORCE_CLOSE:
             if ticker in self._positions:
                 pos = self._positions[ticker]
-                # VWAP positions: full close (existing behavior)
-                if pos.get('strategy') == 'vwap_reclaim' or not pos.get('strategy'):
+                strategy = pos.get('strategy', 'vwap_reclaim') or 'vwap_reclaim'
+
+                # V8: Tier-based EOD behavior
+                # T1 + VWAP: full close (intraday only)
+                # T2/T3: partial sell (swing — hold overnight with reduced size)
+                tier = self._get_pro_tier(strategy)
+
+                if strategy == 'vwap_reclaim' or not strategy.startswith('pro:'):
+                    # VWAP + unknown: full close
                     self._emit_eod_close(ticker, df, event)
-                # Pro/Pop swing positions: reduce to half size for overnight gap protection
+                elif tier == 1:
+                    # Pro T1 (sr_flip, trend_pullback, vwap_reclaim): full close
+                    self._emit_eod_close(ticker, df, event)
                 elif not pos.get('partial_done') and pos.get('quantity', 0) >= 2:
+                    # Pro T2/T3: partial sell (half size for overnight)
                     self._emit_partial_sell(ticker, df, event)
             return  # no new entries after 15:00
 
@@ -146,6 +156,20 @@ class StrategyEngine:
     # ── Entry analysis ────────────────────────────────────────────────────────
 
     def _check_entry(self, ticker: str, df, rvol_df, parent: Event) -> None:
+        # V8: Sentiment-based priority — defer to Pro if sentiment present
+        # and Pro has enough bars to process (>= 52). Pro runs at priority=2
+        # (before VWAP at priority=0), so if Pro fires, RegistryGate blocks VWAP.
+        # This explicit deferral avoids VWAP consuming a ticker that Pro would
+        # handle better with sentiment boost.
+        if len(df) >= 52:  # Pro's MIN_BARS — only defer if Pro CAN run
+            try:
+                from data_sources.alt_data_reader import alt_data
+                sentiment = alt_data.news_sentiment(ticker)
+                if sentiment and abs(sentiment.get('sentiment_delta', 0)) > 0.3:
+                    return  # defer — Pro will handle with sentiment boost
+            except Exception:
+                pass  # alt data unavailable — VWAP proceeds normally
+
         result = self._analyzer.analyze(ticker, df, {ticker: rvol_df} if rvol_df is not None else {})
         if result is None:
             log.debug("[StrategyEngine] %s: analyze returned None (insufficient bars or data)", ticker)
@@ -272,13 +296,30 @@ class StrategyEngine:
                 rsi_value=rsi_value,
                 rvol=rvol,
                 vwap=result['vwap'],
-                stop_price=pos['stop_price'],
-                target_price=pos['target_price'],
-                half_target=pos['half_target'],
+                stop_price=pos.get('stop_price', current_price * 0.97),
+                target_price=pos.get('target_price', current_price * 1.05),
+                half_target=pos.get('half_target', current_price * 1.025),
                 reclaim_candle_low=result['reclaim_candle_low'],
             ),
             correlation_id=parent.event_id,
         ))
+
+    # ── V8: Pro tier lookup ─────────────────────────────────────────────────
+
+    _TIER_MAP = {
+        'sr_flip': 1, 'trend_pullback': 1, 'vwap_reclaim': 1,
+        'orb': 2, 'gap_and_go': 2, 'inside_bar': 2, 'flag_pennant': 2,
+        'momentum_ignition': 3, 'fib_confluence': 3,
+        'bollinger_squeeze': 3, 'liquidity_sweep': 3,
+    }
+
+    @classmethod
+    def _get_pro_tier(cls, strategy: str) -> int:
+        """Extract tier from Pro strategy name (e.g., 'pro:sr_flip' → 1)."""
+        if not strategy or not strategy.startswith('pro:'):
+            return 0  # not a Pro strategy
+        sub = strategy.split(':')[1] if ':' in strategy else ''
+        return cls._TIER_MAP.get(sub, 2)  # default to T2 if unknown
 
     # ── EOD force-close ───────────────────────────────────────────────────────
 
@@ -305,9 +346,9 @@ class StrategyEngine:
                 rsi_value=50.0,          # neutral placeholder
                 rvol=1.0,
                 vwap=current_price,      # placeholder
-                stop_price=pos['stop_price'],
-                target_price=pos['target_price'],
-                half_target=pos['half_target'],
+                stop_price=pos.get('stop_price', current_price * 0.97),
+                target_price=pos.get('target_price', current_price * 1.05),
+                half_target=pos.get('half_target', current_price * 1.025),
                 reclaim_candle_low=current_price,
             ),
             correlation_id=parent.event_id,
@@ -348,9 +389,9 @@ class StrategyEngine:
                 rsi_value=50.0,          # neutral placeholder
                 rvol=1.0,
                 vwap=current_price,      # placeholder
-                stop_price=pos['stop_price'],
-                target_price=pos['target_price'],
-                half_target=pos['half_target'],
+                stop_price=pos.get('stop_price', current_price * 0.97),
+                target_price=pos.get('target_price', current_price * 1.05),
+                half_target=pos.get('half_target', current_price * 1.025),
                 reclaim_candle_low=current_price,
             ),
             correlation_id=parent.event_id,

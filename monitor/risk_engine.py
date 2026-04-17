@@ -140,10 +140,15 @@ class RiskEngine:
         # V7: No registry release needed — RegistryGate owns acquire/release
         _approved = False
         try:
-            # 1. Max positions
-            if len(self._positions) >= self._max_positions:
+            # 1. Max positions — V8: count only VWAP positions (not Pro/Pop)
+            # Pro positions share the same dict but have strategy='pro:...'
+            # Without this filter, 5 Pro positions would block all VWAP entries
+            vwap_count = sum(1 for pos in self._positions.values()
+                             if not str(pos.get('strategy', '')).startswith('pro:'))
+            if vwap_count >= self._max_positions:
                 self._block(ticker, p.action,
-                            f"max positions reached ({self._max_positions})", event)
+                            f"max VWAP positions reached ({vwap_count}/{self._max_positions})",
+                            event)
                 return
 
             # 2. Cooldown
@@ -160,19 +165,38 @@ class RiskEngine:
                             "already reclaimed today", event)
                 return
 
+            # V8: Read alt data sentiment for threshold relaxation
+            _sentiment_score = 0.0
+            try:
+                from data_sources.alt_data_reader import alt_data
+                sent = alt_data.sentiment(ticker)
+                if sent and isinstance(sent, dict):
+                    _sentiment_score = float(sent.get('score', 0))
+            except Exception:
+                pass
+
             # 4. RVOL (lower threshold for ETFs — they never hit 2.0x)
+            # V8: Relax RVOL threshold from 2.0→1.5 when sentiment > 0.6
             from monitor.sector_map import is_etf, ETF_RVOL_MIN
             rvol_threshold = ETF_RVOL_MIN if is_etf(ticker) else MIN_RVOL
+            if _sentiment_score > 0.6:
+                rvol_threshold = min(rvol_threshold, 1.5)
             if p.rvol < rvol_threshold:
                 self._block(ticker, p.action,
                             f"RVOL too low ({p.rvol:.2f} < {rvol_threshold})", event)
                 return
 
             # 5. RSI range
-            if not (RSI_LOW <= p.rsi_value <= RSI_HIGH):
+            # V8: Relax RSI range from 40-75 → 35-80 when sentiment > 0.6
+            rsi_low = RSI_LOW
+            rsi_high = RSI_HIGH
+            if _sentiment_score > 0.6:
+                rsi_low = 35.0
+                rsi_high = 80.0
+            if not (rsi_low <= p.rsi_value <= rsi_high):
                 self._block(ticker, p.action,
                             f"RSI out of bullish band ({p.rsi_value:.1f}, "
-                            f"need {RSI_LOW}–{RSI_HIGH})", event)
+                            f"need {rsi_low}–{rsi_high})", event)
                 return
 
             # 6. Spread — fetch fresh Level-1 quote
@@ -205,6 +229,16 @@ class RiskEngine:
                 self._block(ticker, p.action, corr_reason, event)
                 return
 
+            # V8: Beta-weighted exposure check
+            beta_ok, beta_reason, _ = self._sizer.check_beta_exposure(
+                self._positions, ticker,
+                new_qty=max(1, int(self._trade_budget / (p.current_price or 1))),
+                new_price=p.current_price or 0,
+            )
+            if not beta_ok:
+                self._block(ticker, p.action, beta_reason, event)
+                return
+
             # ── All checks passed — size and submit ──────────────────────────
             effective_entry = ask_price * (1 + SLIPPAGE_PCT)
             qty = max(1, int(self._trade_budget / effective_entry))
@@ -229,8 +263,8 @@ class RiskEngine:
                     qty = max(1, int(qty * mult))
                     log.info("[RiskEngine] Regime sizing %s: %d → %d (%s)",
                              ticker, old_qty, qty, regime.summary())
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("[RiskEngine] Market regime import failed: %s", exc)
 
             log.info(
                 f"[RiskEngine] BUY approved: {ticker} "
@@ -247,9 +281,10 @@ class RiskEngine:
                     price=effective_entry,
                     reason='VWAP reclaim',
                     needs_ask_refresh=p.needs_ask_refresh,
-                    stop_price=p.stop_price,
-                    target_price=p.target_price,
-                    atr_value=p.atr_value,
+                    # V8: Default to percentage-based if signal values are None
+                    stop_price=p.stop_price if p.stop_price else effective_entry * 0.97,
+                    target_price=p.target_price if p.target_price else effective_entry * 1.05,
+                    atr_value=p.atr_value if p.atr_value else 0,
                     layer='vwap',  # V7: RegistryGate acquires
                 ),
                 correlation_id=event.event_id,

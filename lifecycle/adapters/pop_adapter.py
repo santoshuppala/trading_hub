@@ -1,7 +1,7 @@
 """
 PopLifecycleAdapter — maps PopStrategyEngine + PopExecutor state to lifecycle interface.
 
-Pop has its own Alpaca account (APCA_POPUP_KEY / APCA_PUPUP_SECRET_KEY).
+Pop has its own Alpaca account (APCA_POPUP_KEY / APCA_POPUP_SECRET_KEY).
 PopExecutor tracks positions as Set[str] and cooldowns as Dict[str, float].
 """
 from __future__ import annotations
@@ -88,7 +88,7 @@ class PopLifecycleAdapter(AbstractEngineAdapter):
         try:
             from alpaca.trading.client import TradingClient
             key = os.getenv('APCA_POPUP_KEY', '')
-            secret = os.getenv('APCA_PUPUP_SECRET_KEY', '')
+            secret = os.getenv('APCA_POPUP_SECRET_KEY', '')
             if not key or not secret:
                 return {}
             client = TradingClient(key, secret, paper=True)
@@ -113,7 +113,7 @@ class PopLifecycleAdapter(AbstractEngineAdapter):
         try:
             from alpaca.trading.client import TradingClient
             key = os.getenv('APCA_POPUP_KEY', '')
-            secret = os.getenv('APCA_PUPUP_SECRET_KEY', '')
+            secret = os.getenv('APCA_POPUP_SECRET_KEY', '')
             if key and secret:
                 client = TradingClient(key, secret, paper=True)
                 for ticker in tickers:
@@ -135,7 +135,7 @@ class PopLifecycleAdapter(AbstractEngineAdapter):
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
             key = os.getenv('APCA_POPUP_KEY', '')
-            secret = os.getenv('APCA_PUPUP_SECRET_KEY', '')
+            secret = os.getenv('APCA_POPUP_SECRET_KEY', '')
             if not key or not secret:
                 return 0
             client = TradingClient(key, secret, paper=True)
@@ -156,7 +156,7 @@ class PopLifecycleAdapter(AbstractEngineAdapter):
         try:
             from alpaca.trading.client import TradingClient
             key = os.getenv('APCA_POPUP_KEY', '')
-            secret = os.getenv('APCA_PUPUP_SECRET_KEY', '')
+            secret = os.getenv('APCA_POPUP_SECRET_KEY', '')
             if not key or not secret:
                 return False
             client = TradingClient(key, secret, paper=True)

@@ -93,7 +93,7 @@ PAPER_TRADING  = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
 # pop trades never touch the main VWAP strategy account capital or positions.
 # If either key is missing, PopStrategyEngine falls back to PaperBroker mode.
 ALPACA_POPUP_KEY          = os.getenv('APCA_POPUP_KEY')
-ALPACA_PUPUP_SECRET_KEY   = os.getenv('APCA_PUPUP_SECRET_KEY')
+ALPACA_POPUP_SECRET_KEY   = os.getenv('APCA_POPUP_SECRET_KEY')
 POP_PAPER_TRADING         = os.getenv('POP_PAPER_TRADING', 'true').lower() == 'true'
 POP_MAX_POSITIONS         = int(os.getenv('POP_MAX_POSITIONS', 15))   # max concurrent pop positions
 POP_TRADE_BUDGET          = int(os.getenv('POP_TRADE_BUDGET', 2000))   # dollars per pop trade

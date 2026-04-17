@@ -275,6 +275,29 @@ class AlpacaBroker(BaseBroker):
                 ))
                 return
 
+            # ── V8: Check if order filled between poll timeout and cancel ─
+            # Race: order fills at T=5.1s, poll exited at T=5.0s.
+            # Without this check, cancel fails (already filled) and code
+            # retries with a NEW client_order_id → double position at broker.
+            try:
+                order_check = self._client.get_order_by_id(order_id)
+                check_status = str(getattr(order_check, 'status', ''))
+                if check_status == 'filled':
+                    avg_price = float(order_check.filled_avg_price or ask_price)
+                    filled_qty = int(float(order_check.filled_qty or p.qty))
+                    log.info(
+                        f"BUY filled (detected before cancel): {filled_qty} {p.ticker} "
+                        f"@ ${avg_price:.2f}")
+                    self._emit_fill(FillPayload(
+                        ticker=p.ticker, side='BUY', qty=filled_qty,
+                        fill_price=avg_price, order_id=order_id, reason=p.reason,
+                        stop_price=p.stop_price, target_price=p.target_price,
+                        atr_value=p.atr_value,
+                    ))
+                    return
+            except Exception:
+                pass  # lookup failed — proceed with cancel
+
             # ── Cancel unfilled ───────────────────────────────────────
             try:
                 self._client.cancel_order_by_id(order_id)
@@ -362,7 +385,11 @@ class AlpacaBroker(BaseBroker):
         # to prevent double-execution (strategy sells + bracket stop fires = short)
         self._cancel_bracket_children(p.ticker)
 
-        client_order_id = f"th-sell-{p.ticker}-{uuid.uuid4().hex[:8]}"
+        # V8: Deterministic client_order_id (same pattern as BUY).
+        # Random UUID caused dual-sell on crash recovery — Alpaca saw
+        # different order IDs for the same sell intent.
+        event_id = getattr(p, '_source_event_id', '') or uuid.uuid4().hex
+        client_order_id = f"th-sell-{p.ticker}-{event_id[:12]}"
 
         # ── Step 1: Cancel ALL open orders for this ticker (buy AND sell) ────
         # This prevents wash trade rejection from Alpaca.
@@ -391,22 +418,41 @@ class AlpacaBroker(BaseBroker):
         # ── Step 2: Verify actual position qty at Alpaca ─────────────────────
         # The monitor may think we hold X shares but Alpaca may have a different qty
         # (from orphaned positions, partial fills, etc.)
+        # V7.2: Use min(requested, actual) — NOT actual. Prevents PARTIAL_SELL
+        # from becoming a full liquidation when Alpaca holds more than requested.
         actual_qty = p.qty
         try:
             position = self._client.get_open_position(p.ticker)
             alpaca_qty = int(float(position.qty))
             if alpaca_qty != p.qty:
+                # Clip to min(requested, available) — never sell more than asked
+                actual_qty = min(p.qty, alpaca_qty)
                 log.warning(
                     f"SELL qty mismatch for {p.ticker}: monitor says {p.qty}, "
-                    f"Alpaca says {alpaca_qty} — using Alpaca qty"
+                    f"Alpaca says {alpaca_qty} — using {actual_qty} "
+                    f"(min of requested and available)"
                 )
-                actual_qty = alpaca_qty
         except Exception as exc:
-            # V7.1: Position doesn't exist at Alpaca (likely closed by bracket stop).
-            # Set actual_qty = 0 to prevent selling shares we don't hold → creating short.
-            actual_qty = 0
-            log.warning("Position lookup for %s failed — setting qty=0 to prevent short: %s",
-                         p.ticker, exc)
+            # V8: Distinguish "position gone" (404) from "lookup failed" (timeout/500).
+            # For 404: position definitely gone → qty=0 (prevent short).
+            # For other errors: position might exist but lookup failed → retry once.
+            exc_str = str(exc).lower()
+            if '404' in exc_str or 'not found' in exc_str:
+                actual_qty = 0
+                log.warning("Position %s not at Alpaca (404) — setting qty=0: %s",
+                            p.ticker, exc)
+            else:
+                log.warning("Position lookup for %s failed (retrying once): %s",
+                            p.ticker, exc)
+                import time as _t
+                _t.sleep(1)
+                try:
+                    position = self._client.get_open_position(p.ticker)
+                    actual_qty = min(p.qty, int(float(position.qty)))
+                except Exception:
+                    actual_qty = 0
+                    log.warning("Position %s retry also failed — setting qty=0 to prevent short",
+                                p.ticker)
 
         if actual_qty <= 0:
             log.warning(f"SELL skipped for {p.ticker}: no position at Alpaca (prevents accidental short)")

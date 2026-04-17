@@ -176,7 +176,16 @@ class RVOLEngine:
             except Exception as e:
                 log.debug("[RVOLEngine] seed failed for %s: %s", ticker, e)
 
-        log.info("[RVOLEngine] seeded profiles for %d/%d tickers", seeded, len(tickers))
+        # V8: Warn if seed rate drops below 80%
+        seed_rate = seeded / len(tickers) if tickers else 0
+        if seed_rate < 0.80:
+            log.warning(
+                "[RVOLEngine] LOW SEED RATE: only %d/%d tickers seeded (%.0f%%). "
+                "RVOL data may be unreliable for unseeded tickers.",
+                seeded, len(tickers), seed_rate * 100,
+            )
+        else:
+            log.info("[RVOLEngine] seeded profiles for %d/%d tickers", seeded, len(tickers))
 
     def _seed_one(self, ticker: str, data_client, start: date, today: date) -> None:
         """Build volume profile for one ticker from historical data."""
@@ -290,6 +299,17 @@ class RVOLEngine:
             state = self._state[ticker]
             profile = self._profiles.get(ticker)
 
+            # V8: Dedup by bar timestamp — after merge, both Pro and VWAP
+            # call update() for the same ticker on the same BAR event.
+            # Without this check, volume is double-counted → RVOL inflated 2x.
+            last_ts = getattr(state, '_last_bar_ts', None)
+            if last_ts is not None and last_ts == bar_timestamp:
+                # Same bar already processed — return cached result
+                cached = getattr(state, '_last_result', None)
+                if cached is not None:
+                    return cached
+            state._last_bar_ts = bar_timestamp
+
         # Accumulate volume
         state.cumulative_volume += bar_volume
         state.bar_count += 1
@@ -342,13 +362,16 @@ class RVOLEngine:
         # Store for percentile history
         state.rvol_history.append(raw_rvol)
 
-        return RVOLResult(
+        result = RVOLResult(
             rvol=round(raw_rvol, 4),
             rvol_smooth=round(smooth_rvol, 4),
             rvol_percentile=round(percentile, 1),
             acceleration=round(acceleration, 4),
             quality=quality,
         )
+        # V8: Cache result for dedup — second caller gets same result without recomputing
+        state._last_result = result
+        return result
 
     def get_rvol(self, ticker: str) -> float:
         """

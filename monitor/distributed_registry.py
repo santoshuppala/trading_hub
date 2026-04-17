@@ -117,6 +117,35 @@ class DistributedPositionRegistry:
             return set()
         return {t for t, l in data.get('positions', {}).items() if l == layer}
 
+    def cleanup_stale(self, max_age_seconds: float = 3600) -> int:
+        """V8: Evict entries older than max_age_seconds (default 1 hour).
+
+        Called on startup to clean up stale locks from crashed processes.
+        Entries must have '_acquired_at' timestamp (set by try_acquire).
+        """
+        import time as _time
+        cleaned = 0
+        try:
+            with self._sf._exclusive_lock():
+                data = self._sf._read_raw_unlocked()
+                if data is None:
+                    return 0
+                positions = data.get('positions', {})
+                now = _time.time()
+                stale = [t for t, info in positions.items()
+                         if isinstance(info, dict) and
+                         now - info.get('_acquired_at', now) > max_age_seconds]
+                for t in stale:
+                    del positions[t]
+                    cleaned += 1
+                    log.warning("[Registry] Evicted stale entry: %s", t)
+                if cleaned:
+                    data['positions'] = positions
+                    self._sf.write(data, _already_locked=True)
+        except Exception as exc:
+            log.warning("[Registry] Stale cleanup failed: %s", exc)
+        return cleaned
+
     def reset(self) -> None:
         """Clear all positions (called at session start). Uses exclusive lock."""
         self._sf.write({'positions': {}})

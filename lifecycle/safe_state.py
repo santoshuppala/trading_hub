@@ -117,10 +117,18 @@ class SafeStateFile:
         # Rotate backups: current → prev → prev2
         self._rotate_backups()
 
-        # Atomic write: tmp → replace
+        # Atomic write: tmp → fsync → replace
         tmp = self._path + '.tmp'
         with open(tmp, 'w') as f:
             f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())  # force to disk before replace
+        # Verify written bytes match expected (catches disk-full truncation)
+        if os.path.getsize(tmp) != len(serialized.encode()):
+            log.error("[SafeState] Write size mismatch for %s — disk may be full",
+                      self._path)
+            os.unlink(tmp)
+            return False
         os.replace(tmp, self._path)
 
         # Write checksum sidecar
@@ -279,11 +287,18 @@ class SafeStateFile:
             return False
 
     def _rotate_backups(self) -> None:
-        """Rotate: current → .prev → .prev2 (with checksums)."""
+        """Rotate: current → .prev → .prev2 (with checksums + fsync)."""
         try:
             # prev → prev2
             if os.path.exists(self._prev_path):
                 shutil.copy2(self._prev_path, self._prev2_path)
+                # V8: fsync backup to prevent corruption if crash mid-copy
+                try:
+                    fd = os.open(self._prev2_path, os.O_RDONLY)
+                    os.fsync(fd)
+                    os.close(fd)
+                except OSError:
+                    pass
                 prev_cs = self._prev_path + '.sha256'
                 if os.path.exists(prev_cs):
                     shutil.copy2(prev_cs, self._prev2_path + '.sha256')

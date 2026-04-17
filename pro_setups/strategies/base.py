@@ -132,6 +132,11 @@ class BaseProStrategy(ABC):
             if sr_stop is not None:
                 stop = sr_stop
                 stop = max(stop, entry_price - max_offset)  # cap at 3%
+                # V8: T2/T3 use WIDER of ATR and structural (survive overnight gap)
+                # T1 uses TIGHTER (intraday, close at EOD)
+                if self.TIER >= 2:
+                    stop = min(stop, atr_stop)  # wider = further from entry
+                # else: keep sr_stop (tighter) for T1
             else:
                 stop = atr_stop
             stop = min(stop, entry_price - abs_min_offset)
@@ -140,6 +145,8 @@ class BaseProStrategy(ABC):
             if sr_stop is not None:
                 stop = sr_stop
                 stop = min(stop, entry_price + max_offset)
+                if self.TIER >= 2:
+                    stop = max(stop, atr_stop)  # wider for shorts = further from entry
             else:
                 stop = atr_stop
             stop = max(stop, entry_price + abs_min_offset)

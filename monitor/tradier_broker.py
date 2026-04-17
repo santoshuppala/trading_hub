@@ -208,11 +208,16 @@ class TradierBroker:
                         if sym == ticker and side in ("sell", "sell_short"):
                             oid = o.get("id")
                             if oid:
-                                self._session.delete(
+                                resp = self._session.delete(
                                     f"{self._base}/v1/accounts/{self._account}/orders/{oid}",
                                     timeout=5,
                                 )
-                                cancelled += 1
+                                # V8: Check response — don't count failed cancels
+                                if resp.status_code == 200:
+                                    cancelled += 1
+                                else:
+                                    log.warning("[TradierBroker] Cancel order %s failed: status=%d",
+                                                oid, resp.status_code)
                     if cancelled:
                         log.info("[TradierBroker] Cancelled %d open sell orders for %s", cancelled, ticker)
         except Exception as exc:
@@ -287,10 +292,14 @@ class TradierBroker:
                             price=p.price, reason=f'{p.reason} (no position at tradier)')))
                         return
                     if tradier_qty != qty:
+                        # V7.2: Use min(requested, available) — never sell more
+                        # than requested. Prevents PARTIAL_SELL from becoming
+                        # full liquidation.
+                        old_qty = qty
+                        qty = min(qty, tradier_qty)
                         log.warning(
                             "[TradierBroker] SELL qty mismatch for %s: requested %d, "
-                            "Tradier has %d — using Tradier qty", ticker, qty, tradier_qty)
-                        qty = tradier_qty
+                            "Tradier has %d — using %d (min)", ticker, old_qty, tradier_qty, qty)
                 else:
                     log.warning(
                         "[TradierBroker] SELL skipped for %s: no positions at Tradier", ticker)

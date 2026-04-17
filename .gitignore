@@ -48,3 +48,6 @@ docker/data/
 
 #----Docs---
 docs/
+# V8: Archived satellite state files
+data/*_state.json.v7_archive
+*.pre_autofix

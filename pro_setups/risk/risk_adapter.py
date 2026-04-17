@@ -68,19 +68,24 @@ class RiskAdapter:
         max_positions:  int,
         order_cooldown: int,
         trade_budget:   float,
+        shared_positions: Optional[Dict] = None,
     ) -> None:
         self._bus            = bus
         self._max_positions  = max_positions
         self._order_cooldown = order_cooldown
         self._trade_budget   = trade_budget
+        # V8: Shared positions dict from monitor (for cross-engine sector counting)
+        self._shared_positions: Optional[Dict] = shared_positions
 
         self._positions: Set[str]         = set()    # tickers with open pro positions
         self._last_order: Dict[str, float] = {}       # ticker → monotonic timestamp
         self._last_signal: Dict[str, float] = {}      # (ticker, strategy) → monotonic timestamp (dedup)
 
         # Subscribe at priority=0 (after routing handlers) to track state
-        bus.subscribe(EventType.FILL,     self._on_fill,     priority=0)
-        bus.subscribe(EventType.POSITION, self._on_position, priority=0)
+        bus.subscribe(EventType.FILL,       self._on_fill,       priority=0)
+        bus.subscribe(EventType.POSITION,   self._on_position,   priority=0)
+        # V8: Clean up _positions on ORDER_FAIL (prevents permanent ticker lock)
+        bus.subscribe(EventType.ORDER_FAIL, self._on_order_fail, priority=0)
         log.info(
             "[RiskAdapter] ready  max_pos=%d  cooldown=%ds  budget=$%.0f",
             max_positions, order_cooldown, trade_budget,
@@ -140,8 +145,8 @@ class RiskAdapter:
                     log.info("%s conviction boost: +%.2f (%s)",
                              tag, boost, conviction.detail(ticker))
                     confidence = min(1.0, confidence + boost)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("%s conviction import failed: %s", tag, exc)
 
             # ── Check 1b: minimum confidence by tier ─────────────────────────────
             min_conf = _MIN_CONFIDENCE.get(tier, 0.50)
@@ -173,9 +178,13 @@ class RiskAdapter:
                 return
 
             # ── Check 2b: sector concentration limit (max 2 per sector) ──────────
+            # V8: Use shared positions dict for cross-engine sector counting
             _MAX_PER_SECTOR = 2
             sector = get_sector(ticker)
-            sector_counts = count_sector_positions(self._positions)
+            all_held = set(self._positions)
+            if self._shared_positions:
+                all_held |= set(self._shared_positions.keys())
+            sector_counts = count_sector_positions(all_held)
             if sector_counts.get(sector, 0) >= _MAX_PER_SECTOR:
                 log.info("%s BLOCKED: sector %s already has %d positions", tag, sector, sector_counts[sector])
                 return
@@ -194,6 +203,18 @@ class RiskAdapter:
             if ticker in self._positions:
                 log.info("%s BLOCKED: already holding position", tag)
                 return
+
+            # ── V8 Check 4b: Earnings block for T2/T3 (overnight positions) ────────
+            if tier >= 2:
+                try:
+                    from data_sources.alt_data_reader import alt_data
+                    earnings = alt_data.earnings(ticker)
+                    if earnings and earnings.get('days_to_earnings', 999) <= 2:
+                        log.info("%s BLOCKED: earnings in %d days (T%d holds overnight)",
+                                 tag, earnings['days_to_earnings'], tier)
+                        return
+                except Exception:
+                    pass  # alt data unavailable — allow entry
 
             # ── Check 5: minimum R:R ──────────────────────────────────────────────
             risk   = entry_price - stop_price       # always positive for long
@@ -227,8 +248,8 @@ class RiskAdapter:
                 mult = regime.position_size_multiplier()
                 if mult < 1.0:
                     qty = max(1, int(qty * mult))
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("%s market regime import failed: %s", tag, exc)
 
             if qty <= 0:
                 log.warning("%s BLOCKED: qty=0 (budget=%.0f entry=%.4f)", tag, self._trade_budget, entry_price)
@@ -296,8 +317,30 @@ class RiskAdapter:
     def _on_position(self, event: Event) -> None:
         p = event.payload
         if p.action == PositionAction.CLOSED:
-            self._positions.discard(p.ticker)
-            log.debug(
-                "[RiskAdapter][%s] position CLOSED — removed from tracking",
-                p.ticker,
-            )
+            # V8: Only remove if this was a Pro position (not VWAP).
+            # Without this check, VWAP closing AAPL would remove it from
+            # Pro's _positions even if Pro also holds AAPL.
+            cd = getattr(p, 'close_detail', {}) or {}
+            strategy = cd.get('strategy', '')
+            if strategy.startswith('pro:') or p.ticker in self._positions:
+                self._positions.discard(p.ticker)
+                log.debug(
+                    "[RiskAdapter][%s] position CLOSED (strategy=%s) — removed from tracking",
+                    p.ticker, strategy,
+                )
+
+    def _on_order_fail(self, event: Event) -> None:
+        """V8: Clean up _positions and _last_order on BUY ORDER_FAIL.
+        Without this, a rejected Pro BUY leaves the ticker locked forever
+        in _positions (blocks future entries + inflates position count)."""
+        try:
+            p = event.payload
+            reason = str(getattr(p, 'reason', '')).lower()
+            side = str(getattr(p, 'side', '')).upper()
+            if side == 'BUY' and reason.startswith('pro:'):
+                if p.ticker in self._positions:
+                    self._positions.discard(p.ticker)
+                    self._last_order.pop(p.ticker, None)
+                    log.info("[RiskAdapter] Cleaned up %s after ORDER_FAIL", p.ticker)
+        except Exception:
+            pass

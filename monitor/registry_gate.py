@@ -26,8 +26,10 @@ class RegistryGate:
         self._bus = bus
         self._registry = registry
         self._lock = threading.Lock()
-        # Track blocked event IDs (checked by SmartRouter)
-        self._blocked_ids: set = set()
+        # V8: Track blocked event IDs with FIFO eviction (was set.pop() which
+        # removes arbitrary elements → recently blocked orders could slip through).
+        from collections import OrderedDict
+        self._blocked_ids: OrderedDict = OrderedDict()
         # Track tickers we acquired so we can release on ORDER_FAIL
         self._acquired_tickers: set = set()
 
@@ -42,7 +44,7 @@ class RegistryGate:
     def is_blocked(self, event_id: str) -> bool:
         """Check if an ORDER_REQ was blocked by registry. Called by SmartRouter."""
         with self._lock:
-            return event_id in self._blocked_ids
+            return event_id in self._blocked_ids  # OrderedDict supports 'in'
 
     def _on_order_req(self, event: Event) -> None:
         """Acquire ticker in registry for BUY orders. SELL always passes."""
@@ -67,13 +69,11 @@ class RegistryGate:
 
             # Store blocked event ID so SmartRouter can check
             with self._lock:
-                self._blocked_ids.add(event.event_id)
-                # Bound the set (prevent unbounded growth)
-                if len(self._blocked_ids) > 1000:
-                    # Remove oldest entries (set has no order, but this prevents leak)
-                    excess = len(self._blocked_ids) - 500
-                    for _ in range(excess):
-                        self._blocked_ids.pop()
+                import time as _time
+                self._blocked_ids[event.event_id] = _time.monotonic()
+                # V8: FIFO eviction — remove oldest entries (OrderedDict preserves insertion order)
+                while len(self._blocked_ids) > 1000:
+                    self._blocked_ids.popitem(last=False)  # FIFO — removes oldest
 
             # Emit RISK_BLOCK for observability
             try:

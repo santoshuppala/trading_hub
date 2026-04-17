@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 class VWAPReclaim(BaseProStrategy):
     TIER:      int   = 1
-    SL_ATR:    float = 1.0     # 1× ATR stop (matches T4)
+    SL_ATR:    float = 0.5     # V8: tightened from 1.0 (intraday, closes at EOD)
     PARTIAL_R: float = 1.0     # partial at 1R
     FULL_R:    float = 2.0     # full exit at 2R
 

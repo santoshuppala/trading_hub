@@ -307,6 +307,61 @@ def main():
             except Exception as exc:
                 log.debug("[Collector] Unusual options flow failed: %s", exc)
 
+        # ── V8: Benzinga News Sentiment (was in Pop, now collected here) ─
+        try:
+            from pop_screener.benzinga_news import BenzingaNewsSentimentSource
+            benz_key = os.getenv('BENZINGA_API_KEY', '')
+            if benz_key:
+                benz = BenzingaNewsSentimentSource(api_key=benz_key)
+                news_data = {}
+                for ticker in tickers[:20]:
+                    try:
+                        news_1h = benz.get_news(ticker, window_hours=1)
+                        news_24h = benz.get_news(ticker, window_hours=24)
+                        if news_1h or news_24h:
+                            avg_1h = sum(n.sentiment_score for n in news_1h) / len(news_1h) if news_1h else 0
+                            avg_24h = sum(n.sentiment_score for n in news_24h) / len(news_24h) if news_24h else 0
+                            news_data[ticker] = {
+                                'headlines_1h': len(news_1h),
+                                'headlines_24h': len(news_24h),
+                                'sentiment_delta': round(avg_1h - avg_24h, 4),
+                                'avg_sentiment_1h': round(avg_1h, 4),
+                                'avg_sentiment_24h': round(avg_24h, 4),
+                                'headline_baseline': 2.0,  # default, can improve
+                            }
+                    except Exception:
+                        pass
+                if news_data:
+                    cache_data['benzinga_news'] = news_data
+                    log.info("[Collector] Benzinga news for %d tickers", len(news_data))
+        except Exception as exc:
+            log.debug("[Collector] Benzinga collection failed: %s", exc)
+
+        # ── V8: StockTwits Social Sentiment (was in Pop) ──────────────
+        try:
+            from pop_screener.stocktwits_social import StockTwitsSocialSource
+            st_token = os.getenv('STOCKTWITS_TOKEN', '')
+            st = StockTwitsSocialSource(access_token=st_token or None)
+            social_data = {}
+            for ticker in tickers[:20]:
+                try:
+                    social = st.get_social(ticker, window_hours=1)
+                    if social and social.mention_count > 0:
+                        social_data[ticker] = {
+                            'mention_count': social.mention_count,
+                            'mention_velocity': round(social.mention_velocity, 4),
+                            'bullish_pct': round(social.bullish_pct, 4),
+                            'bearish_pct': round(social.bearish_pct, 4),
+                            'baseline': 100.0,  # default, can improve
+                        }
+                except Exception:
+                    pass
+            if social_data:
+                cache_data['stocktwits_social'] = social_data
+                log.info("[Collector] StockTwits social for %d tickers", len(social_data))
+        except Exception as exc:
+            log.debug("[Collector] StockTwits collection failed: %s", exc)
+
         # ── Discovered tickers ────────────────────────────────────────
         cache_data['discovered_tickers'] = list(discovered_tickers)
 
@@ -333,40 +388,150 @@ def main():
                  sorted(new_tickers)[:10])
 
     def _persist_to_db(cache_data):
-        """Write data source snapshot to event_store."""
+        """V8: Write ALL data source snapshots to data_source_snapshots table.
+
+        Previously only wrote a summary to event_store (counts only).
+        Now writes per-source per-ticker data so all 8 sources are queryable.
+        """
         try:
             from db.writer import get_writer
             writer = get_writer()
-            if writer:
-                import uuid
-                row = {
-                    'event_id': str(uuid.uuid4()),
-                    'event_sequence': 0,
-                    'event_type': 'DataSourceCollection',
-                    'event_version': 1,
-                    'event_time': datetime.now(ET).isoformat(),
-                    'received_time': datetime.now(ET).isoformat(),
-                    'processed_time': datetime.now(ET).isoformat(),
-                    'aggregate_id': 'data_collector',
-                    'aggregate_type': 'DataSource',
-                    'aggregate_version': 1,
-                    'event_payload': json.dumps({
-                        'sources_collected': [k for k in cache_data
-                                             if k not in ('collected_at', '_version',
-                                                          '_timestamp', '_date')],
-                        'fear_greed': cache_data.get('fear_greed', {}),
-                        'macro_regime': cache_data.get('macro_regime', {}),
-                        'discovered_count': len(cache_data.get('discovered_tickers', [])),
-                        'earnings_count': len(cache_data.get('earnings', {})),
-                        'finviz_count': len(cache_data.get('finviz_screener', {})),
-                    }, default=str),
-                    'source_system': 'data_collector',
-                    'session_id': None,
-                }
-                writer.enqueue('event_store', row)
-                log.debug("[DB] DataSourceCollection event persisted")
+            if not writer:
+                return
+
+            now_ts = datetime.now(ET).isoformat()
+            rows_written = 0
+
+            # 1. Fear & Greed (market-wide, no ticker)
+            fg = cache_data.get('fear_greed', {})
+            if fg:
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'fear_greed',
+                    'ticker': None,
+                    'data_payload': json.dumps(fg, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 2. Macro Regime / FRED (market-wide)
+            macro = cache_data.get('macro_regime', {})
+            if macro:
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'fred_macro',
+                    'ticker': None,
+                    'data_payload': json.dumps(macro, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 3. Finviz screener (per-ticker)
+            for ticker, data in cache_data.get('finviz_screener', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'finviz',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 4. SEC EDGAR filings (per-ticker)
+            for ticker, data in cache_data.get('sec_filings', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'sec_edgar',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 5. Yahoo earnings calendar (per-ticker)
+            for ticker, data in cache_data.get('earnings', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'yahoo_earnings',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 6. Polygon prev-day movers (per-ticker)
+            for ticker, data in cache_data.get('polygon_prev', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'polygon',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 7. Unusual Options Flow (per-ticker, if collected)
+            for ticker, data in cache_data.get('unusual_options_flow', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'unusual_options_flow',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 8. Alpha Vantage technical data (per-ticker, if collected)
+            for ticker, data in cache_data.get('alpha_vantage', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'alpha_vantage',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 9. V8: Benzinga news sentiment (per-ticker)
+            for ticker, data in cache_data.get('benzinga_news', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'benzinga_news',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # 10. V8: StockTwits social sentiment (per-ticker)
+            for ticker, data in cache_data.get('stocktwits_social', {}).items():
+                writer.enqueue('data_source_snapshots', {
+                    'ts': now_ts, 'source_name': 'stocktwits_social',
+                    'ticker': ticker,
+                    'data_payload': json.dumps(data, default=str),
+                    'ingested_at': now_ts,
+                })
+                rows_written += 1
+
+            # Also write summary to event_store (backward compat)
+            import uuid
+            writer.enqueue('event_store', {
+                'event_id': str(uuid.uuid4()),
+                'event_sequence': 0,
+                'event_type': 'DataSourceCollection',
+                'event_version': 2,  # V8: version bump
+                'event_time': now_ts,
+                'received_time': now_ts,
+                'processed_time': now_ts,
+                'aggregate_id': 'data_collector',
+                'aggregate_type': 'DataSource',
+                'aggregate_version': 1,
+                'event_payload': json.dumps({
+                    'sources_collected': [k for k in cache_data
+                                         if k not in ('collected_at', '_version',
+                                                      '_timestamp', '_date')],
+                    'rows_written': rows_written,
+                    'fear_greed': cache_data.get('fear_greed', {}),
+                    'macro_regime': cache_data.get('macro_regime', {}),
+                }, default=str),
+                'source_system': 'data_collector',
+                'session_id': None,
+            })
+
+            log.info("[DB] Persisted %d data source snapshot rows", rows_written)
         except Exception as exc:
-            log.debug("[DB] Persistence failed (non-fatal): %s", exc)
+            log.warning("[DB] Data source persistence failed: %s", exc)
 
     # ══════════════════════════════════════════════════════════════════
     # MAIN LOOP

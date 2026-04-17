@@ -11,10 +11,11 @@ from monitor.event_bus import Event
 
 log = logging.getLogger(__name__)
 
-FILL_TIMEOUT_SEC = 15.0  # reduced from 30s to avoid long blocking
-FILL_POLL_SEC    = 1.0
-MAX_RETRIES      = 1     # reduced from 2 — 2 attempts total (submit + 1 retry)
-WIDEN_INCREMENT  = 0.05  # widen limit price by $0.05 per retry
+FILL_TIMEOUT_SEC       = 15.0   # single-leg fill timeout
+MLEG_FILL_TIMEOUT_SEC  = 40.0   # multi-leg needs more time (wider spreads, thinner liquidity)
+FILL_POLL_SEC          = 1.0
+MAX_RETRIES            = 1      # 2 attempts total (submit + 1 retry)
+WIDEN_INCREMENT        = 0.05   # widen limit price by $0.05 per retry
 
 
 class AlpacaOptionsBroker:
@@ -329,8 +330,8 @@ class AlpacaOptionsBroker:
                     attempt + 1, MAX_RETRIES + 1,
                 )
 
-                # Poll for fill
-                filled = self._poll_for_fill(str(order_id))
+                # Poll for fill — multi-leg gets longer timeout (thinner liquidity)
+                filled = self._poll_for_fill(str(order_id), timeout=MLEG_FILL_TIMEOUT_SEC)
                 if filled:
                     fill_info = self.get_order_status(str(order_id))
                     log.info(
@@ -343,7 +344,7 @@ class AlpacaOptionsBroker:
                 # Not filled -- check status once more, then cancel and retry
                 log.warning(
                     "[AlpacaOptionsBroker] mleg order %s not filled in %.0fs, cancelling (attempt %d/%d)",
-                    order_id, FILL_TIMEOUT_SEC, attempt + 1, MAX_RETRIES + 1,
+                    order_id, MLEG_FILL_TIMEOUT_SEC, attempt + 1, MAX_RETRIES + 1,
                 )
                 cancelled = self.cancel_order(str(order_id))
                 if not cancelled:
@@ -456,13 +457,15 @@ class AlpacaOptionsBroker:
             log.error("[AlpacaOptionsBroker] httpx mleg fallback error: %s", e)
             return None
 
-    def _poll_for_fill(self, order_id: str) -> bool:
+    def _poll_for_fill(self, order_id: str, timeout: float = None) -> bool:
         """
         Poll order status until filled or timeout.
 
-        Returns True if order reached 'filled' status within FILL_TIMEOUT_SEC.
+        Returns True if order reached 'filled' status within the given timeout.
+        Defaults to FILL_TIMEOUT_SEC (single-leg). Multi-leg callers pass
+        MLEG_FILL_TIMEOUT_SEC for the longer window.
         """
-        deadline = time.monotonic() + FILL_TIMEOUT_SEC
+        deadline = time.monotonic() + (timeout or FILL_TIMEOUT_SEC)
 
         while time.monotonic() < deadline:
             try:

@@ -33,7 +33,7 @@ source venv/bin/activate
 # ── Execution mode ───────────────────────────────────────────────────────
 # MONITOR_MODE controls how the trading system runs:
 #   "monolith"    — single process (run_monitor.py via watchdog) [LEGACY]
-#   "supervisor"  — 5 separate processes via supervisor (V7 recommended)
+#   "supervisor"  — 3 processes via supervisor: core, options, data_collector (V8)
 #   "isolated"    — alias for "supervisor" (backward compat)
 #
 # Set in .env: MONITOR_MODE=supervisor
@@ -42,9 +42,9 @@ MONITOR_MODE="${MONITOR_MODE:-monolith}"
 
 if [ "$MONITOR_MODE" = "supervisor" ] || [ "$MONITOR_MODE" = "isolated" ]; then
     # ── Supervisor Mode (V7) ────────────────────────────────────────────
-    # 5 independent processes: core, pro, pop, options, data_collector
-    # Supervisor manages lifecycle, restarts crashed engines independently
-    echo "$(date) Starting in SUPERVISOR mode (5 engines)"
+    # V8: 3 processes — core (VWAP+Pro+Pop), options, data_collector
+    # Pro and Pop merged into Core. Supervisor manages lifecycle.
+    echo "$(date) Starting in SUPERVISOR mode (V8 — 3 engines)"
     python scripts/supervisor.py
     EXIT=$?
     if [ "$EXIT" -ne 0 ]; then

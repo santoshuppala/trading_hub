@@ -65,6 +65,10 @@ class PortfolioRiskGate:
         bus.subscribe(EventType.ORDER_REQ, self._on_order_req, priority=3)
         bus.subscribe(EventType.FILL, self._on_fill, priority=3)
         bus.subscribe(EventType.POSITION, self._on_position, priority=3)
+        # V8: Subscribe to BAR to update current market prices for unrealized P&L.
+        # Without this, drawdown check only catches realized losses — a portfolio
+        # sitting at -$8K unrealized with no sells shows drawdown=$0 → no halt.
+        bus.subscribe(EventType.BAR, self._on_bar, priority=0)
 
         log.info(
             "[PortfolioRisk] ready | max_drawdown=$%.0f | max_notional=$%.0f | "
@@ -86,23 +90,21 @@ class PortfolioRiskGate:
         if side == 'SELL':
             return
 
-        # BUY blocked if halted
+        # V8: BUY blocked if halted — with hysteresis un-halt
         if self._halted:
-            self._block("HALTED", event, "portfolio risk halt active")
-            return
+            total_pnl = self._get_total_pnl()
+            recovery_threshold = MAX_INTRADAY_DRAWDOWN * 0.80  # 20% buffer
+            if total_pnl > recovery_threshold:
+                self._halted = False
+                log.info("[PortfolioRisk] UN-HALTED: P&L $%.2f recovered above $%.2f",
+                         total_pnl, recovery_threshold)
+            else:
+                self._block("HALTED", event, "portfolio risk halt active")
+                return
 
-        # V7.1: Unified market regime — adjusts order notional based on F&G + VIX.
-        # Never halts — only reduces size. Kill switch handles true emergencies.
-        try:
-            from data_sources.market_regime import regime
-            size_mult = regime.position_size_multiplier()  # 0.5 to 1.0
-            if size_mult < 1.0:
-                qty = max(1, int(qty * size_mult))
-                price = price  # price unchanged, qty reduced
-                log.info("[PortfolioRisk] Market regime: %s → qty adjusted to %d",
-                         regime.summary(), qty)
-        except Exception:
-            pass  # alt data unavailable — full size
+        # V8: Removed dead regime sizing code. RiskEngine already applies
+        # market regime multiplier before emitting ORDER_REQ. PortfolioRiskGate
+        # was reducing qty locally without updating the payload — dead code.
 
         # ── Check 1: Intraday drawdown ─────────────────────────────────
         total_pnl = self._get_total_pnl()
@@ -135,7 +137,7 @@ class PortfolioRiskGate:
         # ── Check 3: Pre-trade margin check ────────────────────────────
         # V7 P1-9: Fail-closed — if buying power is unavailable, BLOCK the order.
         # V6 silently skipped this check when all account queries timed out.
-        buying_power = self._get_buying_power()
+        buying_power = self._get_buying_power_cached()
         if buying_power is None:
             log.error("[PortfolioRisk] Buying power UNAVAILABLE — "
                       "blocking order (fail-closed)")
@@ -198,15 +200,31 @@ class PortfolioRiskGate:
                     if pos['qty'] <= 0:
                         del self._positions[ticker]
 
+    def _on_bar(self, event: Event) -> None:
+        """V8: Update current market prices for unrealized P&L tracking."""
+        try:
+            ticker = event.payload.ticker
+            with self._lock:
+                if ticker in self._positions:
+                    current = float(event.payload.df['close'].iloc[-1])
+                    self._positions[ticker]['current_price'] = current
+        except Exception:
+            pass  # best-effort price update
+
     def _on_position(self, event: Event) -> None:
         """Track position changes for unrealized P&L."""
         p = event.payload
-        if hasattr(p, 'pnl') and p.pnl is not None:
-            action = str(getattr(p, 'action', ''))
-            if action in ('CLOSED', 'closed'):
-                with self._lock:
-                    ticker = getattr(p, 'ticker', '')
-                    self._positions.pop(ticker, None)
+        action = str(getattr(p, 'action', ''))
+        if action in ('CLOSED', 'closed'):
+            with self._lock:
+                ticker = getattr(p, 'ticker', '')
+                self._positions.pop(ticker, None)
+        # V8: Sync qty on partial exits to prevent drift
+        elif action == 'PARTIAL_EXIT' and p.position:
+            with self._lock:
+                ticker = getattr(p, 'ticker', '')
+                if ticker in self._positions:
+                    self._positions[ticker]['qty'] = p.position.quantity
 
     def _get_total_pnl(self) -> float:
         """Get realized + unrealized P&L."""
@@ -225,6 +243,17 @@ class PortfolioRiskGate:
                 for pos in self._positions.values()
             )
 
+    def _get_buying_power_cached(self) -> Optional[float]:
+        """V8: Cache buying power for 60s. Prevents 12s+ blocking on repeated checks."""
+        import time as _time
+        now = _time.monotonic()
+        if hasattr(self, '_bp_cached_value') and now - getattr(self, '_bp_cache_time', 0) < 60:
+            return self._bp_cached_value
+        result = self._get_buying_power()
+        self._bp_cached_value = result
+        self._bp_cache_time = now
+        return result
+
     def _get_buying_power(self) -> Optional[float]:
         """Fetch aggregate buying power from ALL brokers (Alpaca + Tradier)."""
         import requests
@@ -234,7 +263,7 @@ class PortfolioRiskGate:
         # ── Alpaca (main + pop + options accounts) ───────────────────────
         alpaca_accounts = [
             (os.getenv('APCA_API_KEY_ID', ''), os.getenv('APCA_API_SECRET_KEY', '')),
-            (os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_PUPUP_SECRET_KEY', '')),
+            (os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_POPUP_SECRET_KEY', '')),
             (os.getenv('APCA_OPTIONS_KEY', ''), os.getenv('APCA_OPTIONS_SECRET', '')),
         ]
         base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
@@ -303,8 +332,9 @@ class PortfolioRiskGate:
                               float(data.get('theta', 0)),
                               int(data.get('positions', 0)))
                     return delta, gamma
-        except Exception:
-            pass
+        except Exception as exc:
+            # V8: Graceful fallback — corrupt/missing file is expected on fresh installs
+            log.debug("[PortfolioRisk] options_greeks.json unavailable (non-fatal): %s", exc)
 
         # Try 2: Query Alpaca options positions API (rough fallback)
         try:
@@ -362,13 +392,27 @@ class PortfolioRiskGate:
             pass
 
     def reset_day(self):
-        """Reset daily tracking state for a new trading session."""
+        """Reset daily tracking state for a new trading session.
+
+        V8: Re-seed with overnight positions from monitor so notional/drawdown
+        checks account for held positions from day one.
+        """
         with self._lock:
             self._realized_pnl = 0.0
             self._positions.clear()
             self._halted = False
             self._block_count = 0
-        log.info("[PortfolioRisk] Daily reset — all counters cleared")
+            # V8: Re-seed from shared positions dict (overnight T2/T3 holds)
+            if hasattr(self, '_monitor') and self._monitor:
+                for ticker, pos in self._monitor.positions.items():
+                    self._positions[ticker] = {
+                        'qty': pos.get('quantity', 0),
+                        'entry_price': pos.get('entry_price', 0),
+                        'current_price': pos.get('entry_price', 0),
+                    }
+        n_overnight = len(self._positions)
+        log.info("[PortfolioRisk] Daily reset — %d overnight positions re-seeded",
+                 n_overnight)
 
     def status(self) -> dict:
         """Return current portfolio risk status."""

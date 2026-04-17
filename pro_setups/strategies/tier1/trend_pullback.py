@@ -25,7 +25,7 @@ from ...detectors._compute import compute_ema, compute_atr
 
 class TrendPullback(BaseProStrategy):
     TIER:      int   = 1
-    SL_ATR:    float = 0.4
+    SL_ATR:    float = 0.5    # V8: widened from 0.4
     PARTIAL_R: float = 1.0
     FULL_R:    float = 2.0
 

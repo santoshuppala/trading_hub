@@ -387,7 +387,19 @@ class SmartRouter:
 
     def seed_position_broker(self, alpaca_tickers: set, tradier_tickers: set) -> None:
         """Seed position→broker mapping from broker open positions on startup.
-        Merges with any existing mapping loaded from disk."""
+        Merges with any existing mapping loaded from disk.
+
+        V7.2: Detects dual-broker overlap and logs error. For overlapping
+        tickers, Tradier wins (processed second) since reconciliation picks
+        the larger-qty broker as authoritative.
+        """
+        overlap = alpaca_tickers & tradier_tickers
+        if overlap:
+            log.error(
+                "[SmartRouter] DUAL-BROKER OVERLAP detected: %s at both brokers. "
+                "Tradier mapping will take precedence. Manual close recommended.",
+                overlap)
+
         with self._lock:
             for t in alpaca_tickers:
                 self._position_broker[t] = 'alpaca'

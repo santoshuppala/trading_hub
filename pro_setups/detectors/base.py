@@ -60,15 +60,25 @@ class BaseDetector(ABC):
         ticker:   str,
         df:       pd.DataFrame,
         rvol_df:  Optional[pd.DataFrame] = None,
+        precomputed: Optional[Dict[str, Any]] = None,
     ) -> DetectorSignal:
         """
         Public entry point.  Returns ``DetectorSignal.no_signal()`` if there
         are fewer bars than ``MIN_BARS`` or if the inner implementation raises.
+
+        V8: Optional ``precomputed`` dict provides shared indicators (VWAP, ATR,
+        RSI, EMAs) computed once per BAR to avoid redundant computation across
+        13 detectors.
         """
         if len(df) < self.MIN_BARS:
             return DetectorSignal.no_signal()
         try:
-            return self._detect(ticker, df, rvol_df)
+            # V8: Try passing precomputed; fall back without it for
+            # detectors that haven't been updated to accept the kwarg.
+            try:
+                return self._detect(ticker, df, rvol_df, precomputed=precomputed)
+            except TypeError:
+                return self._detect(ticker, df, rvol_df)
         except Exception as exc:
             log.debug("[%s][%s] detector error: %s", self.name, ticker, exc)
             return DetectorSignal.no_signal()
@@ -79,5 +89,6 @@ class BaseDetector(ABC):
         ticker:  str,
         df:      pd.DataFrame,
         rvol_df: Optional[pd.DataFrame],
+        **kwargs,
     ) -> DetectorSignal:
         ...

@@ -1,7 +1,10 @@
+# V8 Trading Hub Requirements
+# Python 3.10+ required (uses match/case, zoneinfo, dataclass features)
+
 # Core
 backtrader
-pandas
-numpy
+pandas>=2.0
+numpy>=1.24
 matplotlib
 streamlit
 plotly
@@ -10,7 +13,7 @@ python-dateutil
 psutil
 
 # Broker APIs
-alpaca-py
+alpaca-py>=0.20
 
 # Market data
 yfinance
@@ -21,8 +24,8 @@ psycopg[binary]>=3.1
 psycopg2-binary
 sqlalchemy
 
-# Message queue
-confluent-kafka
+# Message queue (Redpanda/Kafka IPC for Options process)
+confluent-kafka>=2.3
 
 # ML (optional — needed for pop classifier training)
 xgboost

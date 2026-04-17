@@ -13,7 +13,7 @@ ET = ZoneInfo('America/New_York')
 log = logging.getLogger(__name__)
 
 TRADIER_BASE_URL = 'https://api.tradier.com/v1'
-_MAX_WORKERS = 20
+_MAX_WORKERS = 40
 
 
 class TradierDataClient(BaseDataClient):
@@ -25,7 +25,7 @@ class TradierDataClient(BaseDataClient):
     def __init__(self, token):
         self._token = token
         self._session = requests.Session()
-        # Raise connection pool size to match _MAX_WORKERS so parallel
+        # V8: Raise connection pool size to match _MAX_WORKERS (40) so parallel
         # fetch_batch_bars threads don't discard connections under load.
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=_MAX_WORKERS,
@@ -36,24 +36,44 @@ class TradierDataClient(BaseDataClient):
             'Authorization': f'Bearer {token}',
             'Accept': 'application/json',
         })
+        # V8: Reuse ThreadPoolExecutor across calls (avoids thread creation overhead)
+        self._executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
 
     # ------------------------------------------------------------------
     # Low-level REST helpers (private)
     # ------------------------------------------------------------------
 
     def _get(self, path, params=None):
+        # V8: Retry on 5xx errors (had 26 x 502 today) + 429 rate limit + 401 circuit breaker
         for attempt in range(3):
-            resp = self._session.get(
-                f'{TRADIER_BASE_URL}{path}', params=params, timeout=15
-            )
-            if resp.status_code == 429:
-                wait = 2 ** attempt   # 1 s, 2 s, 4 s
-                log.warning(f"Tradier 429 rate-limit on {path}; retrying in {wait}s")
+            try:
+                resp = self._session.get(
+                    f'{TRADIER_BASE_URL}{path}', params=params, timeout=15
+                )
+            except Exception as exc:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+
+            # V8: 401 circuit breaker — stop all fetches if token expired
+            if resp.status_code == 401:
+                if not getattr(self, '_auth_alert_sent', False):
+                    log.critical("Tradier API 401 — token expired! All data fetches will fail.")
+                    self._auth_alert_sent = True
+                resp.raise_for_status()
+
+            # Retryable status codes (429 rate limit + 5xx server errors)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = min(2 ** attempt, 8)
+                log.warning(f"Tradier {resp.status_code} on {path}; retrying in {wait}s "
+                            f"(attempt {attempt + 1}/3)")
                 time.sleep(wait)
                 continue
+
             resp.raise_for_status()
             return resp.json()
-        resp.raise_for_status()   # final attempt exhausted — propagate
+        resp.raise_for_status()
         return resp.json()
 
     def _fetch_timesales(self, symbol, start, end, interval='1min'):
@@ -75,6 +95,13 @@ class TradierDataClient(BaseDataClient):
             if not rows:
                 return pd.DataFrame()
             df = pd.DataFrame(rows)
+            # V8: Validate required columns exist before selecting
+            required_cols = ['time', 'open', 'high', 'low', 'close', 'volume']
+            missing = [c for c in required_cols if c not in df.columns]
+            if missing:
+                log.warning("Timesales for %s missing columns: %s (have: %s)",
+                            symbol, missing, list(df.columns))
+                return pd.DataFrame()
             df['time'] = pd.to_datetime(df['time']).dt.tz_localize(ET)
             return df.set_index('time')[['open', 'high', 'low', 'close', 'volume']].astype(float)
         except Exception as e:
@@ -154,8 +181,9 @@ class TradierDataClient(BaseDataClient):
             hist = self.get_daily_history(ticker, rvol_start, now)
             return ticker, bars, hist
 
-        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as ex:
-            futures = {ex.submit(_fetch_one, t): t for t in tickers}
+        # V8: Reuse persistent executor instead of creating a new one per call
+        futures = {self._executor.submit(_fetch_one, t): t for t in tickers}
+        if True:  # maintain indentation compatibility
             for f in as_completed(futures):
                 try:
                     ticker, bars, hist = f.result(timeout=30)

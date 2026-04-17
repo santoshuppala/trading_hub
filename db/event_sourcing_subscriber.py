@@ -120,6 +120,7 @@ class EventSourcingSubscriber:
             EventType.QUOTE:                self._on_quote,
             EventType.NEWS_DATA:            self._on_news_data,
             EventType.SOCIAL_DATA:          self._on_social_data,
+            EventType.ORDER_FAIL:           self._on_order_fail,  # V8: persist order failures
         }
         for event_type, handler in handlers.items():
             self._bus.subscribe(event_type, handler, priority=10)
@@ -516,6 +517,28 @@ class EventSourcingSubscriber:
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_risk_block error: %s", exc)
+
+    def _on_order_fail(self, event: Event) -> None:
+        """V8: Persist order failures (broker rejections, timeouts, phantom cleanups)."""
+        try:
+            p = event.payload
+            payload = {
+                "ticker":     getattr(p, 'ticker', ''),
+                "side":       str(getattr(p, 'side', '')),
+                "qty":        getattr(p, 'qty', 0),
+                "price":      float(getattr(p, 'price', 0)),
+                "reason":     str(getattr(p, 'reason', '')),
+            }
+            self._write_event(
+                event_type="OrderFailed",
+                aggregate_type="Order",
+                aggregate_id=f"order_{payload['ticker']}",
+                event_payload=payload,
+                event=event,
+                source_system="Broker",
+            )
+        except Exception as exc:
+            log.debug("EventSourcingSubscriber._on_order_fail error: %s", exc)
 
     def _on_pop_signal(self, event: Event) -> None:
         """Pop strategy engine signal."""

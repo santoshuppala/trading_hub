@@ -104,6 +104,9 @@ class SignalAnalyzer:
     # Cache is bounded to 500 entries to avoid unbounded growth.
     _MAX_CACHE = 500
 
+    # V8: PARTIAL_SELL dedup window (seconds)
+    _PARTIAL_SELL_DEDUP_SEC = 60.0
+
     def __init__(self, strategy_params, per_ticker_params):
         """
         Parameters
@@ -117,6 +120,8 @@ class SignalAnalyzer:
         self.per_ticker_params = per_ticker_params or {}
         # {(ticker, df_id): indicator_dict} — avoids recomputing for identical DataFrame objects
         self._indicator_cache: dict = {}
+        # V8: PARTIAL_SELL dedup tracker {ticker: monotonic_time}
+        self._last_partial_time: dict = {}
 
     def _to_scalar(self, val):
         try:
@@ -317,22 +322,72 @@ class SignalAnalyzer:
         rsi_overbought = result['_rsi_overbought']
         vwap_breakdown = result['_vwap_breakdown']
 
-        stop_price = pos['stop_price']
-        target_price = pos['target_price']
-        half_target = pos['half_target']
-        partial_done = pos['partial_done']
-        qty = pos['quantity']
+        # V8: Use .get() with defaults to prevent KeyError on malformed positions
+        # (corrupt state, reconciliation edge cases, test data)
+        entry_price_val = pos.get('entry_price', current_price)
+        stop_price = pos.get('stop_price', entry_price_val * 0.97)
+        target_price = pos.get('target_price', entry_price_val * 1.05)
+        half_target = pos.get('half_target', (entry_price_val + target_price) / 2)
+        partial_done = pos.get('partial_done', False)
+        qty = pos.get('quantity', pos.get('qty', 1))
 
         # Partial exit — sell 50% at 1x ATR, move stop to breakeven
         if not partial_done and current_price >= half_target and qty >= 2:
-            return 'PARTIAL_SELL'
+            # V8: Dedup — skip if PARTIAL_SELL was emitted within 60s
+            import time as _time
+            now_mono = _time.monotonic()
+            last_partial = self._last_partial_time.get(ticker, 0)
+            if now_mono - last_partial < self._PARTIAL_SELL_DEDUP_SEC:
+                pass  # suppress duplicate
+            else:
+                self._last_partial_time[ticker] = now_mono
+                return 'PARTIAL_SELL'
 
-        # Trailing stop update (caller is responsible for updating pos)
-        trail_stop = current_price - (atr_value * 1.0)
-        if trail_stop > pos['stop_price']:
-            pos['stop_price'] = trail_stop
+        # V8: Strategy-specific trailing stop logic
+        strategy = pos.get('strategy', 'vwap_reclaim')
+        entry_price_val = pos.get('entry_price', current_price)
 
-        if current_price <= pos['stop_price']:
+        if strategy.startswith('pro:'):
+            # V8: Pro tier-based trailing — breakeven at +1R, lock +1R at +2R
+            risk = entry_price_val - stop_price
+            if risk > 0:
+                current_r = (current_price - entry_price_val) / risk
+
+                # Determine tier from strategy name
+                _tier_map = {
+                    'sr_flip': 1, 'trend_pullback': 1, 'vwap_reclaim': 1,
+                    'orb': 2, 'gap_and_go': 2, 'inside_bar': 2, 'flag_pennant': 2,
+                    'momentum_ignition': 3, 'fib_confluence': 3,
+                    'bollinger_squeeze': 3, 'liquidity_sweep': 3,
+                }
+                sub = strategy.split(':')[1] if ':' in strategy else ''
+                tier = _tier_map.get(sub, 2)
+
+                if tier >= 2:
+                    old_stop = stop_price
+                    if current_r >= 2.0:
+                        lock_r = 1.0 if tier == 3 else 0.5
+                        new_stop = entry_price_val + risk * lock_r
+                        if new_stop > stop_price:
+                            pos['stop_price'] = new_stop
+                            stop_price = new_stop
+                            log.info("[Trail] %s tier=%d R=%.1f stop=$%.2f→$%.2f (locked +%.1fR)",
+                                     pos.get('_ticker', ''), tier, current_r, old_stop, new_stop, lock_r)
+                    elif current_r >= 1.0:
+                        new_stop = entry_price_val  # breakeven
+                        if new_stop > stop_price:
+                            pos['stop_price'] = new_stop
+                            stop_price = new_stop
+                            log.info("[Trail] %s tier=%d R=%.1f stop=$%.2f→$%.2f (breakeven)",
+                                     pos.get('_ticker', ''), tier, current_r, old_stop, new_stop)
+        else:
+            # VWAP: ATR-based trailing stop (existing behavior)
+            trail_stop = current_price - (atr_value * 1.0)
+            if trail_stop > stop_price:
+                pos['stop_price'] = trail_stop
+                stop_price = trail_stop
+
+        if current_price <= pos.get('stop_price', stop_price):
             return 'SELL_STOP'
         if current_price >= target_price:
             return 'SELL_TARGET'

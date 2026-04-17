@@ -23,7 +23,7 @@ from ...detectors._compute import compute_atr
 
 class FlagPennant(BaseProStrategy):
     TIER:      int   = 2
-    SL_ATR:    float = 0.8
+    SL_ATR:    float = 2.0    # V8: widened from 0.8 (flags are volatile overnight)
     PARTIAL_R: float = 1.5
     FULL_R:    float = 3.0
 

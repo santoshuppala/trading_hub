@@ -70,24 +70,13 @@ log = logging.getLogger(__name__)
 #   2. Add entry to PROCESSES dict below (or set ENGINE_CONFIG env var)
 #   3. Add engine-specific config to config.py
 # No other code changes required — supervisor, registry, IPC are generic.
+# V8: Pro and Pop merged into Core. Only 3 processes: core, options, data_collector.
 _DEFAULT_PROCESSES = {
     'core': {
         'script': os.path.join(SCRIPTS_DIR, 'run_core.py'),
         'critical': True,    # If core dies, all trading stops
         'max_restarts': 3,
         'restart_delay': 10,
-    },
-    'pro': {
-        'script': os.path.join(SCRIPTS_DIR, 'run_pro.py'),
-        'critical': False,   # Can survive without pro-setups
-        'max_restarts': 5,
-        'restart_delay': 15,
-    },
-    'pop': {
-        'script': os.path.join(SCRIPTS_DIR, 'run_pop.py'),
-        'critical': False,
-        'max_restarts': 5,
-        'restart_delay': 15,
     },
     'options': {
         'script': os.path.join(SCRIPTS_DIR, 'run_options.py'),
@@ -96,6 +85,9 @@ _DEFAULT_PROCESSES = {
         'restart_delay': 20,
     },
 }
+
+# V8: Skip scripts that should NOT be auto-discovered
+_SKIP_SCRIPTS = {'run_pro.py', 'run_pop.py', 'run_monitor.py'}
 
 
 def _load_engine_config() -> dict:
@@ -135,7 +127,7 @@ def _load_engine_config() -> dict:
 
     # V7: Auto-discover run_*.py scripts not in config (skip explicitly disabled)
     for f in sorted(os.listdir(SCRIPTS_DIR)):
-        if f.startswith('run_') and f.endswith('.py') and f != 'run_monitor.py':
+        if f.startswith('run_') and f.endswith('.py') and f not in _SKIP_SCRIPTS:
             engine_name = f[4:-3]  # run_arbitrage.py → arbitrage
             if engine_name not in processes and engine_name not in _disabled:
                 log.info("[supervisor] Auto-discovered engine '%s' from %s", engine_name, f)
@@ -209,7 +201,11 @@ class ProcessManager:
             return False
 
     # V7 P3-2: Heartbeat staleness threshold for hung process detection
-    _HEARTBEAT_STALE_SEC = 120.0  # 2x normal heartbeat interval
+    # V7.2: Increased from 120s → 180s. Background heartbeat thread writes
+    # every 15s, so 180s means 12 missed writes before triggering. This
+    # prevents false HUNG detection when emit_batch() blocks processing
+    # many sequential sells (each taking ~3s for broker polling).
+    _HEARTBEAT_STALE_SEC = 180.0
 
     def check(self) -> str:
         """Check process health. Returns status: running, crashed, stopped, hung.
@@ -222,12 +218,13 @@ class ProcessManager:
 
         retcode = self.process.poll()
         if retcode is None:
-            # Process is alive — reset restart counter if it's been stable (>60s)
+            # V8: Reset restart counter only after 5 min stable (was 60s).
+            # At 60s, a process crashing every 61s would never hit max_restarts.
             if self.restart_count > 0 and self.started_at:
                 try:
                     started = datetime.fromisoformat(self.started_at)
                     uptime = (datetime.now(ET) - started).total_seconds()
-                    if uptime > 60:
+                    if uptime > 300:
                         self.restart_count = 0
                 except Exception:
                     pass
@@ -342,11 +339,16 @@ class ProcessManager:
             finally:
                 os.unlink(tmp)
 
+            # V8: Backup before applying fix (rollback if logic is wrong)
+            import shutil
+            shutil.copy2(fix_file, fix_file + '.pre_autofix')
+
             # Apply
             with open(fix_file, 'w') as f:
                 f.write(new_content)
 
-            log.info("[%s] Fix applied to %s: %s", self.name, diagnosis.fix_file, diagnosis.fix_description)
+            log.info("[%s] Fix applied to %s: %s (backup at %s.pre_autofix)",
+                     self.name, diagnosis.fix_file, diagnosis.fix_description, fix_file)
             return True
 
         except Exception as exc:
@@ -384,7 +386,7 @@ class ProcessManager:
             try:
                 # Send SIGTERM to process group
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                self.process.wait(timeout=10)
+                self.process.wait(timeout=30)  # V8: was 10s, increased to avoid SIGKILL during order flush
                 log.info("[%s] Stopped gracefully", self.name)
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
@@ -431,8 +433,8 @@ def send_alert(subject: str, body: str):
         # monitor.alerts.send_alert(alert_email, message, severity)
         message = f"{subject}\n\n{body}" if body else subject
         _send(ALERT_EMAIL, message, severity='CRITICAL')
-    except Exception:
-        pass
+    except Exception as exc:
+        log.error("Supervisor alert send failed: %s", exc)
 
 
 def main():
@@ -477,10 +479,11 @@ def main():
     # Wait for core to initialize shared cache
     time.sleep(5)
 
-    # Start satellite processes
-    for name in ['pro', 'pop', 'options']:
-        if not managers[name].start():
-            log.warning("[%s] Failed to start — will retry in main loop", name)
+    # V8: Start satellite processes (dynamic — no hardcoded names)
+    for name, manager in managers.items():
+        if name != 'core':
+            if not manager.start():
+                log.warning("[%s] Failed to start — will retry in main loop", name)
 
     log.info("All processes started. Entering monitoring loop.")
     write_status(managers)
@@ -511,6 +514,12 @@ def main():
                             manager.process.kill()
                         except Exception:
                             pass
+                    # V8: Reap zombie process before clearing reference
+                    try:
+                        if manager.process:
+                            manager.process.wait(timeout=1)
+                    except Exception:
+                        pass
                     manager.process = None
                     manager.status = 'crashed'
                     # Fall through to restart logic below

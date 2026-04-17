@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Core process — VWAP strategy + broker + position management.
+"""
+V8 Core process — VWAP + Pro strategies + Pop scanning + broker + position management.
 
-This is the primary process. It fetches market data, runs the VWAP strategy,
-executes orders via Alpaca, and manages positions. Other engines (Pro, Pop, Options)
-run as separate processes and communicate via Redpanda.
+Pro and Pop merged into Core (V8). Options stays separate (different instruments).
+Data Collector stays separate (independent pipeline).
+
+This is the primary process. It:
+  - Fetches market data, runs VWAP strategy
+  - Runs Pro's 11 technical strategies (merged in-process)
+  - Scans for Pop momentum tickers (periodic, no independent trading)
+  - Executes orders via Alpaca + Tradier (SmartRouter)
+  - Manages positions (single PositionManager, single bot_state.json)
+  - Publishes SIGNAL + POP_SIGNAL to Redpanda for Options process
 """
 import os
 import sys
@@ -15,8 +23,10 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo('America/New_York')
 
+
 def _handle_sigterm(signum, frame):
     raise KeyboardInterrupt
+
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -28,6 +38,7 @@ from config import (
     ALERT_EMAIL, ALPACA_API_KEY, ALPACA_SECRET, TRADIER_TOKEN,
     PAPER_TRADING, DATA_SOURCE, BROKER, GLOBAL_MAX_POSITIONS,
     DB_ENABLED, DATABASE_URL, MAX_DAILY_LOSS,
+    PRO_MAX_POSITIONS, PRO_TRADE_BUDGET, PRO_ORDER_COOLDOWN,
 )
 
 # Logging
@@ -37,7 +48,6 @@ date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
 os.makedirs(date_dir, exist_ok=True)
 log_file = os.path.join(date_dir, 'core.log')
 
-# Only FileHandler — supervisor already redirects stdout to this log file
 logging.root.handlers = []
 logging.basicConfig(
     level=logging.INFO,
@@ -51,29 +61,50 @@ log = logging.getLogger(__name__)
 def main():
     from monitor import RealTimeMonitor
     from monitor.shared_cache import CacheWriter
-    from monitor.ipc import EventPublisher, EventConsumer, TOPIC_ORDERS, TOPIC_FILLS, TOPIC_SIGNALS, TOPIC_BAR_READY
+    from monitor.ipc import (EventPublisher, EventConsumer,
+                              TOPIC_SIGNALS, TOPIC_POP, TOPIC_DISCOVERY)
     from monitor.distributed_registry import DistributedPositionRegistry
     from monitor.event_bus import EventType, Event
 
     log.info("=" * 60)
-    log.info("CORE PROCESS STARTING")
+    log.info("V8 CORE PROCESS STARTING (VWAP + Pro + Pop scan)")
     log.info("=" * 60)
 
-    # Initialize distributed registry (replaces in-memory singleton)
-    # V7: Core is the ONLY writer — satellites send layer tag in ORDER_REQ
+    # ── V8: Validate SMTP at startup ──────────────────────────────────────
+    try:
+        from monitor.alerts import validate_smtp
+        validate_smtp()
+    except Exception:
+        log.warning("SMTP validation skipped — alerts module not ready")
+
+    # ── Distributed registry ──────────────────────────────────────────────
     dist_registry = DistributedPositionRegistry(global_max=GLOBAL_MAX_POSITIONS)
-    dist_registry.reset()  # Clean slate at session start
+    # V8: Clean stale entries from previous crash (lease-based cleanup)
+    try:
+        dist_registry.cleanup_stale(max_age_seconds=3600)
+    except Exception:
+        pass
+    dist_registry.reset()
     log.info("Distributed position registry initialized (max=%d)", GLOBAL_MAX_POSITIONS)
 
-    # Initialize shared cache writer
+    # ── Shared cache writer (Options still reads from this) ───────────────
     cache_writer = CacheWriter()
     log.info("Shared cache writer ready")
 
-    # Initialize IPC
+    # ── IPC publisher (for Options — SIGNAL + POP_SIGNAL) ─────────────────
     publisher = EventPublisher(source_name='core')
     log.info("IPC publisher ready")
 
-    # Initialize monitor (same as run_monitor.py but without Pro/Pop/Options)
+    # ── V8: Initialize RVOL engine BEFORE Pro (Pro detectors need it) ─────
+    try:
+        from monitor.rvol import init_global_rvol_engine
+        rvol_engine = init_global_rvol_engine()
+        log.info("RVOL engine initialized")
+    except Exception as exc:
+        log.warning("RVOL engine init failed (non-fatal): %s", exc)
+        rvol_engine = None
+
+    # ── Monitor (VWAP strategy + broker + position management) ────────────
     redpanda_brokers = os.getenv('REDPANDA_BROKERS', '127.0.0.1:9092')
 
     monitor = RealTimeMonitor(
@@ -94,25 +125,95 @@ def main():
         data_source=DATA_SOURCE,
     )
 
-    # ── DB persistence for core events ─────────────────────────────────────
+    # ── V8: Seed RVOL profiles from monitor's data client ─────────────────
+    if rvol_engine:
+        try:
+            rvol_engine.seed_profiles(monitor.tickers, monitor._data)
+            log.info("RVOL profiles seeded for %d tickers", len(monitor.tickers))
+        except Exception as exc:
+            log.warning("RVOL profile seeding failed (non-fatal): %s", exc)
+
+    # ── V8: Pre-seed beta cache for all tickers ────────────────────────────
+    try:
+        from monitor.risk_sizing import RiskSizer
+        _sizer = RiskSizer()
+        _sizer.seed_betas_from_cache(monitor.tickers)
+    except Exception as exc:
+        log.warning("Beta pre-seeding failed (non-fatal): %s", exc)
+
+    # ── V8: Cancel stale orders at BOTH brokers on startup ────────────────
+    # After SIGKILL, open BUY/SELL orders may still be pending.
+    try:
+        trading_client = getattr(monitor, '_broker', None)
+        if trading_client and hasattr(trading_client, '_client') and trading_client._client:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            open_orders = trading_client._client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            for order in open_orders:
+                try:
+                    trading_client._client.cancel_order_by_id(str(order.id))
+                    log.info("[Startup] Cancelled stale Alpaca order: %s %s %s",
+                             order.side, order.symbol, order.id)
+                except Exception:
+                    pass
+    except Exception as exc:
+        log.warning("[Startup] Stale Alpaca order cancel failed: %s", exc)
+
+    try:
+        import requests as _req
+        t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '')
+        t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+        if t_token and t_acct:
+            t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+            t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+            t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+            # Get open orders
+            resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/orders',
+                           params={'filter': 'open'}, headers=t_headers, timeout=5)
+            if resp.status_code == 200:
+                orders = resp.json().get('orders', {})
+                if orders and orders != 'null':
+                    order_list = orders.get('order', [])
+                    if isinstance(order_list, dict):
+                        order_list = [order_list]
+                    for o in order_list:
+                        oid = o.get('id')
+                        if oid:
+                            _req.delete(f'{t_base}/v1/accounts/{t_acct}/orders/{oid}',
+                                       headers=t_headers, timeout=5)
+                            log.info("[Startup] Cancelled stale Tradier order: %s", oid)
+    except Exception as exc:
+        log.warning("[Startup] Stale Tradier order cancel failed: %s", exc)
+
+    # ── DB persistence ────────────────────────────────────────────────────
     from scripts._db_helper import init_satellite_db
     db_cleanup = init_satellite_db(monitor._bus, process_name='core')
 
-    # ── Portfolio-level risk gate (aggregate limits across all engines) ─────
+    # ── Portfolio-level risk gate ─────────────────────────────────────────
     from monitor.portfolio_risk import PortfolioRiskGate
     portfolio_risk = PortfolioRiskGate(bus=monitor._bus, monitor=monitor)
-    log.info("PortfolioRiskGate active | drawdown=$%.0f | notional=$%.0f | delta=%.1f | gamma=%.1f",
-             portfolio_risk._max_drawdown if hasattr(portfolio_risk, '_max_drawdown') else -5000,
-             100000, 5.0, 1.0)
+    log.info("PortfolioRiskGate active")
     portfolio_risk.reset_day()
 
-    # ── V7: Centralized registry gate (acquires positions for all layers) ──
+    # ── V8: Per-strategy kill switch ─────────────────────────────────────
+    from monitor.kill_switch import PerStrategyKillSwitch
+    kill_switch = PerStrategyKillSwitch(
+        bus=monitor._bus,
+        limits={'vwap': float(MAX_DAILY_LOSS), 'pro': -2000.0},
+        alert_email=ALERT_EMAIL,
+    )
+    kill_switch.reset_day()
+    log.info("PerStrategyKillSwitch active | vwap=$%.0f pro=$%.0f",
+             MAX_DAILY_LOSS, -2000.0)
+
+    # ── Centralized registry gate ─────────────────────────────────────────
     from monitor.registry_gate import RegistryGate
     registry_gate = RegistryGate(bus=monitor._bus, registry=dist_registry)
 
     # ── Smart routing (multi-broker) ──────────────────────────────────────
-    # Note: SmartRouter created below; registry_gate wired after creation
     from config import BROKER_MODE
+    smart_router = None
     if BROKER_MODE == 'smart':
         try:
             from monitor.tradier_broker import TradierBroker
@@ -128,7 +229,7 @@ def main():
                     token=tradier_token,
                     account_id=tradier_account,
                     sandbox=tradier_sandbox,
-                    subscribe=False,  # SmartRouter handles routing
+                    subscribe=False,
                 )
                 alpaca_broker = getattr(monitor, '_broker', None)
 
@@ -140,48 +241,55 @@ def main():
                 )
                 log.info("SmartRouter active | brokers=alpaca+tradier | mode=%s", BROKER_MODE)
 
-                # Seed position→broker mapping from current broker positions
+                # V7.2: Seed from reconciliation results
                 try:
-                    import requests as _req
-                    alpaca_tickers = set()
-                    tradier_tickers = set()
-                    # Alpaca positions
-                    alpaca_client = getattr(monitor, '_broker', None)
-                    if alpaca_client and hasattr(alpaca_client, '_client') and alpaca_client._client:
-                        for p in alpaca_client._client.get_all_positions():
-                            alpaca_tickers.add(str(p.symbol))
-                    # Tradier positions
-                    t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '')
-                    t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
-                    if t_token and t_acct:
-                        t_base = 'https://sandbox.tradier.com'
-                        t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
-                        resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/positions',
-                                       headers=t_headers, timeout=5)
-                        if resp.status_code == 200:
-                            positions = resp.json().get('positions', {})
-                            if positions and positions != 'null':
-                                pos_list = positions.get('position', [])
-                                if isinstance(pos_list, dict):
-                                    pos_list = [pos_list]
-                                for p in pos_list:
-                                    if int(float(p.get('quantity', 0))) > 0:
-                                        tradier_tickers.add(p['symbol'])
+                    alpaca_tickers = getattr(monitor, '_reconciled_alpaca', set()) or set()
+                    tradier_tickers = getattr(monitor, '_reconciled_tradier', set()) or set()
+                    overlap = alpaca_tickers & tradier_tickers
+                    if overlap:
+                        log.error("DUAL-BROKER OVERLAP: %s at both brokers", overlap)
                     smart_router.seed_position_broker(alpaca_tickers, tradier_tickers)
                 except Exception as seed_exc:
-                    log.warning("SmartRouter position seed failed (non-fatal): %s", seed_exc)
+                    log.warning("SmartRouter position seed failed: %s", seed_exc)
             else:
-                log.warning("BROKER_MODE=smart but Tradier credentials missing — using Alpaca only")
+                log.warning("BROKER_MODE=smart but Tradier credentials missing")
         except Exception as exc:
-            log.warning("SmartRouter init failed (non-fatal): %s — using Alpaca only", exc)
+            log.warning("SmartRouter init failed: %s — using Alpaca only", exc)
     else:
         log.info("BROKER_MODE=%s — single broker mode", BROKER_MODE)
 
-    # V7: Wire RegistryGate to SmartRouter (if created)
-    if 'smart_router' in dir():
+    if smart_router:
         smart_router.set_registry_gate(registry_gate)
 
-    # Hook: publish SIGNAL events to Redpanda for Options process
+    # ── V8: ProSetupEngine (merged in-process) ────────────────────────────
+    # Pro's 11 strategies subscribe to BAR events directly on Core's bus.
+    # No IPC needed — same process, same EventBus.
+    pro_engine = None
+    try:
+        from pro_setups.engine import ProSetupEngine
+        pro_engine = ProSetupEngine(
+            bus=monitor._bus,
+            max_positions=PRO_MAX_POSITIONS,
+            order_cooldown=PRO_ORDER_COOLDOWN,
+            trade_budget=float(PRO_TRADE_BUDGET),
+            shared_positions=monitor.positions,  # V8: cross-engine sector counting
+        )
+        log.info("V8 ProSetupEngine merged into Core | max_pos=%d budget=$%.0f",
+                 PRO_MAX_POSITIONS, PRO_TRADE_BUDGET)
+
+        # Seed RiskAdapter._positions from restored state
+        # (Pro positions in bot_state.json have strategy='pro:...')
+        risk_adapter = pro_engine._risk_adapter
+        for ticker, pos in monitor.positions.items():
+            if str(pos.get('strategy', '')).startswith('pro:'):
+                risk_adapter._positions.add(ticker)
+        if risk_adapter._positions:
+            log.info("V8 RiskAdapter seeded with %d restored Pro positions: %s",
+                     len(risk_adapter._positions), sorted(risk_adapter._positions))
+    except Exception as exc:
+        log.error("V8 ProSetupEngine init failed: %s — Pro strategies disabled", exc)
+
+    # ── IPC: Publish SIGNAL events to Redpanda for Options ────────────────
     def _on_signal_publish(event):
         if event.type == EventType.SIGNAL:
             p = event.payload
@@ -196,96 +304,68 @@ def main():
                 'target_price': float(getattr(p, 'target_price', 0)),
             })
 
-    def _on_fill_publish(event):
-        if event.type in (EventType.FILL, EventType.POSITION):
+    # V8: Publish POP_SIGNAL to Redpanda for Options (Pop scanner in Core now)
+    def _on_pop_signal_publish(event):
+        try:
             p = event.payload
-            ticker = getattr(p, 'ticker', '')
-            publisher.publish(TOPIC_FILLS, ticker, {
-                'event_type': event.type.name,
-                'ticker': ticker,
-                'payload': str(p),
+            publisher.publish(TOPIC_POP, p.symbol, {
+                'symbol': p.symbol,
+                'strategy_type': str(p.strategy_type),
+                'entry_price': float(p.entry_price),
+                'stop_price': float(p.stop_price),
+                'target_1': float(p.target_1),
+                'target_2': float(p.target_2),
+                'pop_reason': str(p.pop_reason),
+                'atr_value': float(p.atr_value),
+                'rvol': float(p.rvol),
+                'vwap_distance': float(getattr(p, 'vwap_distance', 0)),
+                'strategy_confidence': float(getattr(p, 'strategy_confidence', 0)),
+                'features_json': getattr(p, 'features_json', '{}'),
+                'source': 'core',
             })
+        except Exception as exc:
+            log.debug("[IPC] POP_SIGNAL publish failed: %s", exc)
 
     monitor._bus.subscribe(EventType.SIGNAL, _on_signal_publish, priority=10)
-    monitor._bus.subscribe(EventType.FILL, _on_fill_publish, priority=10)
-    monitor._bus.subscribe(EventType.POSITION, _on_fill_publish, priority=10)
+    try:
+        monitor._bus.subscribe(EventType.POP_SIGNAL, _on_pop_signal_publish, priority=10)
+    except Exception:
+        pass  # POP_SIGNAL event type may not exist
 
-    # V7 P2-1: IPC inbox queue — consumer thread enqueues, main loop drains.
-    # Prevents cross-thread emit() races between IPC consumer and main loop.
-    # Consumer daemon thread puts ORDER_REQ payloads into _ipc_inbox.
-    # Main loop calls _drain_ipc_inbox() each tick to emit on the main thread.
-    import queue as _queue
-    _ipc_inbox = _queue.Queue(maxsize=500)
+    # ── V8: Discovery ticker consumer (single, replaces Pro + Pop) ────────
+    _ticker_set = set(monitor.tickers)
 
-    consumer = EventConsumer(
-        group_id='core-order-consumer',
-        topics=[TOPIC_ORDERS],
-        source_name='core',
-    )
+    def _on_discovery(key, payload):
+        ticker = payload.get('ticker', '')
+        if ticker and ticker not in _ticker_set:
+            monitor.tickers.append(ticker)
+            _ticker_set.add(ticker)
+            log.info("[Discovery] Added %s to scan universe (%d total)",
+                     ticker, len(monitor.tickers))
 
-    def _on_remote_order(key, payload):
-        """Receive ORDER_REQ from satellite — enqueue for main-thread processing.
+    discovery_consumer = None
+    try:
+        discovery_consumer = EventConsumer(
+            group_id='core-discovery-consumer',
+            topics=[TOPIC_DISCOVERY],
+            source_name='core',
+        )
+        discovery_consumer.on(TOPIC_DISCOVERY, _on_discovery)
+        discovery_consumer.start()
+        log.info("Discovery consumer started")
+    except Exception as exc:
+        log.warning("Discovery consumer failed (non-fatal): %s", exc)
 
-        V7 P2-1: Does NOT call bus.emit() directly (wrong thread).
-        Puts payload into inbox queue. Main loop drains it.
-        """
-        try:
-            _ipc_inbox.put_nowait(payload)
-            log.debug("[IPC] Enqueued ORDER_REQ: %s %s",
-                      payload.get('ticker', '?'), payload.get('side', '?'))
-        except _queue.Full:
-            log.error("[IPC] Inbox FULL — dropping ORDER_REQ for %s",
-                      payload.get('ticker', '?'))
-
-    def _drain_ipc_inbox():
-        """Drain all queued IPC ORDER_REQs onto the EventBus (main thread).
-
-        Called from the main loop each tick cycle. Single-threaded emit()
-        ensures correct ordering with local BAR → SIGNAL → ORDER_REQ chain.
-        """
-        drained = 0
-        while not _ipc_inbox.empty():
-            try:
-                payload = _ipc_inbox.get_nowait()
-            except _queue.Empty:
-                break
-            try:
-                from monitor.events import OrderRequestPayload
-                order_payload = OrderRequestPayload(
-                    ticker=payload['ticker'],
-                    side=payload['side'],
-                    qty=int(payload['qty']),
-                    price=float(payload['price']),
-                    reason=payload.get('reason', 'remote'),
-                    stop_price=float(payload.get('stop_price', 0)),
-                    target_price=float(payload.get('target_price', 0)),
-                    layer=payload.get('layer', payload.get('source')),
-                )
-                # V7 P3-1: Propagate correlation_id from IPC envelope
-                ipc_corr = payload.get('_ipc_correlation_id', '')
-                monitor._bus.emit(Event(
-                    type=EventType.ORDER_REQ, payload=order_payload,
-                    correlation_id=ipc_corr or None))
-                drained += 1
-            except Exception as exc:
-                log.warning("[IPC] Failed to process remote ORDER_REQ: %s", exc)
-        if drained:
-            log.info("[IPC] Drained %d ORDER_REQ(s) from inbox", drained)
-
-    consumer.on(TOPIC_ORDERS, _on_remote_order)
-    consumer.start()
-    log.info("IPC consumer started (inbox queue mode — main-thread drain)")
-
-    # Start monitor
+    # ── Start monitor ─────────────────────────────────────────────────────
     monitor.start()
-    log.info("Core monitor running. VWAP strategy active.")
+    log.info("V8 Core running | VWAP + Pro strategies active | %d tickers",
+             len(monitor.tickers))
 
-    # Write initial cache
+    # Write initial cache (Options reads from this)
     if hasattr(monitor, '_bars_cache') and hasattr(monitor, '_rvol_cache'):
         cache_writer.write(monitor._bars_cache or {}, monitor._rvol_cache or {})
-        publisher.publish(TOPIC_BAR_READY, 'all', {'count': len(monitor._bars_cache or {})})
 
-    # Main loop (same heartbeat as run_monitor.py)
+    # ── Main loop ─────────────────────────────────────────────────────────
     try:
         while True:
             now = datetime.now(ET)
@@ -293,29 +373,21 @@ def main():
                 log.info("4:00 PM ET reached — stopping core process.")
                 break
 
-            # V7 P2-1: Drain IPC inbox on main thread BEFORE cache update.
-            # This ensures satellite ORDER_REQs are processed in the same
-            # thread as local BAR → SIGNAL → ORDER_REQ, preventing races.
-            _drain_ipc_inbox()
-
-            # Update shared cache after each cycle
+            # Update shared cache (Options reads from this)
             if hasattr(monitor, '_bars_cache') and monitor._bars_cache:
                 cache_writer.write(monitor._bars_cache, monitor._rvol_cache or {})
-                publisher.publish(TOPIC_BAR_READY, 'all', {
-                    'count': len(monitor._bars_cache),
-                    'time': now.isoformat(),
-                })
 
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Core process interrupted.")
     finally:
         monitor.stop()
-        consumer.stop()
+        if discovery_consumer:
+            discovery_consumer.stop()
         publisher.stop()
         if db_cleanup:
             db_cleanup()
-        log.info("Core process stopped.")
+        log.info("V8 Core process stopped.")
 
 
 if __name__ == '__main__':

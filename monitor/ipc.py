@@ -36,6 +36,7 @@ class EventPublisher:
     def __init__(self, brokers: str = None, source_name: str = 'unknown'):
         from confluent_kafka import Producer
         self._source = source_name
+        self._delivery_failures = 0
         self._producer = Producer({
             'bootstrap.servers': brokers or DEFAULT_BROKERS,
             'acks': '1',
@@ -48,6 +49,13 @@ class EventPublisher:
         self._running = True
         self._flush_thread = threading.Thread(target=self._bg_flush, daemon=True)
         self._flush_thread.start()
+
+    def _delivery_report(self, err, msg):
+        """V8: Callback for delivery confirmation. Logs failures after retries exhausted."""
+        if err is not None:
+            self._delivery_failures += 1
+            log.error("[IPC] Message delivery FAILED after retries: %s topic=%s key=%s",
+                      err, msg.topic(), msg.key().decode() if msg.key() else '?')
 
     def publish(self, topic: str, key: str, payload: dict,
                 headers: dict = None, correlation_id: str = None) -> None:
@@ -68,6 +76,7 @@ class EventPublisher:
                 key=key.encode('utf-8'),
                 value=json.dumps(envelope, default=str).encode('utf-8'),
                 headers=msg_headers,
+                callback=self._delivery_report,  # V8: detect silent message loss
             )
         except Exception as exc:
             log.warning("[IPC] Publish failed on %s: %s", topic, exc)

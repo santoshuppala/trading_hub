@@ -133,6 +133,60 @@ class AltDataReader:
         data = self._load()
         return data.get('unusual_options_flow', {})
 
+    # ── V8: News & Social Sentiment ────────────────────────────────────
+
+    def news_sentiment(self, ticker: str) -> Optional[dict]:
+        """V8: Get Benzinga news sentiment for ticker.
+        Returns dict with headlines_1h, sentiment_delta, headline_baseline, etc."""
+        data = self._load()
+        return data.get('benzinga_news', {}).get(ticker)
+
+    def social_sentiment(self, ticker: str) -> Optional[dict]:
+        """V8: Get StockTwits social sentiment for ticker.
+        Returns dict with mention_count, mention_velocity, bullish_pct, etc."""
+        data = self._load()
+        return data.get('stocktwits_social', {}).get(ticker)
+
+    def sentiment(self, ticker: str) -> Optional[dict]:
+        """V8: Combined sentiment score for a ticker.
+        Returns dict with 'score' (0.0-1.0) from news + social combined."""
+        news = self.news_sentiment(ticker)
+        social = self.social_sentiment(ticker)
+        if not news and not social:
+            return None
+        score = 0.0
+        count = 0
+        if news:
+            score += abs(news.get('sentiment_delta', 0))
+            count += 1
+        if social:
+            skew = social.get('bullish_pct', 0.5) - social.get('bearish_pct', 0.5)
+            score += abs(skew)
+            count += 1
+        return {'score': round(score / max(count, 1), 4), 'ticker': ticker}
+
+    def recent_headlines(self, window_minutes: int = 5) -> Optional[dict]:
+        """V8: Get tickers with high recent headline counts.
+        Returns {ticker: count} for tickers with >= 2 headlines."""
+        data = self._load()
+        news = data.get('benzinga_news', {})
+        result = {}
+        for ticker, info in news.items():
+            count = info.get('headlines_1h', 0)
+            if count >= 2:
+                result[ticker] = count
+        return result if result else None
+
+    def get_all(self) -> Optional[dict]:
+        """V8: Get full cache for Pop periodic scanner."""
+        data = self._load()
+        return data if data else None
+
+    def polygon_prev_day(self, ticker: str) -> Optional[dict]:
+        """Get Polygon previous-day data for ticker."""
+        data = self._load()
+        return data.get('polygon_prev', {}).get(ticker)
+
     # ── Discovery ─────────────────────────────────────────────────────
 
     def discovered_tickers(self) -> List[str]:

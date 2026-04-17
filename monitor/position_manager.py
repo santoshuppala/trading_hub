@@ -81,8 +81,59 @@ class PositionManager:
         self._lock            = threading.Lock()
 
         bus.subscribe(EventType.FILL, self._on_fill)
+        # V8: Clean up phantom positions when SELL fails with "no position"
+        bus.subscribe(EventType.ORDER_FAIL, self._on_order_fail, priority=0)
 
-    # ── Handler ───────────────────────────────────────────────────────────────
+    # ── Phantom cleanup ──────────────────────────────────────────────────────
+
+    def _on_order_fail(self, event: Event) -> None:
+        """V8: Remove phantom positions when broker confirms no position exists.
+
+        When a bracket stop fires at the broker, Core doesn't know until
+        it tries to exit. The SELL fails with 'no position at alpaca/tradier'.
+        Without cleanup, StrategyEngine retries every 60s → sell storm.
+        """
+        try:
+            p = event.payload
+            side_str = str(getattr(p, 'side', '')).upper()
+            reason_str = str(getattr(p, 'reason', '')).lower()
+            ticker = p.ticker
+
+            if side_str != 'SELL':
+                return
+            if 'no position' not in reason_str:
+                return
+
+            with self._lock:
+                if ticker in self._positions:
+                    pos = self._positions[ticker]
+                    pos_strategy = pos.get('strategy', 'unknown')
+                    log.warning(
+                        "[PositionManager] Removing phantom %s — broker confirmed "
+                        "no position (strategy=%s). Bracket/stop likely fired externally.",
+                        ticker, pos_strategy)
+                    del self._positions[ticker]
+                    self._persist()
+
+                    # Emit POSITION CLOSED so other components clean up
+                    self._bus.emit(Event(
+                        type=EventType.POSITION,
+                        payload=PositionPayload(
+                            ticker=ticker,
+                            action='CLOSED',
+                            position=None,
+                            pnl=0.0,
+                            close_detail={
+                                'reason': 'phantom_cleanup',
+                                'strategy': pos_strategy,
+                                'broker': pos.get('_broker', 'unknown'),
+                            },
+                        ),
+                    ))
+        except Exception as exc:
+            log.debug("[PositionManager] _on_order_fail error: %s", exc)
+
+    # ── Fill Handler ─────────────────────────────────────────────────────────
 
     def _on_fill(self, event: Event) -> None:
         # Dedup: skip if we've already processed this FILL event
@@ -110,6 +161,17 @@ class PositionManager:
         fill_price = p.fill_price
         qty        = p.qty
         now        = datetime.now(ET)
+
+        # V8: Guard against duplicate BUY fills overwriting existing position
+        if ticker in self._positions:
+            existing = self._positions[ticker]
+            log.error(
+                "[PositionManager] DUPLICATE BUY for %s — already open "
+                "(qty=%d entry=$%.2f strategy=%s). Keeping existing, ignoring fill.",
+                ticker, existing.get('quantity', 0),
+                existing.get('entry_price', 0),
+                existing.get('strategy', 'unknown'))
+            return
 
         # Reconstruct stop / target from reason string if available.
         # These values are computed by RiskEngine and stored in position on open.
@@ -195,6 +257,13 @@ class PositionManager:
                     half_target=pos['half_target'],
                     atr_value=pos.get('atr_value'),
                 ),
+                # V7.2: Include strategy/broker so DB event_store has
+                # full position data for crash recovery (not just CLOSED).
+                close_detail={
+                    'strategy': strategy,
+                    'broker': _broker,
+                    'reason': str(p.reason or ''),
+                },
             ),
             correlation_id=parent.event_id,
         )
@@ -222,6 +291,22 @@ class PositionManager:
         pos = self._positions[ticker]
         entry_price = pos['entry_price']
         pos_strategy = pos.get('strategy', 'unknown')
+
+        # V7.2: Detect overfill — broker sold more than local position qty
+        position_qty = pos['quantity']
+        if qty > position_qty:
+            log.error(
+                "[PositionManager] OVERFILL for %s: sold %d but position "
+                "only had %d! Possible dual-broker collision or broker-side "
+                "liquidation. Clamping to position qty.",
+                ticker, qty, position_qty)
+            send_alert(
+                self._alert_email,
+                f"OVERFILL {ticker}: sold {qty} > position {position_qty}. "
+                f"Check both brokers for orphaned shares.",
+            )
+            qty = position_qty  # clamp to avoid negative remaining
+
         pnl         = round((fill_price - entry_price) * qty, 2)
 
         trade = {

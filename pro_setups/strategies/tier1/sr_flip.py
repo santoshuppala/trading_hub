@@ -23,7 +23,7 @@ from ...detectors._compute import compute_ema
 
 class SRFlip(BaseProStrategy):
     TIER:      int   = 1
-    SL_ATR:    float = 0.3
+    SL_ATR:    float = 0.4    # V8: widened from 0.3 for breathing room
     PARTIAL_R: float = 1.0
     FULL_R:    float = 2.0
 

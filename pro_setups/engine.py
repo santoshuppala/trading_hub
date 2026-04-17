@@ -48,6 +48,9 @@ from .detectors import (
     LiquidityDetector, VolatilityDetector, FibDetector, MomentumDetector,
     DetectorSignal,
 )
+# V8: New detectors from alt data sources
+from .detectors.sentiment_detector import SentimentDetector
+from .detectors.news_velocity_detector import NewsVelocityDetector
 from .classifiers import StrategyClassifier
 from .strategies import STRATEGY_REGISTRY
 from .router import ProStrategyRouter
@@ -78,22 +81,26 @@ class ProSetupEngine:
         max_positions:  int   = 3,
         order_cooldown: int   = 300,
         trade_budget:   float = 1000.0,
+        shared_positions: dict = None,
     ) -> None:
         self._bus = bus
 
         # ── Detectors (all 11 required by spec) ──────────────────────────
         self._detectors = {
-            'trend':      TrendDetector(),
-            'vwap':       VWAPDetector(),
-            'sr':         SRDetector(),
-            'orb':        ORBDetector(),
-            'inside_bar': InsideBarDetector(),
-            'gap':        GapDetector(),
-            'flag':       FlagDetector(),
-            'liquidity':  LiquidityDetector(),
-            'volatility': VolatilityDetector(),
-            'fib':        FibDetector(),
-            'momentum':   MomentumDetector(),
+            'trend':          TrendDetector(),
+            'vwap':           VWAPDetector(),
+            'sr':             SRDetector(),
+            'orb':            ORBDetector(),
+            'inside_bar':     InsideBarDetector(),
+            'gap':            GapDetector(),
+            'flag':           FlagDetector(),
+            'liquidity':      LiquidityDetector(),
+            'volatility':     VolatilityDetector(),
+            'fib':            FibDetector(),
+            'momentum':       MomentumDetector(),
+            # V8: Alt data detectors (read from alt_data_cache.json)
+            'sentiment':      SentimentDetector(mode='stocks'),
+            'news_velocity':  NewsVelocityDetector(),
         }
 
         # ── Classifier ────────────────────────────────────────────────────
@@ -101,10 +108,11 @@ class ProSetupEngine:
 
         # ── Risk adapter (subscribes to FILL/POSITION internally) ─────────
         self._risk_adapter = RiskAdapter(
-            bus            = bus,
-            max_positions  = max_positions,
-            order_cooldown = order_cooldown,
-            trade_budget   = trade_budget,
+            bus               = bus,
+            max_positions     = max_positions,
+            order_cooldown    = order_cooldown,
+            trade_budget      = trade_budget,
+            shared_positions  = shared_positions,
         )
 
         # ── Router (subscribes to PRO_STRATEGY_SIGNAL internally) ─────────
@@ -142,10 +150,23 @@ class ProSetupEngine:
 
         t0 = time.monotonic()
 
+        # ── Step 0.5: precompute shared indicators once ──────────────────
+        precomputed: Dict[str, object] = {}
+        try:
+            precomputed['vwap'] = compute_vwap(df)
+            precomputed['atr'] = compute_atr(df)
+            precomputed['rsi'] = compute_rsi(df)
+            from .detectors._compute import compute_ema
+            precomputed['ema_9'] = compute_ema(df['close'], 9)
+            precomputed['ema_21'] = compute_ema(df['close'], 21)
+            precomputed['ema_50'] = compute_ema(df['close'], 50)
+        except Exception as exc:
+            log.debug("[ProSetupEngine][%s] precompute failed: %s", ticker, exc)
+
         # ── Step 1: run all detectors ─────────────────────────────────────
         outputs: Dict[str, DetectorSignal] = {}
         for name, detector in self._detectors.items():
-            outputs[name] = detector.detect(ticker, df, rvol_df)
+            outputs[name] = detector.detect(ticker, df, rvol_df, precomputed=precomputed)
 
         # ── Step 2: classify ──────────────────────────────────────────────
         classification = self._classifier.classify(ticker, outputs)
@@ -172,6 +193,11 @@ class ProSetupEngine:
         try:
             entry_price = strategy.generate_entry(ticker, df, confirmed, outputs)
             atr         = compute_atr(df)
+            # V8: Reject signal if ATR is too low relative to price (dead market)
+            if atr is None or (entry_price > 0 and atr < entry_price * 0.001):
+                log.debug("[ProSetupEngine][%s] ATR too low (%.4f) — skipping",
+                          ticker, atr or 0)
+                return
             stop_price  = strategy.generate_stop(entry_price, confirmed, atr, df, outputs=outputs)
 
             # Enforce minimum stop distance (0.3%) as a safety net across ALL strategies
@@ -291,6 +317,9 @@ class ProSetupEngine:
             log.warning("%s invalid levels (non-positive): entry=%.4f stop=%.4f t1=%.4f t2=%.4f",
                         tag, entry, stop, target_1, target_2)
             return False
+        # V8: Tier-specific min R:R for target_2 validation
+        from pro_setups.risk.risk_adapter import _MIN_RR
+
         if direction == 'long':
             if not (stop < entry < target_1 < target_2):
                 log.warning("%s invalid long levels: stop=%.4f entry=%.4f t1=%.4f t2=%.4f",
@@ -303,6 +332,23 @@ class ProSetupEngine:
                 log.debug("%s rejected: R:R too low (%.2f) stop=%.2f entry=%.2f t1=%.2f",
                           tag, reward / risk, stop, entry, target_1)
                 return False
+            # V8: target_2 R:R check using tier-specific minimum
+            reward_2 = target_2 - entry
+            if risk > 0:
+                rr_2 = reward_2 / risk
+                # Extract tier from strategy name for tier-specific min R:R
+                _tier_map = {
+                    'sr_flip': 1, 'trend_pullback': 1, 'vwap_reclaim': 1,
+                    'orb': 2, 'gap_and_go': 2, 'inside_bar': 2, 'flag_pennant': 2,
+                    'momentum_ignition': 3, 'fib_confluence': 3,
+                    'bollinger_squeeze': 3, 'liquidity_sweep': 3,
+                }
+                tier = _tier_map.get(strategy, 2)
+                min_rr = _MIN_RR.get(tier, 1.5)
+                if rr_2 < min_rr:
+                    log.debug("%s rejected: target_2 R:R too low (%.2f < %.2f) t2=%.2f",
+                              tag, rr_2, min_rr, target_2)
+                    return False
         else:
             if not (stop > entry > target_1 > target_2):
                 log.warning("%s invalid short levels: stop=%.4f entry=%.4f t1=%.4f t2=%.4f",
@@ -314,4 +360,20 @@ class ProSetupEngine:
                 log.debug("%s rejected: R:R too low (%.2f) stop=%.2f entry=%.2f t1=%.2f",
                           tag, reward / risk, stop, entry, target_1)
                 return False
+            # V8: target_2 R:R check for shorts
+            reward_2 = entry - target_2
+            if risk > 0:
+                rr_2 = reward_2 / risk
+                _tier_map = {
+                    'sr_flip': 1, 'trend_pullback': 1, 'vwap_reclaim': 1,
+                    'orb': 2, 'gap_and_go': 2, 'inside_bar': 2, 'flag_pennant': 2,
+                    'momentum_ignition': 3, 'fib_confluence': 3,
+                    'bollinger_squeeze': 3, 'liquidity_sweep': 3,
+                }
+                tier = _tier_map.get(strategy, 2)
+                min_rr = _MIN_RR.get(tier, 1.5)
+                if rr_2 < min_rr:
+                    log.debug("%s rejected: target_2 R:R too low (%.2f < %.2f) t2=%.2f",
+                              tag, rr_2, min_rr, target_2)
+                    return False
         return True

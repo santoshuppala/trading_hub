@@ -126,6 +126,16 @@ class EventLogger:
                     f"open={hb.open_tickers} trades={hb.n_trades} "
                     f"wins={hb.n_wins}({win_rate}) pnl=${hb.total_pnl:+.2f}"
                 )
+            case EventType.PRO_STRATEGY_SIGNAL:
+                log.info(
+                    f"[{eid}] PRO_SIGNAL {p.ticker} setup={p.strategy_name} "
+                    f"tier={p.tier} dir={p.direction} conf={p.confidence:.2f} "
+                    f"entry=${p.entry_price:.2f} stop=${p.stop_price:.2f}")
+            case EventType.POP_SIGNAL:
+                log.info(
+                    f"[{eid}] POP_SIGNAL {p.symbol} type={p.strategy_type} "
+                    f"reason={p.pop_reason} conf={p.strategy_confidence:.2f} "
+                    f"entry=${p.entry_price:.2f} rvol={p.rvol:.1f}")
             case _:
                 log.debug(f"[{eid}] {event.type.name} payload={p!r}")
 
@@ -176,14 +186,46 @@ class HeartbeatEmitter:
         self._signal_alert_sent = False
         self._fill_alert_sent   = False
 
+        # V8: Per-engine signal counters for heartbeat
+        self._pro_signal_count = 0
+        self._pop_signal_count = 0
+
         # Subscribe to SIGNAL and FILL to track recency
+        # V8: Also track PRO_STRATEGY_SIGNAL and POP_SIGNAL to prevent
+        # false silence alerts when Pro is active but VWAP isn't generating.
         bus.subscribe(EventType.SIGNAL, self._on_signal, priority=0)
         bus.subscribe(EventType.FILL,   self._on_fill,   priority=0)
+        try:
+            bus.subscribe(EventType.PRO_STRATEGY_SIGNAL, self._on_pro_signal, priority=0)
+            bus.subscribe(EventType.POP_SIGNAL, self._on_pop_signal, priority=0)
+        except Exception:
+            pass  # event types may not exist in test environments
+
+        # V7.2: Background heartbeat writer — independent of main loop latency.
+        # When emit_batch() blocks for 10+ seconds processing sells, the main
+        # loop can't call tick(). This daemon thread writes the heartbeat file
+        # every 15 seconds regardless, preventing false HUNG detection.
+        import threading
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_writer_loop, daemon=True, name='heartbeat-writer')
+        self._hb_thread.start()
 
     def _on_signal(self, event: Event) -> None:
         """V7 P3-4: Track last SIGNAL time."""
         self._last_signal_time = time.monotonic()
         self._signal_alert_sent = False  # reset on new signal
+
+    def _on_pro_signal(self, event: Event) -> None:
+        """V8: Track PRO_STRATEGY_SIGNAL count + reset signal timer."""
+        self._last_signal_time = time.monotonic()
+        self._signal_alert_sent = False
+        self._pro_signal_count += 1
+
+    def _on_pop_signal(self, event: Event) -> None:
+        """V8: Track POP_SIGNAL count + reset signal timer."""
+        self._last_signal_time = time.monotonic()
+        self._signal_alert_sent = False
+        self._pop_signal_count += 1
 
     def _on_fill(self, event: Event) -> None:
         """V7 P3-4: Track last FILL time."""
@@ -205,6 +247,11 @@ class HeartbeatEmitter:
 
     def _emit(self) -> None:
         snap = self._state.snapshot()
+        # V8: Log Pro/Pop signal counts in heartbeat
+        log.info(
+            "[HeartbeatEmitter] pro_signals=%d pop_signals=%d (session total)",
+            self._pro_signal_count, self._pop_signal_count,
+        )
         self._bus.emit(Event(
             type=EventType.HEARTBEAT,
             payload=HeartbeatPayload(
@@ -216,6 +263,19 @@ class HeartbeatEmitter:
                 total_pnl=snap['total_pnl'],
             ),
         ))
+
+    def _heartbeat_writer_loop(self) -> None:
+        """V7.2: Background thread that writes heartbeat every 15 seconds.
+
+        Decoupled from main loop so long-running emit_batch() calls
+        (e.g., 17 sequential sells taking 11s) don't starve the heartbeat.
+        """
+        while True:
+            try:
+                time.sleep(15)
+                self._write_heartbeat_file()
+            except Exception:
+                pass  # daemon thread — never crash
 
     def _write_heartbeat_file(self) -> None:
         """V7 P3-2: Write heartbeat timestamp for supervisor health checks.
@@ -241,10 +301,22 @@ class HeartbeatEmitter:
 
     def _check_silent_failures(self, now: float) -> None:
         """V7 P3-4: Alert if no SIGNAL or FILL for too long during market hours."""
-        # Only check during market hours (9:30 AM - 3:45 PM ET)
+        # V7.2: Don't check until signals are actually possible.
+        # Earliest signal = TRADE_START_TIME + MIN_BARS_REQUIRED minutes
+        # (bars are ~1 min each). Then add the silence threshold itself,
+        # since we need to wait that long after signals become possible.
         et_now = datetime.now(ET)
-        if et_now.hour < 10 or (et_now.hour >= 15 and et_now.minute >= 45):
+        if et_now.hour >= 15 and et_now.minute >= 45:
             return  # outside active trading window
+
+        from config import TRADE_START_TIME, MIN_BARS_REQUIRED
+        start_h, start_m = (int(x) for x in TRADE_START_TIME.split(':'))
+        # Earliest possible signal time + silence threshold (in minutes)
+        warmup_minutes = start_m + MIN_BARS_REQUIRED + (self._SIGNAL_SILENCE_ALERT_SEC // 60)
+        earliest_h = start_h + warmup_minutes // 60
+        earliest_m = warmup_minutes % 60
+        if (et_now.hour, et_now.minute) < (earliest_h, earliest_m):
+            return  # still in warmup — signals can't have been expected yet
 
         signal_age = now - self._last_signal_time
         if signal_age > self._SIGNAL_SILENCE_ALERT_SEC and not self._signal_alert_sent:
@@ -303,6 +375,34 @@ class EODSummary:
                 f"pnl=${pnl:+.2f}  ({t.get('reason','')})"
             )
         lines.append("=" * 48)
+
+        # V8: Per-strategy breakdown
+        from collections import defaultdict
+        strat_stats = defaultdict(lambda: {'count': 0, 'pnl': 0.0, 'wins': 0})
+        for t in trade_log:
+            strategy = t.get('strategy', t.get('reason', 'unknown'))
+            # Extract strategy prefix (e.g., 'pro:sr_flip' → 'pro', 'vwap_reclaim' → 'vwap')
+            if ':' in str(strategy):
+                prefix = str(strategy).split(':')[0]
+            elif strategy in ('VWAP reclaim', 'vwap_reclaim'):
+                prefix = 'vwap'
+            else:
+                prefix = str(strategy).split('_')[0] if strategy else 'unknown'
+            pnl = t.get('pnl', 0.0) or 0.0
+            strat_stats[prefix]['count'] += 1
+            strat_stats[prefix]['pnl'] += pnl
+            if pnl >= 0:
+                strat_stats[prefix]['wins'] += 1
+
+        if strat_stats:
+            lines.append("PER-STRATEGY BREAKDOWN:")
+            for prefix, stats in sorted(strat_stats.items()):
+                wr = stats['wins'] / stats['count'] if stats['count'] > 0 else 0
+                lines.append(
+                    f"  {prefix:12s}  trades={stats['count']:2d}  "
+                    f"wins={stats['wins']}({wr:.0%})  pnl=${stats['pnl']:+.2f}"
+                )
+            lines.append("=" * 48)
 
         summary = "\n".join(lines)
         log.info("\n" + summary)

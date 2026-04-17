@@ -73,20 +73,40 @@ class StrategyClassifier:
         detector_outputs: Dict[str, DetectorSignal],
     ) -> Optional[ClassificationResult]:
         """
-        Returns a ``ClassificationResult`` for the first matching rule,
-        or ``None`` if no rule matches.
+        V8: Evaluate ALL rules and return the HIGHEST CONFIDENCE match.
+        Tie-break by tier (higher tier = higher R:R = better).
+
+        V8: Sentiment boost — if sentiment detector fired, lower required
+        detector strengths by up to 25%. Formula:
+          adjusted_threshold = base_threshold × (1.0 - sentiment_strength × 0.25)
         """
+        # V8: Get sentiment strength for threshold reduction
+        sentiment_strength = 0.0
+        sentiment_sig = detector_outputs.get('sentiment')
+        if sentiment_sig and sentiment_sig.fired:
+            sentiment_strength = sentiment_sig.strength
+
+        candidates = []
         for strategy_name, tier, required in self._RULES:
             result = self._evaluate_rule(
-                strategy_name, tier, required, detector_outputs
+                strategy_name, tier, required, detector_outputs,
+                sentiment_strength=sentiment_strength,
             )
             if result is not None:
-                log.debug(
-                    "[classifier][%s] matched=%s tier=%d dir=%s conf=%.2f",
-                    ticker, strategy_name, tier, result.direction, result.confidence,
-                )
-                return result
-        return None
+                candidates.append(result)
+
+        if not candidates:
+            return None
+
+        # Pick highest confidence; break ties by tier (higher tier = better R:R)
+        best = max(candidates, key=lambda r: (r.confidence, r.tier))
+        log.debug(
+            "[classifier][%s] matched=%s tier=%d dir=%s conf=%.2f "
+            "(from %d candidates, sentiment=%.2f)",
+            ticker, best.strategy_name, best.tier, best.direction,
+            best.confidence, len(candidates), sentiment_strength,
+        )
+        return best
 
     # ── Private helpers ───────────────────────────────────────────────────
 
@@ -96,15 +116,20 @@ class StrategyClassifier:
         tier:             int,
         required:         list,
         outputs:          Dict[str, DetectorSignal],
+        sentiment_strength: float = 0.0,
     ) -> Optional[ClassificationResult]:
         """
         Check all required detector conditions.  Returns None on any miss.
-        Confidence = geometric mean of required strengths × optional bonus.
+        Confidence = arithmetic mean of required strengths × optional bonus.
+
+        V8: Sentiment reduces required detector strength thresholds by up to 25%.
         """
         strengths = []
         for det_name, min_str in required:
+            # V8: Sentiment lowers thresholds (max 25% reduction)
+            adjusted_min = min_str * (1.0 - sentiment_strength * 0.25)
             sig = outputs.get(det_name)
-            if sig is None or not sig.fired or sig.strength < min_str:
+            if sig is None or not sig.fired or sig.strength < adjusted_min:
                 return None
             strengths.append(sig.strength)
 
@@ -113,12 +138,13 @@ class StrategyClassifier:
 
         base_conf = sum(strengths) / len(strengths)
 
-        # Optional detector bonus (+0.05 per additional fired detector)
+        # V8: Optional detector bonus weighted by strength (not fixed +0.05)
         optional_bonus = 0.0
         req_names = {r[0] for r in required}
         for name, sig in outputs.items():
             if name not in req_names and sig.fired:
-                optional_bonus = min(optional_bonus + 0.05, 0.15)
+                optional_bonus += min(sig.strength * 0.05, 0.05)
+        optional_bonus = min(optional_bonus, 0.15)  # cap total bonus
 
         confidence = min(base_conf + optional_bonus, 1.0)
 

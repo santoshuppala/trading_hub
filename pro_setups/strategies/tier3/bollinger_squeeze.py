@@ -22,7 +22,7 @@ from ...detectors._compute import compute_atr
 
 class BollingerSqueeze(BaseProStrategy):
     TIER:      int   = 3
-    SL_ATR:    float = 1.5
+    SL_ATR:    float = 2.5    # V8: widened from 1.5 (post-squeeze needs room)
     PARTIAL_R: float = 3.0
     FULL_R:    float = 6.0
 

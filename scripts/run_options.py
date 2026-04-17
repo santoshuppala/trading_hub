@@ -129,20 +129,22 @@ def main():
         """Receive POP_SIGNAL from pop process → inject into local bus (deduplicated)."""
         from monitor.events import PopSignalPayload
 
-        # Dedup: skip if same (symbol, entry_price) seen within 60 seconds
+        # V8: Dedup: skip if same (symbol, entry_price) seen within 300 seconds
         symbol = payload.get('symbol', '')
         price = float(payload.get('entry_price', 0))
         dedup_key = (symbol, round(price, 2))
         now = time.monotonic()
         last_seen = _pop_signal_seen.get(dedup_key, 0)
-        if now - last_seen < 60.0:
+        if now - last_seen < 300.0:
             return  # duplicate — skip silently
         _pop_signal_seen[dedup_key] = now
 
-        # Prune old entries (prevent unbounded growth)
+        # V8: Prune by age instead of dict.clear() (preserves recent entries)
         if len(_pop_signal_seen) > 500:
-            cutoff = now - 120
-            _pop_signal_seen.clear()
+            cutoff = now - 600
+            stale_keys = [k for k, ts in _pop_signal_seen.items() if ts < cutoff]
+            for k in stale_keys:
+                del _pop_signal_seen[k]
 
         try:
             pop_payload = PopSignalPayload(

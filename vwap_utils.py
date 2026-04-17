@@ -17,7 +17,10 @@ def compute_vwap(high, low, close, volume):
     pandas Series of cumulative VWAP values, same index as inputs.
     """
     typical = (high + low + close) / 3
-    return (typical * volume).cumsum() / volume.cumsum()
+    cum_vol = volume.cumsum()
+    # V8: Replace 0 with NaN to prevent division by zero on bars with no volume,
+    # then forward-fill so VWAP is carried from last valid bar.
+    return ((typical * volume).cumsum() / cum_vol.replace(0, float('nan'))).ffill()
 
 
 def detect_vwap_reclaim(closes, vwaps, lookback=6, max_dip_age=4):

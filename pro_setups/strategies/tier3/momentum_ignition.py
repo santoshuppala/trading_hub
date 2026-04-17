@@ -22,7 +22,7 @@ from ...detectors._compute import compute_atr
 
 class MomentumIgnition(BaseProStrategy):
     TIER:      int   = 3
-    SL_ATR:    float = 1.5
+    SL_ATR:    float = 2.0    # V8: widened from 1.5 (multi-day holding)
     PARTIAL_R: float = 3.0
     FULL_R:    float = 8.0     # high expectancy — let winners run
 

@@ -82,6 +82,28 @@ class RiskSizer:
         self._beta_cache_time: Dict[str, float] = {k: time.time() for k in _STATIC_BETAS}
         self._lock = threading.Lock()
 
+    def seed_betas_from_cache(self, tickers: list) -> int:
+        """V8: Pre-seed beta cache for all tickers at startup.
+
+        Fetches betas from Yahoo Finance in bulk so the first live trade
+        doesn't block on a synchronous Yahoo call.
+
+        Returns the number of tickers successfully seeded.
+        """
+        seeded = 0
+        for ticker in tickers:
+            with self._lock:
+                if ticker in self._beta_cache:
+                    continue  # already cached
+            try:
+                beta = self.get_beta(ticker)
+                if beta != 1.0:  # got a real value
+                    seeded += 1
+            except Exception:
+                pass
+        log.info("[RiskSizer] Pre-seeded betas for %d/%d tickers", seeded, len(tickers))
+        return seeded
+
     def get_beta(self, ticker: str) -> float:
         """Get beta for a ticker. Uses cache, falls back to Yahoo Finance."""
         with self._lock:

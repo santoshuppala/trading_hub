@@ -417,6 +417,26 @@ class BacktestEngine:
 
     def _init_engines(self) -> None:
         """Initialize strategy engines based on engines_to_run."""
+        # VWAP StrategyEngine — always init alongside pro (it's the core strategy)
+        if 'pro' in self.engines_to_run or 'vwap' in self.engines_to_run:
+            try:
+                from monitor.strategy_engine import StrategyEngine
+                from config import STRATEGY_PARAMS
+                # StrategyEngine needs positions dict — create shared one
+                self._bt_positions = {}
+                self._vwap_engine = StrategyEngine(
+                    bus=self.bus.bus,
+                    positions=self._bt_positions,
+                    strategy_params=STRATEGY_PARAMS,
+                )
+                # Sync positions on fill close so VWAP can re-enter
+                self.fill_simulator.register_close_callback(
+                    'pro', lambda ticker: self._bt_positions.pop(ticker, None),
+                )
+                log.info("[BacktestEngine] Initialized StrategyEngine (VWAP)")
+            except Exception as e:
+                log.warning("[BacktestEngine] Failed to init StrategyEngine: %s", e)
+
         if 'pro' in self.engines_to_run:
             try:
                 adapter = ProBacktestAdapter(self.bus.bus, self.fill_simulator)

@@ -115,6 +115,20 @@ class OptionsPosition:
         return 0.50       # close at 50% of max_risk loss
 
 
+class _VwapSignalWrapper:
+    """Adapts SignalPayload (VWAP) to the interface FillSimulator expects."""
+    def __init__(self, signal_payload, qty: int):
+        self.ticker = signal_payload.ticker
+        self.strategy_name = 'vwap_reclaim'
+        self.direction = 'long' if str(signal_payload.action) == 'BUY' else 'short'
+        self.signal = 'BUY' if self.direction == 'long' else 'SELL'
+        self.entry_price = signal_payload.current_price
+        self.stop_price = signal_payload.stop_price
+        self.target_1 = signal_payload.half_target
+        self.target_2 = signal_payload.target_price
+        self.qty = qty
+
+
 class FillSimulator:
     """
     Simulates order fills and position management for backtesting.
@@ -151,6 +165,17 @@ class FillSimulator:
 
         # Track cumulative P&L for equity curve
         self.cumulative_pnl = 0.0
+
+    def queue_from_vwap(self, payload: Any, qty: Optional[int] = None) -> None:
+        """Queue a VWAP SIGNAL (BUY) for entry on next bar open."""
+        if qty is None:
+            price = getattr(payload, 'current_price', getattr(payload, 'ask_price', 100))
+            qty = max(1, int(self.trade_budget / price)) if price > 0 else 1
+        # Wrap VWAP signal to match the interface expected by fill logic
+        wrapped = _VwapSignalWrapper(payload, qty)
+        self.pending_pro.append((wrapped, qty))
+        log.debug("[FillSim] Queued VWAP entry: %s %d shares @ $%.2f",
+                  payload.ticker, qty, price)
 
     def queue_from_pro(self, payload: Any, qty: Optional[int] = None) -> None:
         """Queue a PRO_STRATEGY_SIGNAL for entry on next bar open."""

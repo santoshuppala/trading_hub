@@ -68,8 +68,16 @@ class SignalCapture:
     """
 
     def __init__(self):
-        self.all_signals: deque = deque(maxlen=50_000)  # bounded audit trail: ('pro' | 'pop' | 'options', payload)
+        self.all_signals: deque = deque(maxlen=50_000)  # bounded audit trail
         self.fill_simulator: Optional[Any] = None  # set by BacktestEngine after construction
+
+    def on_signal(self, event: Any) -> None:
+        """Handle SIGNAL (VWAP strategy — BUY entries and SELL exits)."""
+        payload = event.payload
+        action = str(payload.action)
+        self.all_signals.append(('vwap', payload))
+        if self.fill_simulator and action == 'BUY':
+            self.fill_simulator.queue_from_vwap(payload)
 
     def on_pro(self, event: Any) -> None:
         """Handle PRO_STRATEGY_SIGNAL."""
@@ -131,6 +139,11 @@ class BacktestBus:
         )
 
         # Capture signals at priority=999 (before router/executor)
+        self.bus.subscribe(
+            EventType.SIGNAL,
+            self.capture.on_signal,
+            priority=999,
+        )
         self.bus.subscribe(
             EventType.PRO_STRATEGY_SIGNAL,
             self.capture.on_pro,

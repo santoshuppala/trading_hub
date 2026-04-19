@@ -18,7 +18,7 @@ class GapDetector(BaseDetector):
     """
     name:         str   = 'gap'
     MIN_BARS:     int   = 5
-    _MIN_GAP_PCT: float = 0.005    # minimum 0.5% gap to qualify
+    _MIN_GAP_PCT: float = 0.015    # minimum 1.5% gap to qualify (V9: was 0.5%, too noisy)
     _MAX_GAP_PCT: float = 0.15     # ignore extreme gaps > 15% (earnings/halts handled elsewhere)
     _NORM_GAP:    float = 0.05     # 5% gap → strength = 1.0
 

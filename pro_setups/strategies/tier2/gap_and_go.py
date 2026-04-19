@@ -39,7 +39,20 @@ class GapAndGo(BaseProStrategy):
 
         direction = gap_sig.direction
 
-        # Continuation bar: close in top/bottom 40% of session range
+        # ── Volume confirmation: current bar volume > 1.2× average ──────
+        if len(df) >= 10:
+            avg_vol = float(df['volume'].iloc[-10:].mean())
+            cur_vol = float(df['volume'].iloc[-1])
+            if avg_vol > 0 and cur_vol < avg_vol * 1.2:
+                return None  # no volume behind the move
+
+        # ── Trend alignment: EMA9 > EMA21 for longs (vice versa) ────────
+        trend_sig = detector_outputs.get('trend')
+        if trend_sig and trend_sig.fired:
+            if trend_sig.direction != direction:
+                return None  # gap against the trend — likely to fill
+
+        # ── Continuation bar: close in top/bottom 30% of session range ──
         session_high = float(df['high'].max())
         session_low  = float(df['low'].min())
         last_close   = float(df['close'].iloc[-1])
@@ -50,12 +63,12 @@ class GapAndGo(BaseProStrategy):
 
         position = (last_close - session_low) / session_range
 
-        if direction == 'long'  and position < 0.60:
-            return None   # not near session high — not a go
-        if direction == 'short' and position > 0.40:
-            return None   # not near session low
+        if direction == 'long'  and position < 0.70:
+            return None   # must be near session high for "go"
+        if direction == 'short' and position > 0.30:
+            return None   # must be near session low
 
-        # VWAP alignment (optional but preferred)
+        # ── VWAP alignment: required (not optional) ─────────────────────
         vwap_sig = detector_outputs.get('vwap')
         if vwap_sig and vwap_sig.fired:
             above_vwap = vwap_sig.metadata.get('above_vwap', direction == 'long')
@@ -63,6 +76,9 @@ class GapAndGo(BaseProStrategy):
                 return None
             if direction == 'short' and above_vwap:
                 return None
+        else:
+            # VWAP must fire — no signal without it
+            return None
 
         return direction
 

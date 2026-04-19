@@ -204,13 +204,20 @@ class FillSimulator:
             new_pending = []
             for payload, qty in pending_list:
                 if payload.ticker == ticker:
+                    # Determine side: support both 'signal' (sync_bus) and 'direction' (live payload)
+                    is_long = True
+                    if hasattr(payload, 'signal'):
+                        is_long = payload.signal == 'BUY'
+                    elif hasattr(payload, 'direction'):
+                        is_long = payload.direction == 'long'
+
                     # Fill at open with slippage
-                    fill_price = o * (1.0 + SPREAD_FACTOR) if payload.signal == 'BUY' else o * (1.0 - SPREAD_FACTOR)
+                    fill_price = o * (1.0 + SPREAD_FACTOR) if is_long else o * (1.0 - SPREAD_FACTOR)
                     pos = OpenPosition(
                         ticker=ticker,
                         layer=layer_name,
                         strategy_name=payload.strategy_name if hasattr(payload, 'strategy_name') else 'unknown',
-                        side=PositionSide.LONG if payload.signal == 'BUY' else PositionSide.SHORT,
+                        side=PositionSide.LONG if is_long else PositionSide.SHORT,
                         entry_bar_ts=None,  # will be set by BacktestEngine
                         entry_price=fill_price,
                         stop_price=payload.stop_price,
@@ -270,12 +277,12 @@ class FillSimulator:
             positions = self.open_positions[layer_name]
             remaining = []
             for pos in positions:
-                if pos.ticker != ticker or not pos.fill_pending:
-                    # Different ticker or already exited
-                    if pos.ticker == ticker and pos.exit_reason is not None:
-                        remaining.append(pos)
-                    elif pos.ticker != ticker:
-                        remaining.append(pos)
+                if pos.ticker != ticker:
+                    remaining.append(pos)
+                    continue
+                if pos.fill_pending or pos.exit_reason is not None:
+                    # Still pending fill or already exited
+                    remaining.append(pos)
                     continue
 
                 # Check stop

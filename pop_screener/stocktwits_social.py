@@ -228,6 +228,35 @@ class StockTwitsSocialSource:
         )
 
 
+    def discover_trending(self) -> List[str]:
+        """V8: Fetch StockTwits trending tickers. 1 API call = top 30 tickers.
+        No per-ticker cost. Returns list of trending ticker symbols.
+        """
+        # Cache for 15 min
+        cached = self._cache.get('__trending__')
+        if cached and (time.monotonic() - cached[0]) < 900:
+            return cached[1]
+
+        try:
+            url = 'https://api.stocktwits.com/api/2/trending/symbols.json'
+            params = {}
+            if self._access_token:
+                params['access_token'] = self._access_token
+            resp = self._session.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                symbols = data.get('symbols', [])
+                tickers = [s.get('symbol', '') for s in symbols
+                          if isinstance(s, dict) and s.get('symbol', '').isalpha()
+                          and len(s.get('symbol', '')) <= 5]
+                self._cache['__trending__'] = (time.monotonic(), tickers)
+                log.info("[StockTwits] Trending: %d tickers", len(tickers))
+                return tickers
+        except Exception as exc:
+            log.debug("[StockTwits] Trending fetch failed: %s", exc)
+        return []
+
+
 def _parse_ts(ts_str: str) -> datetime:
     """Parse StockTwits timestamp format: '2026-04-12T10:30:00Z'."""
     for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S%z'):

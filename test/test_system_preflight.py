@@ -198,7 +198,7 @@ def test_3_alpaca():
 
     accounts = [
         ('Main', os.getenv('APCA_API_KEY_ID', ''), os.getenv('APCA_API_SECRET_KEY', '')),
-        ('Pop', os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_PUPUP_SECRET_KEY', '')),
+        ('Pop', os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_POPUP_SECRET_KEY', '')),
         ('Options', os.getenv('APCA_OPTIONS_KEY', ''), os.getenv('APCA_OPTIONS_SECRET', '')),
     ]
     base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
@@ -965,7 +965,7 @@ def test_18_broker_live_validation():
     # Check no accidental short positions at any broker
     accounts = [
         ('Alpaca Main', os.getenv('APCA_API_KEY_ID', ''), os.getenv('APCA_API_SECRET_KEY', '')),
-        ('Alpaca Pop', os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_PUPUP_SECRET_KEY', '')),
+        ('Alpaca Pop', os.getenv('APCA_POPUP_KEY', ''), os.getenv('APCA_POPUP_SECRET_KEY', '')),
         ('Alpaca Options', os.getenv('APCA_OPTIONS_KEY', ''), os.getenv('APCA_OPTIONS_SECRET', '')),
     ]
     base = os.getenv('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
@@ -1181,15 +1181,15 @@ def test_20_data_collector():
     check("20l: PortfolioRiskGate has market regime filter",
           'market_regime' in pr_src or 'regime' in pr_src)
 
-    # Verify Pop subscribes to discovery topic
-    pop_path = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), 'scripts', 'run_pop.py')
-    with open(pop_path) as f:
-        pop_src = f.read()
-    check("20m: Pop subscribes to th-discovery",
-          'TOPIC_DISCOVERY' in pop_src or 'th-discovery' in pop_src)
-    check("20n: Pop adds discovered tickers to scan",
-          '_extra_tickers' in pop_src or 'discovered' in pop_src.lower())
+    # V8: Pop merged into Core — verify discovery in run_core.py
+    core_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'scripts', 'run_core.py')
+    with open(core_path) as f:
+        core_src = f.read()
+    check("20m: V8 Core subscribes to th-discovery",
+          'TOPIC_DISCOVERY' in core_src or 'th-discovery' in core_src)
+    check("20n: V8 Core adds discovered tickers to scan",
+          '_ticker_set' in core_src or 'discovery' in core_src.lower())
 
     # Verify DB migration exists
     migration_path = os.path.join(os.path.dirname(os.path.dirname(

@@ -106,6 +106,8 @@ class RiskEngine:
         self._max_positions   = max_positions
         self._order_cooldown  = order_cooldown
         self._trade_budget    = trade_budget
+        # V9: Optional streaming client for instant price lookups
+        self._stream_client   = None  # set via set_stream_client()
         self._alert_email     = alert_email
         self._sizer           = RiskSizer()
 
@@ -254,6 +256,24 @@ class RiskEngine:
                          ticker, qty, sizing.adjusted_qty, sizing.adjustment_reason)
                 qty = sizing.adjusted_qty
 
+            # V8: Conviction-based position sizing
+            # Higher conviction = larger position (from TickerRankingEngine)
+            try:
+                from data_sources.ticker_ranking import _engine as _ranking_engine
+                cached = _ranking_engine._cache.get(ticker)
+                if cached:
+                    _, ranking = cached
+                    conv_mult = ranking.size_multiplier
+                    if conv_mult != 1.0:
+                        old_qty = qty
+                        qty = max(1, int(qty * conv_mult))
+                        log.info("[RiskEngine] Conviction sizing %s: %d → %d "
+                                 "(conv=%.2f, %s, %s)",
+                                 ticker, old_qty, qty, ranking.conviction,
+                                 ranking.strategy, ranking.catalyst)
+            except Exception:
+                pass
+
             # V7.1: Market regime position sizing (F&G + VIX)
             try:
                 from data_sources.market_regime import regime
@@ -345,9 +365,20 @@ class RiskEngine:
             correlation_id=event.event_id,
         ))
 
+    def set_stream_client(self, stream_client) -> None:
+        """V9: Attach TradierStreamClient for instant price lookups.
+
+        When set, _get_spread() uses streaming bid/ask (<1ms) instead of
+        REST API call (0.5-3s). Falls back to REST if streaming unavailable.
+        """
+        self._stream_client = stream_client
+        log.info("[RiskEngine] Stream client attached — using streaming prices for spread check")
+
     def _get_spread(self, ticker: str, signal_ask: float):
         """
-        Fetch a fresh Level-1 quote from the data client.
+        Get a fresh Level-1 quote for spread and price checks.
+
+        V9: Tries streaming price first (<1ms). Falls back to REST API (0.5-3s).
 
         Returns (spread_pct, ask_price) on success.
         Returns (None, None) on any failure so the caller can block the trade
@@ -356,22 +387,44 @@ class RiskEngine:
         Also returns (None, None) if the live ask diverges more than 0.5% from
         the signal's ask — a fast-moving price means the entry thesis has changed.
         """
-        try:
-            spread_pct, ask_price = self._data.check_spread(ticker)
-            if spread_pct is None or ask_price is None or ask_price <= 0:
-                log.warning(
-                    f"[RiskEngine] check_spread({ticker}) returned invalid data "
-                    f"({spread_pct}, {ask_price}) — blocking entry"
-                )
+        ask_price = None
+        spread_pct = None
+
+        # V9: Try streaming price first (<1ms vs 0.5-3s REST)
+        if self._stream_client is not None:
+            try:
+                quote = self._stream_client.get_quote(ticker)
+                if quote and quote.get('ask', 0) > 0 and quote.get('bid', 0) > 0:
+                    ask_price = quote['ask']
+                    bid = quote['bid']
+                    mid = (ask_price + bid) / 2
+                    spread_pct = (ask_price - bid) / mid if mid > 0 else 0
+                    log.debug("[RiskEngine] %s spread from STREAM: ask=$%.2f spread=%.4f",
+                              ticker, ask_price, spread_pct)
+            except Exception:
+                pass  # fall through to REST
+
+        # Fallback: REST API call (0.5-3s)
+        if ask_price is None:
+            try:
+                spread_pct, ask_price = self._data.check_spread(ticker)
+            except Exception as e:
+                log.warning(f"[RiskEngine] check_spread({ticker}) failed: {e} — blocking entry")
                 return None, None
-            # Price-divergence guard: signal ask may be stale if the market moved
-            if signal_ask > 0 and abs(ask_price - signal_ask) / signal_ask > 0.005:
-                log.warning(
-                    f"[RiskEngine] {ticker}: live ask ${ask_price:.2f} diverges "
-                    f">0.5% from signal ask ${signal_ask:.2f} — blocking entry"
-                )
-                return None, None
-            return spread_pct, ask_price
-        except Exception as e:
-            log.warning(f"[RiskEngine] check_spread({ticker}) failed: {e} — blocking entry")
+
+        if spread_pct is None or ask_price is None or ask_price <= 0:
+            log.warning(
+                f"[RiskEngine] check_spread({ticker}) returned invalid data "
+                f"({spread_pct}, {ask_price}) — blocking entry"
+            )
             return None, None
+
+        # Price-divergence guard: signal ask may be stale if the market moved
+        if signal_ask > 0 and abs(ask_price - signal_ask) / signal_ask > 0.005:
+            log.warning(
+                f"[RiskEngine] {ticker}: live ask ${ask_price:.2f} diverges "
+                f">0.5% from signal ask ${signal_ask:.2f} — blocking entry"
+            )
+            return None, None
+
+        return spread_pct, ask_price

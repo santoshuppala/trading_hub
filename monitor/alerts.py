@@ -48,6 +48,7 @@ _worker_started = False
 _worker_lock = threading.Lock()
 _consecutive_failures = 0
 _backoff_until = 0.0
+_worker_disabled_until = 0.0  # V8: auto-recover after 30 min cooldown
 
 
 def _alert_worker() -> None:
@@ -100,21 +101,39 @@ def _alert_worker() -> None:
                 f"Alert delivery failed — backoff {backoff_secs}s "
                 f"({_consecutive_failures} consecutive failures)"
             )
-            # V8: Stop hammering SMTP after 10 failures (Yahoo rate-limits us)
+            # V9 (R6): Reduced blackout from 30 min to 5 min.
+            # CRITICAL alerts bypass blackout entirely.
             if _consecutive_failures >= 10:
+                _worker_disabled_until = time.time() + 300  # 5 min cooldown (was 30 min)
                 log.critical(
-                    "Alert delivery permanently disabled after %d consecutive failures. "
-                    "Fix SMTP config and restart.", _consecutive_failures)
-                # Drain queue to log only
+                    "Alert delivery paused after %d consecutive failures. "
+                    "Will retry in 5 min. CRITICAL alerts still attempt delivery.",
+                    _consecutive_failures)
+                # Drain queue — log all, attempt delivery for CRITICAL only
                 while not _alert_queue.empty():
                     try:
                         item = _alert_queue.get_nowait()
                         if item:
-                            log.info("ALERT (email disabled): %s", item[1][:200])
+                            _email, _msg = item[0], item[1]
+                            _sev = item[2] if len(item) > 2 else 'INFO'
+                            if _sev == 'CRITICAL':
+                                try:
+                                    _send_email(_email, _msg, severity='CRITICAL')
+                                    log.info("CRITICAL alert sent despite blackout: %s", _msg[:100])
+                                except Exception:
+                                    log.info("ALERT (CRITICAL, delivery failed): %s", _msg[:200])
+                            else:
+                                log.info("ALERT (email paused): %s", _msg[:200])
                         _alert_queue.task_done()
                     except Exception:
                         break
-                return  # stop worker thread
+                # Sleep for cooldown then reset and continue
+                time.sleep(300)
+                _consecutive_failures = 0
+                _backoff_until = 0.0
+                _worker_disabled_until = 0.0
+                log.info("Alert delivery resuming after 5 min cooldown")
+                continue  # resume the worker loop
         else:
             _consecutive_failures = 0
             _backoff_until = 0.0
@@ -183,6 +202,12 @@ def send_alert(alert_email, message, severity='INFO'):
     if not alert_email:
         log.info(f"ALERT: {tagged_message}")
         return
+
+    # V8: If worker is in cooldown, log instead of queuing
+    if _worker_disabled_until > 0 and time.time() < _worker_disabled_until:
+        log.info("ALERT (email paused): %s", tagged_message[:200])
+        return
+
     _ensure_worker()
     try:
         _alert_queue.put_nowait((alert_email, tagged_message))

@@ -182,17 +182,24 @@ class TradierDataClient(BaseDataClient):
             return ticker, bars, hist
 
         # V8: Reuse persistent executor instead of creating a new one per call
+        # V9 (R5): Hard 20s timeout on entire batch to prevent pool deadlock
+        import concurrent.futures as _cf
         futures = {self._executor.submit(_fetch_one, t): t for t in tickers}
-        if True:  # maintain indentation compatibility
-            for f in as_completed(futures):
-                try:
-                    ticker, bars, hist = f.result(timeout=30)
-                    if not bars.empty:
-                        bars_cache[ticker] = bars
-                    if not hist.empty:
-                        rvol_cache[ticker] = hist
-                except Exception as e:
-                    log.error(f"Fetch error for {futures[f]}: {e}")
+        done, not_done = _cf.wait(futures, timeout=20)
+        if not_done:
+            for f in not_done:
+                f.cancel()
+            log.warning("[TradierClient] %d/%d tickers timed out in fetch_batch_bars "
+                        "(20s hard limit)", len(not_done), len(tickers))
+        for f in done:
+            try:
+                ticker, bars, hist = f.result(timeout=1)
+                if not bars.empty:
+                    bars_cache[ticker] = bars
+                if not hist.empty:
+                    rvol_cache[ticker] = hist
+            except Exception as e:
+                log.error(f"Fetch error for {futures[f]}: {e}")
 
         log.info(f"Tradier: fetched bars for {len(bars_cache)}/{len(tickers)} tickers.")
         return bars_cache, rvol_cache

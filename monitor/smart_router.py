@@ -162,6 +162,36 @@ class SmartRouter:
         p = event.payload
         ticker = p.ticker
 
+        # V8: Dual-broker sell splitting — if position spans both brokers,
+        # split the sell so each broker sells its own shares
+        side = str(getattr(p, 'side', '')).upper()
+        if 'SELL' in side and hasattr(self, '_positions_ref') and self._positions_ref:
+            pos = self._positions_ref.get(ticker, {})
+            broker_qty = pos.get('_broker_qty')
+            if broker_qty and len(broker_qty) > 1:
+                sell_qty = p.qty
+                for b_name, b_qty in sorted(broker_qty.items(),
+                                             key=lambda x: x[1], reverse=True):
+                    if sell_qty <= 0:
+                        break
+                    b = self._brokers.get(b_name)
+                    if not b or not self._is_healthy(b_name):
+                        continue
+                    chunk = min(sell_qty, b_qty)
+                    if chunk <= 0:
+                        continue
+                    log.info("[SmartRouter] SPLIT SELL %s: %d of %d to %s (has %d)",
+                             ticker, chunk, p.qty, b_name, b_qty)
+                    # Create a modified payload with the chunk qty
+                    from copy import copy
+                    chunk_event = copy(event)
+                    chunk_payload = copy(p)
+                    object.__setattr__(chunk_payload, 'qty', chunk)
+                    chunk_event.payload = chunk_payload
+                    self._execute_on_broker(b_name, b, chunk_payload, chunk_event)
+                    sell_qty -= chunk
+                return
+
         # Determine preferred broker
         preferred = self._select_broker(p)
 
@@ -395,9 +425,9 @@ class SmartRouter:
         """
         overlap = alpaca_tickers & tradier_tickers
         if overlap:
-            log.error(
+            log.warning(
                 "[SmartRouter] DUAL-BROKER OVERLAP detected: %s at both brokers. "
-                "Tradier mapping will take precedence. Manual close recommended.",
+                "Sells will be split across both brokers.",
                 overlap)
 
         with self._lock:

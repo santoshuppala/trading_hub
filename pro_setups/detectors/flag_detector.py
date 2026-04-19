@@ -18,6 +18,7 @@ class FlagDetector(BaseDetector):
     """
     name:            str   = 'flag'
     MIN_BARS:        int   = 25
+    _MIN_5M_BARS:    int   = 10     # V9: 10 5-min bars = 50 min for pole+flag
     _POLE_BARS_MAX:  int   = 8
     _POLE_ATR_MULT:  float = 3.0   # pole must be ≥ 3× ATR
     _FLAG_BARS:      int   = 10    # consolidation window to check
@@ -29,17 +30,23 @@ class FlagDetector(BaseDetector):
         ticker:  str,
         df:      pd.DataFrame,
         rvol_df: Optional[pd.DataFrame],
+        precomputed: dict = None,
+        **kw,
     ) -> DetectorSignal:
-        atr = compute_atr(df)
+        # V9: Use 5-min bars — flag patterns need real consolidation (50 min, not 10 min)
+        work_df = precomputed.get('df_5min', df) if precomputed else df
+        if len(work_df) < self._MIN_5M_BARS:
+            return DetectorSignal.no_signal()
+        atr = precomputed.get('atr_5m', compute_atr(work_df)) if precomputed else compute_atr(work_df)
 
         # Identify pole: look for large directional move before the flag window
-        flag_start = max(0, len(df) - self._FLAG_BARS - self._POLE_BARS_MAX)
-        flag_end   = max(0, len(df) - self._FLAG_BARS)
+        flag_start = max(0, len(work_df) - self._FLAG_BARS - self._POLE_BARS_MAX)
+        flag_end   = max(0, len(work_df) - self._FLAG_BARS)
 
         if flag_end <= flag_start:
             return DetectorSignal.no_signal()
 
-        pole_slice = df.iloc[flag_start:flag_end]
+        pole_slice = work_df.iloc[flag_start:flag_end]
         pole_move  = float(pole_slice['close'].iloc[-1]) - float(pole_slice['close'].iloc[0])
 
         if abs(pole_move) < self._POLE_ATR_MULT * atr:
@@ -48,7 +55,7 @@ class FlagDetector(BaseDetector):
         bull_flag = pole_move > 0
 
         # Flag: consolidation in last _FLAG_BARS bars
-        flag_slice  = df.tail(self._FLAG_BARS)
+        flag_slice  = work_df.tail(self._FLAG_BARS)
         flag_high   = float(flag_slice['high'].max())
         flag_low    = float(flag_slice['low'].min())
         flag_range  = flag_high - flag_low
@@ -56,6 +63,7 @@ class FlagDetector(BaseDetector):
         if flag_range > self._FLAG_ATR_MULT * atr:
             return DetectorSignal.no_signal()
 
+        # Use latest 1-min close for breakout check (most current price)
         last_close = float(df['close'].iloc[-1])
 
         # Breakout: close breaks out of flag

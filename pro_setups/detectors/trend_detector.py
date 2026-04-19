@@ -14,8 +14,9 @@ class TrendDetector(BaseDetector):
 
     Strength = fraction of HH+HL pairs in last ``_LOOKBACK`` bars.
     """
-    name:      str = 'trend'
-    MIN_BARS:  int = 52      # need 50 bars for EMA50
+    name:          str = 'trend'
+    MIN_BARS:      int = 52      # need 50 bars for EMA50 (1-min)
+    _MIN_5M_BARS:  int = 12      # V9: 12 5-min bars = 60 min for session trend
     _LOOKBACK: int = 20
     _MIN_STR:  float = 0.45  # require 45% of bars to be trending structure
 
@@ -24,11 +25,22 @@ class TrendDetector(BaseDetector):
         ticker:  str,
         df:      pd.DataFrame,
         rvol_df: Optional[pd.DataFrame],
+        precomputed: dict = None,
+        **kw,
     ) -> DetectorSignal:
-        close = df['close']
-        ema9  = compute_ema(close, 9)
-        ema20 = compute_ema(close, 20)
-        ema50 = compute_ema(close, 50)
+        # V9: Use 5-min bars for trend detection
+        # EMA50 on 5-min = 250 min (full session trend) vs 50 min (incomplete)
+        work_df = precomputed.get('df_5min', df) if precomputed else df
+        if len(work_df) < self._MIN_5M_BARS:
+            return DetectorSignal.no_signal()
+
+        # Use precomputed 5-min EMAs if available
+        ema9 = precomputed.get('ema_9_5m') if precomputed else compute_ema(work_df['close'], 9)
+        ema20 = precomputed.get('ema_21_5m') if precomputed else compute_ema(work_df['close'], 20)
+        ema50 = precomputed.get('ema_50_5m') if precomputed else compute_ema(work_df['close'], 50)
+
+        if ema9 is None or ema20 is None or ema50 is None or len(ema50) == 0:
+            return DetectorSignal.no_signal()
 
         last_e9  = float(ema9.iloc[-1])
         last_e20 = float(ema20.iloc[-1])
@@ -40,9 +52,9 @@ class TrendDetector(BaseDetector):
         if not (uptrend or downtrend):
             return DetectorSignal.no_signal()
 
-        # Structural confirmation over last N bars
-        highs = df['high'].values[-self._LOOKBACK:]
-        lows  = df['low'].values[-self._LOOKBACK:]
+        # Structural confirmation over last N bars (on 5-min)
+        highs = work_df['high'].values[-self._LOOKBACK:]
+        lows  = work_df['low'].values[-self._LOOKBACK:]
         n     = len(highs) - 1
         if n <= 0:
             return DetectorSignal.no_signal()
@@ -62,7 +74,8 @@ class TrendDetector(BaseDetector):
             return DetectorSignal.no_signal()
 
         # Pullback context: is price near EMA20 (good entry zone)?
-        last_close  = float(close.iloc[-1])
+        # Use latest 1-min close for most current price
+        last_close  = float(df['close'].iloc[-1])
         dist_ema20  = abs(last_close - last_e20) / last_close
         near_ema20  = dist_ema20 < 0.015      # within 1.5%
         dist_ema9   = abs(last_close - last_e9) / last_close

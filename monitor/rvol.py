@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -139,53 +140,265 @@ class RVOLEngine:
     Lifecycle:
       1. seed_profiles() — called once at session start, loads 20-day history
       2. update() — called on every BAR event, returns RVOLResult
-      3. reset_session() — called at EOD, clears today's state
+      3. update_from_cvol() — V9: called with streaming cvol for real-time RVOL
+      4. reset_session() — called at EOD, clears today's state
+
+    V9 improvements:
+      - Profile caching: saves to data/rvol_profiles_YYYYMMDD.json
+        Same-day restarts load from cache (<1s) instead of API (51s)
+      - Parallel seeding: ThreadPoolExecutor(40) for first-run-of-day (51s → ~5s)
+      - Streaming cvol: update_from_cvol() uses Tradier's cumulative volume
+        for instant RVOL (no bar accumulation, survives restart)
 
     Thread-safe: all state mutations under lock.
     """
+
+    _CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    _CACHE_PREFIX = 'rvol_profiles_'
+    _MAX_SEED_WORKERS = 40
 
     def __init__(self) -> None:
         self._profiles: Dict[str, _VolumeProfile] = {}
         self._state: Dict[str, _TickerState] = defaultdict(_TickerState)
         self._lock = threading.Lock()
         self._session_date: Optional[date] = None
+        # V9: streaming cvol reference (set via set_stream_client)
+        self._stream_client = None
         log.info("[RVOLEngine] initialized")
+
+    def set_stream_client(self, stream_client) -> None:
+        """V9: Attach TradierStreamClient for real-time cvol-based RVOL."""
+        self._stream_client = stream_client
+        log.info("[RVOLEngine] Streaming cvol attached — real-time RVOL active")
 
     # ── Profile Seeding (session start) ──────────────────────────────────────
 
     def seed_profiles(self, tickers: List[str], data_client) -> None:
         """
-        Precompute 20-day intraday volume profiles for all tickers.
-        Called once at session start. Uses data_client.get_daily_history()
-        for daily data, or intraday bars if available.
+        Load or build 20-day intraday volume profiles for all tickers.
+
+        V9: Tries disk cache first (<1s). Falls back to parallel API fetch (~5s).
+        Cache file: data/rvol_profiles_YYYYMMDD.json
 
         Args:
             tickers: list of symbols
-            data_client: TradierDataClient or AlpacaDataClient with
-                         get_daily_history(ticker, start, end) method
+            data_client: TradierDataClient or AlpacaDataClient
         """
+        import time as _time
+        t0 = _time.monotonic()
         today = datetime.now(ET).date()
         self._session_date = today
-        start = today - timedelta(days=LOOKBACK_DAYS + 10)  # buffer for weekends
 
-        seeded = 0
-        for ticker in tickers:
+        # V9: Try loading from disk cache first
+        if self._load_cache(today):
+            elapsed = (_time.monotonic() - t0) * 1000
+            log.info("[RVOLEngine] Loaded %d profiles from cache in %.0fms (same-day restart)",
+                     len(self._profiles), elapsed)
+            return
+
+        # First run of the day — fetch from API with parallel workers
+        start = today - timedelta(days=LOOKBACK_DAYS + 10)
+
+        log.info("[RVOLEngine] No cache for %s — fetching from API (parallel, %d workers)",
+                 today, self._MAX_SEED_WORKERS)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _seed_worker(ticker):
             try:
                 self._seed_one(ticker, data_client, start, today)
-                seeded += 1
+                return ticker, True
             except Exception as e:
                 log.debug("[RVOLEngine] seed failed for %s: %s", ticker, e)
+                return ticker, False
+
+        seeded = 0
+        with ThreadPoolExecutor(max_workers=self._MAX_SEED_WORKERS) as executor:
+            futures = {executor.submit(_seed_worker, t): t for t in tickers}
+            # Hard timeout: 30s max for entire batch
+            import concurrent.futures as _cf
+            done, not_done = _cf.wait(futures, timeout=30)
+            for f in not_done:
+                f.cancel()
+            if not_done:
+                log.warning("[RVOLEngine] %d/%d tickers timed out during seed",
+                            len(not_done), len(tickers))
+            for f in done:
+                try:
+                    ticker, ok = f.result(timeout=1)
+                    if ok:
+                        seeded += 1
+                except Exception:
+                    pass
+
+        elapsed = (_time.monotonic() - t0) * 1000
 
         # V8: Warn if seed rate drops below 80%
         seed_rate = seeded / len(tickers) if tickers else 0
         if seed_rate < 0.80:
             log.warning(
-                "[RVOLEngine] LOW SEED RATE: only %d/%d tickers seeded (%.0f%%). "
-                "RVOL data may be unreliable for unseeded tickers.",
-                seeded, len(tickers), seed_rate * 100,
+                "[RVOLEngine] LOW SEED RATE: only %d/%d tickers seeded (%.0f%%) in %.1fs",
+                seeded, len(tickers), seed_rate * 100, elapsed / 1000,
             )
         else:
-            log.info("[RVOLEngine] seeded profiles for %d/%d tickers", seeded, len(tickers))
+            log.info("[RVOLEngine] seeded profiles for %d/%d tickers in %.1fs",
+                     seeded, len(tickers), elapsed / 1000)
+
+        # V9: Save to disk cache for same-day restarts
+        self._save_cache(today)
+
+    # ── V9: Profile Disk Cache ───────────────────────────────────────────────
+
+    def _cache_path(self, today: date) -> str:
+        return os.path.join(self._CACHE_DIR, f'{self._CACHE_PREFIX}{today.isoformat()}.json')
+
+    def _save_cache(self, today: date) -> None:
+        """Save profiles to disk for same-day restart."""
+        try:
+            import json as _json
+            os.makedirs(self._CACHE_DIR, exist_ok=True)
+            cache = {}
+            with self._lock:
+                for ticker, profile in self._profiles.items():
+                    cache[ticker] = {
+                        'buckets': {
+                            str(k): [(wd, cv) for wd, cv in v]
+                            for k, v in profile.buckets.items()
+                        },
+                        'trading_dates': [d.isoformat() for d in (profile.trading_dates or [])],
+                    }
+            path = self._cache_path(today)
+            with open(path + '.tmp', 'w') as f:
+                _json.dump({'date': today.isoformat(), 'profiles': cache}, f)
+            os.replace(path + '.tmp', path)
+            log.info("[RVOLEngine] Cached %d profiles to %s", len(cache), os.path.basename(path))
+
+            # Clean old cache files (keep only today)
+            for f in os.listdir(self._CACHE_DIR):
+                if f.startswith(self._CACHE_PREFIX) and f.endswith('.json'):
+                    if today.isoformat() not in f:
+                        try:
+                            os.unlink(os.path.join(self._CACHE_DIR, f))
+                        except Exception:
+                            pass
+        except Exception as exc:
+            log.warning("[RVOLEngine] Cache save failed: %s", exc)
+
+    def _load_cache(self, today: date) -> bool:
+        """Load profiles from disk cache. Returns True if loaded."""
+        try:
+            import json as _json
+            path = self._cache_path(today)
+            if not os.path.exists(path):
+                return False
+            with open(path) as f:
+                data = _json.load(f)
+            if data.get('date') != today.isoformat():
+                return False
+
+            with self._lock:
+                for ticker, pdata in data.get('profiles', {}).items():
+                    profile = _VolumeProfile()
+                    for k, entries in pdata.get('buckets', {}).items():
+                        profile.buckets[int(k)] = [(wd, cv) for wd, cv in entries]
+                    profile.trading_dates = [
+                        date.fromisoformat(d) for d in pdata.get('trading_dates', [])
+                    ]
+                    self._profiles[ticker] = profile
+            return True
+        except Exception as exc:
+            log.warning("[RVOLEngine] Cache load failed: %s", exc)
+            return False
+
+    # ── V9: Streaming cvol-based RVOL ────────────────────────────────────────
+
+    def update_from_cvol(self, ticker: str, cvol: int,
+                          bar_timestamp: Optional[datetime] = None) -> RVOLResult:
+        """Compute RVOL from streaming cumulative volume (no bar accumulation).
+
+        Unlike update() which accumulates bar volumes, this uses the broker's
+        authoritative cumulative daily volume directly. This:
+        - Survives restart (cvol is broker-side, not our counter)
+        - Updates on every trade event (<1s, not 60s BAR cycle)
+        - Is always correct (no missed bars or double-counting)
+
+        Args:
+            ticker: symbol
+            cvol: cumulative daily volume from Tradier trade event
+            bar_timestamp: optional timestamp (uses now if None)
+
+        Returns:
+            RVOLResult
+        """
+        if bar_timestamp is None:
+            bar_timestamp = datetime.now(ET)
+
+        profile = self._profiles.get(ticker)
+        if profile is None or not profile.trading_dates:
+            return RVOLResult.neutral()
+
+        if len(profile.trading_dates) < MIN_PROFILE_DAYS:
+            return RVOLResult.neutral()
+
+        # Compute which 5-min bucket we're in
+        market_open = datetime.combine(bar_timestamp.date(), MARKET_OPEN, tzinfo=ET)
+        minutes_since_open = max(0, (bar_timestamp - market_open).total_seconds() / 60)
+        bucket_idx = min(int(minutes_since_open / BUCKET_MINUTES), BUCKETS_PER_DAY - 1)
+
+        today_weekday = bar_timestamp.weekday()
+        expected = profile.expected_cumulative_at(bucket_idx, today_weekday)
+        if expected < MIN_EXPECTED_VOLUME:
+            return RVOLResult.neutral()
+
+        # RVOL = actual cvol / expected cumulative at this bucket
+        raw_rvol = cvol / expected
+        raw_rvol = max(RVOL_CLAMP_MIN, min(raw_rvol, RVOL_CLAMP_MAX))
+
+        # EMA smoothing
+        with self._lock:
+            state = self._state[ticker]
+            alpha = 2.0 / (EMA_SPAN + 1)
+            state.ema_state = alpha * raw_rvol + (1 - alpha) * state.ema_state
+            rvol_smooth = state.ema_state
+
+        # Percentile ranking
+        hist = profile.historical_rvol_at(bucket_idx, today_weekday)
+        if hist:
+            below = sum(1 for h in hist if h <= raw_rvol)
+            percentile = (below / len(hist)) * 100
+        else:
+            percentile = 50.0
+
+        # Quality classification
+        if raw_rvol > 3.0 and raw_rvol > rvol_smooth * 1.5:
+            quality = 'spike'
+        elif raw_rvol > 2.0 and abs(raw_rvol - rvol_smooth) < 0.3:
+            quality = 'sustained'
+        elif raw_rvol > 5.0:
+            quality = 'block_trade'
+        else:
+            quality = 'normal'
+
+        return RVOLResult(
+            rvol=round(raw_rvol, 4),
+            rvol_smooth=round(rvol_smooth, 4),
+            rvol_percentile=round(percentile, 1),
+            acceleration=1.0,  # not meaningful for single-sample cvol
+            quality=quality,
+        )
+
+    def get_realtime_rvol(self, ticker: str) -> Optional[RVOLResult]:
+        """Get real-time RVOL using streaming cvol if available.
+
+        Returns None if streaming is not available — caller should
+        fall back to BAR-based update().
+        """
+        if self._stream_client is None:
+            return None
+        cvol = self._stream_client.get_cvol(ticker)
+        if cvol is None or cvol <= 0:
+            return None
+        return self.update_from_cvol(ticker, cvol)
 
     def _seed_one(self, ticker: str, data_client, start: date, today: date) -> None:
         """Build volume profile for one ticker from historical data."""

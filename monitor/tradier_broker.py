@@ -23,7 +23,13 @@ log = logging.getLogger(__name__)
 
 
 class TradierBroker:
-    """Equity + options broker using Tradier REST API."""
+    """Equity + options broker using Tradier REST API.
+
+    NOTE: Does not inherit BaseBroker because _execute_buy/_execute_sell
+    have different signatures (extra parent_event param). However, it
+    implements the same query interface (get_positions, get_equity,
+    supports_fractional) so BrokerRegistry can iterate it generically.
+    """
 
     FILL_TIMEOUT_SEC = 5.0
     FILL_POLL_SEC = 0.5
@@ -188,11 +194,19 @@ class TradierBroker:
     # ── Equity sell (market) ─────────────────────────────────────────
 
     def _cancel_open_orders(self, ticker: str) -> None:
-        """Cancel any open orders for a ticker before selling (prevents bracket double-sell)."""
+        """Cancel any open orders for a ticker before selling (prevents bracket double-sell).
+
+        V8 fix: Tradier sandbox filter=open returns ALL orders (filled/rejected/etc).
+        We filter client-side by status='pending' or 'open' only, and cache stale IDs
+        to avoid hammering 401s on already-terminated orders.
+        """
+        if not hasattr(self, '_stale_order_ids'):
+            self._stale_order_ids = set()
         try:
+            # V8: Don't use filter=open — Tradier sandbox returns stale orders
+            # but EXCLUDES actually-open stop orders. Filter client-side instead.
             resp = self._session.get(
                 f"{self._base}/v1/accounts/{self._account}/orders",
-                params={"filter": "open"},
                 timeout=5,
             )
             if resp.status_code == 200:
@@ -202,24 +216,37 @@ class TradierBroker:
                     if isinstance(order_list, dict):
                         order_list = [order_list]
                     cancelled = 0
+                    matching = sum(1 for o in order_list
+                                   if o.get("symbol") == ticker
+                                   and o.get("side") in ("sell", "sell_short")
+                                   and o.get("status") in ("pending", "open", "partially_filled"))
+                    log.info("[TradierBroker] _cancel_open_orders(%s): %d total orders, %d matching open sells",
+                             ticker, len(order_list), matching)
                     for o in order_list:
                         sym = o.get("symbol", "")
                         side = o.get("side", "")
-                        if sym == ticker and side in ("sell", "sell_short"):
-                            oid = o.get("id")
-                            if oid:
-                                resp = self._session.delete(
-                                    f"{self._base}/v1/accounts/{self._account}/orders/{oid}",
-                                    timeout=5,
-                                )
-                                # V8: Check response — don't count failed cancels
-                                if resp.status_code == 200:
-                                    cancelled += 1
-                                else:
-                                    log.warning("[TradierBroker] Cancel order %s failed: status=%d",
-                                                oid, resp.status_code)
+                        status = o.get("status", "")
+                        oid = o.get("id")
+                        # Only cancel truly open/pending orders for this ticker
+                        if (sym == ticker
+                                and side in ("sell", "sell_short")
+                                and status in ("pending", "open", "partially_filled")
+                                and oid
+                                and oid not in self._stale_order_ids):
+                            resp_cancel = self._session.delete(
+                                f"{self._base}/v1/accounts/{self._account}/orders/{oid}",
+                                timeout=5,
+                            )
+                            if resp_cancel.status_code == 200:
+                                cancelled += 1
+                            else:
+                                self._stale_order_ids.add(oid)
+                                log.debug("[TradierBroker] Cancel order %s: status=%d (cached as stale)",
+                                          oid, resp_cancel.status_code)
                     if cancelled:
                         log.info("[TradierBroker] Cancelled %d open sell orders for %s", cancelled, ticker)
+            elif resp.status_code == 401:
+                log.warning("[TradierBroker] Open orders list returned 401 — token may be expired")
         except Exception as exc:
             log.warning("[TradierBroker] Failed to cancel orders for %s: %s", ticker, exc)
 
@@ -345,8 +372,18 @@ class TradierBroker:
                 self._emit_order_fail(p, parent_event)
                 return
 
-            order = resp.json().get("order", {})
+            order_resp = resp.json()
+            order = order_resp.get("order", {})
             order_id = str(order.get("id", ""))
+            log.info("[TradierBroker] SELL %s order response: id=%s status=%s resp=%s",
+                     ticker, order_id, order.get("status", "N/A"),
+                     str(order_resp)[:300])
+
+            if not order_id or order_id == "None":
+                log.warning("[TradierBroker] SELL %s got empty order_id — response: %s",
+                            ticker, str(order_resp)[:500])
+                self._emit_order_fail(p, parent_event)
+                return
 
             filled, fill_price, filled_qty = self._poll_fill(
                 order_id, qty, float(p.price)
@@ -527,10 +564,13 @@ class TradierBroker:
                     timeout=5,
                 )
                 if resp.status_code != 200:
+                    log.debug("[TradierBroker] poll %s: HTTP %d", order_id, resp.status_code)
                     continue
 
                 order = resp.json().get("order", {})
                 status = order.get("status", "")
+                log.debug("[TradierBroker] poll %s: status=%s exec_qty=%s",
+                          order_id, status, order.get("exec_quantity", "N/A"))
 
                 if status in ("filled", "partially_filled"):
                     fill_price = float(
@@ -562,6 +602,9 @@ class TradierBroker:
                             pass
                     return True, fill_price, filled_qty
                 elif status in ("canceled", "expired", "rejected"):
+                    reason_desc = order.get("reason_description", "")
+                    if reason_desc:
+                        log.warning("[TradierBroker] Order %s %s: %s", order_id, status, reason_desc[:200])
                     # Check if any shares filled before cancel
                     exec_qty = int(float(order.get("exec_quantity", 0)))
                     if exec_qty > 0:
@@ -632,8 +675,27 @@ class TradierBroker:
             log.warning("[TradierBroker] Balance fetch failed: %s", exc)
         return {}
 
-    def get_positions(self) -> list:
-        """Fetch open positions."""
+    def get_positions(self) -> list[dict]:
+        """Fetch open positions in normalized format for BrokerRegistry.
+
+        Returns list of {symbol, qty, avg_entry, cost_basis} dicts.
+        """
+        raw = self._get_positions_raw()
+        result = []
+        for p in raw:
+            qty = float(p.get('quantity', 0))
+            cost = float(p.get('cost_basis', 0))
+            if qty > 0:
+                result.append({
+                    'symbol': p.get('symbol', ''),
+                    'qty': qty,
+                    'avg_entry': cost / qty if qty > 0 else 0.0,
+                    'cost_basis': cost,
+                })
+        return result
+
+    def _get_positions_raw(self) -> list:
+        """Fetch raw position dicts from Tradier API."""
         try:
             resp = self._session.get(
                 f"{self._base}/v1/accounts/{self._account}/positions",
@@ -649,6 +711,21 @@ class TradierBroker:
         except Exception as exc:
             log.warning("[TradierBroker] Positions fetch failed: %s", exc)
         return []
+
+    def get_equity(self) -> float | None:
+        """Fetch total account equity from Tradier."""
+        bal = self.get_account_balance()
+        if bal:
+            return float(bal.get('total_equity', 0))
+        return None
+
+    @property
+    def supports_fractional(self) -> bool:
+        return False
+
+    @property
+    def supports_notional(self) -> bool:
+        return False
 
     def cancel_all_orders(self) -> None:
         """Cancel all open orders."""

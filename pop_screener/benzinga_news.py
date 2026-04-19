@@ -193,3 +193,103 @@ def _parse_benzinga_ts(ts_str: str) -> datetime:
             return datetime.fromisoformat(ts_str)
         except Exception:
             return datetime.now(timezone.utc)
+
+    def discover_trending_tickers(self, hours: float = 4.0,
+                                   min_mentions: int = 2) -> Dict[str, dict]:
+        """V8: Fetch ALL recent headlines (no ticker filter) and extract
+        mentioned tickers. Uses 1 API call to discover market-wide movers.
+
+        Returns {ticker: {mention_count, headlines, avg_sentiment}}.
+        """
+        if not self._api_key:
+            return {}
+
+        cache_key = ('__trending__', f'{hours:.1f}')
+        cached = self._cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < 300:  # 5 min cache
+            return cached[1]
+
+        try:
+            since = datetime.now(timezone.utc) - timedelta(hours=hours)
+            params = {
+                'token': self._api_key,
+                'pageSize': 50,  # max articles per call
+                'sort': 'created:desc',
+            }
+            resp = self._session.get(
+                self._BASE_URL, params=params,
+                headers={'Accept': 'application/json'},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            articles = data if isinstance(data, list) else data.get('data', data.get('articles', []))
+
+            # Extract tickers from articles
+            ticker_data: Dict[str, dict] = {}
+            for article in articles:
+                try:
+                    # Benzinga articles have 'stocks' field with ticker associations
+                    stocks = article.get('stocks', [])
+                    if isinstance(stocks, list):
+                        tickers_in_article = [s.get('name', '') for s in stocks
+                                             if isinstance(s, dict) and s.get('name')]
+                    elif isinstance(stocks, str):
+                        tickers_in_article = [s.strip() for s in stocks.split(',') if s.strip()]
+                    else:
+                        tickers_in_article = []
+
+                    # Also try 'securities' field
+                    securities = article.get('securities', [])
+                    if isinstance(securities, list):
+                        for sec in securities:
+                            sym = sec.get('symbol', '') if isinstance(sec, dict) else ''
+                            if sym and sym not in tickers_in_article:
+                                tickers_in_article.append(sym)
+
+                    headline = article.get('title', article.get('headline', ''))
+                    sentiment = self._compute_sentiment(headline)
+                    ts = self._parse_timestamp(article.get('created', article.get('updated', '')))
+
+                    if ts < since:
+                        continue  # too old
+
+                    for ticker in tickers_in_article:
+                        ticker = ticker.upper().strip()
+                        if not ticker or len(ticker) > 5 or not ticker.isalpha():
+                            continue
+                        if ticker not in ticker_data:
+                            ticker_data[ticker] = {
+                                'mention_count': 0,
+                                'headlines': [],
+                                'sentiment_sum': 0.0,
+                            }
+                        td = ticker_data[ticker]
+                        td['mention_count'] += 1
+                        td['sentiment_sum'] += sentiment
+                        if len(td['headlines']) < 3:
+                            td['headlines'].append(headline[:100])
+
+                except Exception:
+                    continue
+
+            # Filter to tickers with enough mentions and compute avg sentiment
+            result = {}
+            for ticker, td in ticker_data.items():
+                if td['mention_count'] >= min_mentions:
+                    result[ticker] = {
+                        'mention_count': td['mention_count'],
+                        'avg_sentiment': round(td['sentiment_sum'] / td['mention_count'], 4),
+                        'top_headline': td['headlines'][0] if td['headlines'] else '',
+                        'source': 'benzinga_discovery',
+                    }
+
+            self._cache[cache_key] = (time.monotonic(), result)
+            log.info("[BenzingaNews] Discovery: %d trending tickers from %d articles",
+                     len(result), len(articles))
+            return result
+
+        except Exception as exc:
+            log.warning("[BenzingaNews] Discovery failed: %s", exc)
+            return {}

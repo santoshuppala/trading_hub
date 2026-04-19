@@ -212,6 +212,12 @@ class OptionsEngine:
         self._daily_exits    = 0
         self._daily_pnl      = 0.0
 
+        # ── Kill switch halt flag (M4) ────────────────────────────────
+        # Set by close_all_positions() when reason contains 'kill_switch'.
+        # Checked as FIRST line in _on_signal, _on_bar, _execute_entry.
+        # Prevents new entries even if BAR events arrive before tick() returns False.
+        self._halted = False
+
         # ── Subscribe ──────────────────────────────────────────────────
         bus.subscribe(EventType.SIGNAL,     self._on_signal,     priority=3)
         bus.subscribe(EventType.BAR,        self._on_bar,        priority=3)
@@ -230,6 +236,8 @@ class OptionsEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _on_signal(self, event: Event) -> None:
+        if self._halted:
+            return
         p = event.payload
         action = str(p.action)
 
@@ -400,8 +408,12 @@ class OptionsEngine:
         spot = float(df['close'].iloc[-1])
 
         # ── STEP 1: Monitor existing positions for exits ──────────────
-        # (exits always run, even after EOD cutoff)
+        # (exits always run, even after EOD cutoff and kill switch halt)
         self._monitor_positions(p.ticker, spot)
+
+        # M4: Kill switch halt — allow exits above, block new entries below
+        if self._halted:
+            return
 
         # EOD gate: no new entries after 3:45 PM ET (exits still monitored above)
         from datetime import datetime
@@ -416,9 +428,20 @@ class OptionsEngine:
 
         try:
             from pro_setups.detectors._compute import compute_atr, compute_rsi, compute_rvol
-            atr_value = compute_atr(df)
-            rsi_value = compute_rsi(df)
-            rvol = compute_rvol(df, p.rvol_df)
+            # V9: Use 5-min bars for ATR/RSI — gives realistic intraday volatility
+            # ATR-14 on 1-min = 14 min (too small for options entry decisions)
+            # ATR-14 on 5-min = 70 min (meaningful for strike width + P&L targets)
+            df_5min = df.resample('5min').agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum',
+            }).dropna()
+            if len(df_5min) >= 14:
+                atr_value = compute_atr(df_5min)
+                rsi_value = compute_rsi(df_5min)
+            else:
+                atr_value = compute_atr(df)     # fallback to 1-min early in session
+                rsi_value = compute_rsi(df)
+            rvol = compute_rvol(df, p.rvol_df)  # RVOL stays on 1-min (cumulative volume)
         except (ImportError, Exception):
             atr_value = 0.5
             rsi_value = 50.0
@@ -520,9 +543,47 @@ class OptionsEngine:
         if not self._risk.reserve(p.ticker):
             return
 
+        # V8: Limit concurrent execution threads to avoid overwhelming chain API.
+        # Max 3 concurrent (semaphore) + max 5 spawned per 60s window.
+        if not hasattr(self, '_exec_semaphore'):
+            import threading as _th
+            self._exec_semaphore = _th.Semaphore(3)
+            self._exec_spawned_times = []  # timestamps of recent thread spawns
+
+        # Max 5 execution threads per 60s window
+        now_mono = time.monotonic()
+        self._exec_spawned_times = [t for t in self._exec_spawned_times
+                                     if now_mono - t < 60]
+        if len(self._exec_spawned_times) >= 5:
+            self._risk.unreserve(p.ticker)
+            return
+        self._exec_spawned_times.append(now_mono)
+
         import threading
+
+        def _guarded_execute(**kwargs):
+            ticker = kwargs.get('ticker', '')
+            strategy = kwargs.get('strategy_type', '?')
+            if not self._exec_semaphore.acquire(timeout=30):
+                log.warning("[OptionsEngine] %s dropped — semaphore timeout", ticker)
+                self._risk.unreserve(ticker)
+                return
+            try:
+                log.info("[OptionsEngine] %s %s execution thread started", ticker, strategy)
+                self._execute_entry(**kwargs)
+                log.info("[OptionsEngine] %s %s execution thread completed", ticker, strategy)
+            except Exception as exc:
+                log.error("[OptionsEngine] %s execution error: %s", ticker, exc,
+                          exc_info=True)
+                try:
+                    self._risk.unreserve(ticker)
+                except Exception:
+                    pass
+            finally:
+                self._exec_semaphore.release()
+
         t = threading.Thread(
-            target=self._execute_entry,
+            target=_guarded_execute,
             kwargs=dict(
                 ticker=p.ticker,
                 spot_price=spot,
@@ -816,6 +877,11 @@ class OptionsEngine:
 
     def close_all_positions(self, reason: str = 'eod_close') -> None:
         """Close all open positions (called at end of day or emergency)."""
+        # M4: Set halt flag BEFORE iterating — prevents any concurrent
+        # _on_signal/_on_bar from opening new positions during close-all.
+        if 'kill_switch' in reason:
+            self._halted = True
+
         with self._positions_lock:
             tickers = list(self._positions.keys())
 
@@ -855,10 +921,16 @@ class OptionsEngine:
         6. Execute via broker
         7. Track position for monitoring
         """
-        # Step 1: Pre-check risk gate (ticker already reserved by caller)
-        reject_reason = self._risk.check(ticker, max_risk=self._risk._trade_budget)
+        # M4: Kill switch halt — block entry immediately
+        if self._halted:
+            self._risk.unreserve(ticker)
+            return
+
+        # Step 1: Pre-check risk gate (skip pending check — we already hold the reservation)
+        reject_reason = self._risk.check(ticker, max_risk=self._risk._trade_budget,
+                                          skip_pending=True)
         if reject_reason:
-            log.debug("[OptionsEngine] %s %s BLOCKED: %s", ticker, strategy_type, reject_reason)
+            log.info("[OptionsEngine] %s %s BLOCKED (pre): %s", ticker, strategy_type, reject_reason)
             self._risk.unreserve(ticker)
             return
 
@@ -869,6 +941,7 @@ class OptionsEngine:
             return
 
         if not self._chain:
+            log.warning("[OptionsEngine] %s no chain client — skipping", ticker)
             self._risk.unreserve(ticker)
             return
 
@@ -884,14 +957,15 @@ class OptionsEngine:
         )
 
         if trade_spec is None:
-            log.debug("[OptionsEngine] %s %s build returned None", ticker, strategy_type)
+            log.info("[OptionsEngine] %s %s build returned None (no suitable strikes/legs)", ticker, strategy_type)
             self._risk.unreserve(ticker)
             return
 
-        # Step 3: Verify risk with actual max_risk
-        reject_reason = self._risk.check(ticker, max_risk=trade_spec.max_risk)
+        # Step 3: Verify risk with actual max_risk (skip pending — we hold reservation)
+        reject_reason = self._risk.check(ticker, max_risk=trade_spec.max_risk,
+                                          skip_pending=True)
         if reject_reason:
-            log.debug("[OptionsEngine] %s %s BLOCKED after build: %s", ticker, strategy_type, reject_reason)
+            log.info("[OptionsEngine] %s %s BLOCKED (post): %s", ticker, strategy_type, reject_reason)
             self._risk.unreserve(ticker)
             return
 
@@ -1041,13 +1115,23 @@ class OptionsEngine:
         )
 
     def _estimate_iv(self, ticker: str, spot_price: float) -> float:
+        """Estimate IV from cached chain data only — never make a live API call.
+
+        V8: Previously called get_chain() which made live API calls for every
+        ticker on every BAR cycle. This starved execution threads of API bandwidth
+        (rate limiter at 3 req/sec, 60+ tickers = 60s of blocked API access).
+        Now uses cache-only lookup. If no cache exists, returns default 0.25
+        and the execution thread will fetch the chain when it runs.
+        """
         if not self._chain:
             return 0.25
         try:
-            contracts = self._chain.get_chain(ticker, min_dte=self._min_dte, max_dte=self._max_dte)
-            if not contracts:
-                return 0.25
-            atm_call = self._chain.find_atm(contracts, 'call', spot_price)
+            # Cache-only lookup — don't trigger API call
+            cache_key = self._chain._cache_key(ticker, self._min_dte, self._max_dte)
+            cached = self._chain._get_cached(cache_key)
+            if cached is None:
+                return 0.25  # no cache — execution thread will fetch later
+            atm_call = self._chain.find_atm(cached, 'call', spot_price)
             if atm_call and atm_call.iv > 0:
                 return atm_call.iv
             return 0.25
@@ -1060,4 +1144,5 @@ class OptionsEngine:
         self._daily_entries = 0
         self._daily_exits   = 0
         self._daily_pnl     = 0.0
+        self._halted        = False
         log.info("[OptionsEngine] daily stats reset")

@@ -26,6 +26,7 @@ Config key: BROKER  ('alpaca' | 'paper', default 'alpaca')
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -88,6 +89,40 @@ class BaseBroker(ABC):
 
     @abstractmethod
     def _execute_sell(self, p: OrderRequestPayload) -> None: ...
+
+    # ── Account query interface (concrete defaults — override in subclass) ──
+
+    def get_positions(self) -> list[dict]:
+        """Return open positions as normalized dicts.
+
+        Each dict: {symbol: str, qty: float, avg_entry: float, cost_basis: float}
+        Default: empty list. Override in subclass.
+        """
+        return []
+
+    def get_equity(self) -> float | None:
+        """Return total account equity, or None if unavailable."""
+        return None
+
+    def get_account_balance(self) -> dict:
+        """Return raw account balance dict (broker-specific fields ok)."""
+        return {}
+
+    def cancel_all_orders(self) -> None:
+        """Cancel all open orders at this broker."""
+        pass
+
+    # ── Capability interface ──────────────────────────────────────────
+
+    @property
+    def supports_fractional(self) -> bool:
+        """True if this broker accepts fractional share quantities."""
+        return False
+
+    @property
+    def supports_notional(self) -> bool:
+        """True if this broker accepts dollar-amount (notional) orders."""
+        return False
 
 
 # ── Alpaca broker ─────────────────────────────────────────────────────────────
@@ -229,8 +264,19 @@ class AlpacaBroker(BaseBroker):
                     except Exception:
                         pass
 
-                # Wait 1s for Alpaca to fully settle the buy order.
-                time.sleep(1.0)
+                # V9: Quick settlement verification (was: time.sleep(1.0))
+                # 3 fast polls at 200ms instead of 1s blind sleep.
+                # Saves 0.4-0.8s per trade.
+                for _settle in range(3):
+                    time.sleep(0.2)
+                    try:
+                        _check = self._client.get_order_by_id(order_id)
+                        if _check.status == 'filled':
+                            filled_qty = int(float(_check.filled_qty or filled_qty))
+                            avg_price = float(_check.filled_avg_price or avg_price)
+                            break
+                    except Exception:
+                        pass
 
                 # Extract engine/strategy from reason for rich alerts
                 _reason = getattr(p, 'reason', '') or ''
@@ -596,6 +642,57 @@ class AlpacaBroker(BaseBroker):
             ticker=p.ticker, side=p.side, qty=p.qty, price=p.price, reason=p.reason,
         )))
 
+    # ── Account query methods ─────────────────────────────────────────
+
+    def get_positions(self) -> list[dict]:
+        """Fetch open positions from Alpaca in normalized format."""
+        try:
+            positions = self._client.get_all_positions()
+            return [
+                {
+                    'symbol': str(p.symbol),
+                    'qty': float(p.qty),
+                    'avg_entry': float(p.avg_entry_price),
+                    'cost_basis': float(p.cost_basis),
+                }
+                for p in positions
+            ]
+        except Exception as exc:
+            log.warning("[AlpacaBroker] get_positions failed: %s", exc)
+            return []
+
+    def get_equity(self) -> float | None:
+        """Fetch total account equity from Alpaca."""
+        try:
+            acct = self._client.get_account()
+            return float(acct.equity)
+        except Exception as exc:
+            log.warning("[AlpacaBroker] get_equity failed: %s", exc)
+            return None
+
+    def get_account_balance(self) -> dict:
+        """Fetch raw account data from Alpaca."""
+        try:
+            acct = self._client.get_account()
+            return {
+                'equity': float(acct.equity),
+                'cash': float(acct.cash),
+                'buying_power': float(acct.buying_power),
+                'portfolio_value': float(acct.portfolio_value or 0),
+                'last_equity': float(acct.last_equity or 0),
+            }
+        except Exception as exc:
+            log.warning("[AlpacaBroker] get_account_balance failed: %s", exc)
+            return {}
+
+    @property
+    def supports_fractional(self) -> bool:
+        return True
+
+    @property
+    def supports_notional(self) -> bool:
+        return True
+
 
 # ── Paper broker ──────────────────────────────────────────────────────────────
 
@@ -627,6 +724,104 @@ class PaperBroker(BaseBroker):
             ticker=p.ticker, side='SELL', qty=p.qty,
             fill_price=p.price, order_id=order_id, reason=p.reason,
         ))
+
+
+# ── Alpaca Fill Stream (FREE WebSocket for order status) ─────────────────────
+
+class AlpacaFillStream:
+    """FREE WebSocket listener for Alpaca order fill events.
+
+    Uses paper-api endpoint (wss://paper-api.alpaca.markets/stream).
+    No paid subscription required — trade_updates is free on all accounts.
+    NOT used for market data (that stays on Tradier $10/month).
+
+    Usage:
+        stream = AlpacaFillStream(api_key, api_secret, paper=True)
+        stream.start()
+        # ... submit order ...
+        result = stream.wait_for_fill(order_id, timeout=5.0)
+    """
+
+    def __init__(self, api_key: str, api_secret: str, paper: bool = True):
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._paper = paper
+        self._pending: dict[str, threading.Event] = {}
+        self._results: dict[str, object] = {}
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> bool:
+        """Start WebSocket listener in background thread. Returns True if started."""
+        try:
+            from alpaca.trading.stream import TradingStream
+            self._stream = TradingStream(
+                self._api_key, self._api_secret, paper=self._paper,
+            )
+            self._stream.subscribe_trade_updates(self._on_trade_update)
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._run_stream, daemon=True, name='AlpacaFillStream',
+            )
+            self._thread.start()
+            log.info("[AlpacaFillStream] Started (paper=%s)", self._paper)
+            return True
+        except Exception as exc:
+            log.warning("[AlpacaFillStream] Start failed: %s — using REST polling", exc)
+            return False
+
+    def _run_stream(self) -> None:
+        """Background thread running the Alpaca WebSocket."""
+        try:
+            self._stream.run()
+        except Exception as exc:
+            if self._running:
+                log.warning("[AlpacaFillStream] Disconnected: %s", exc)
+
+    async def _on_trade_update(self, data) -> None:
+        """Async callback from Alpaca WebSocket on order status change.
+
+        Alpaca's TradingStream requires handler to be an async coroutine.
+        """
+        try:
+            order_id = str(data.order.id)
+            with self._lock:
+                if order_id in self._pending:
+                    self._results[order_id] = data
+                    self._pending[order_id].set()
+        except Exception as exc:
+            log.debug("[AlpacaFillStream] Callback error: %s", exc)
+
+    def wait_for_fill(self, order_id: str, timeout: float = 5.0) -> object:
+        """Block until fill event arrives via WebSocket.
+
+        Returns fill data or None on timeout. Falls back to REST polling
+        if WebSocket is not connected.
+        """
+        if not self._running:
+            return None
+
+        event = threading.Event()
+        with self._lock:
+            self._pending[order_id] = event
+
+        try:
+            if event.wait(timeout=timeout):
+                with self._lock:
+                    return self._results.pop(order_id, None)
+            return None  # timeout — caller should fall back to REST poll
+        finally:
+            with self._lock:
+                self._pending.pop(order_id, None)
+                self._results.pop(order_id, None)
+
+    def stop(self) -> None:
+        """Stop the WebSocket listener."""
+        self._running = False
+        # TradingStream.close() is async — don't call it from sync context.
+        # The daemon thread will exit when the process exits.
+        log.info("[AlpacaFillStream] Stopped")
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

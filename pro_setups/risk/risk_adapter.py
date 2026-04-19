@@ -209,9 +209,9 @@ class RiskAdapter:
                 try:
                     from data_sources.alt_data_reader import alt_data
                     earnings = alt_data.earnings(ticker)
-                    if earnings and earnings.get('days_to_earnings', 999) <= 2:
+                    if earnings and earnings.get('days_until_earnings', 999) <= 2:
                         log.info("%s BLOCKED: earnings in %d days (T%d holds overnight)",
-                                 tag, earnings['days_to_earnings'], tier)
+                                 tag, earnings['days_until_earnings'], tier)
                         return
                 except Exception:
                     pass  # alt data unavailable — allow entry
@@ -241,6 +241,20 @@ class RiskAdapter:
             qty_by_risk     = int(max_dollar_risk / risk)
             qty_by_budget   = int(self._trade_budget / entry_price)
             qty             = min(max(qty_by_risk, 1), max(qty_by_budget, 1))
+
+            # V8: Conviction-based position sizing (from TickerRankingEngine)
+            try:
+                from data_sources.ticker_ranking import _engine as _ranking_engine
+                cached = _ranking_engine._cache.get(ticker)
+                if cached:
+                    _, ranking = cached
+                    conv_mult = ranking.size_multiplier
+                    if conv_mult != 1.0:
+                        qty = max(1, int(qty * conv_mult))
+                        log.info("%s conviction sizing: conv=%.2f mult=%.2f (%s)",
+                                 tag, ranking.conviction, conv_mult, ranking.catalyst)
+            except Exception:
+                pass
 
             # V7.1: Market regime sizing (F&G + VIX)
             try:

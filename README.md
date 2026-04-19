@@ -1,110 +1,163 @@
-# Trading Hub (V8)
+# Trading Hub (V9)
 
-A real-time algorithmic trading system built on an event-driven architecture. V8 merges Pro and Pop engines into Core for a unified 3-process architecture with 13 technical strategies, 8 alt data sources, multi-broker execution (Alpaca + Tradier), and a 20+ check risk stack.
+A real-time algorithmic trading system built on a hybrid streaming + polling architecture. V9 adds lot-based position tracking (FillLedger), real-time WebSocket streaming, sub-second exit detection, and 47 correctness fixes over V8.
 
 > **Disclaimer:** This is for educational purposes only. Trading involves significant risk. Always start with paper trading. Consult a financial advisor before trading with real money.
 
 ---
 
-## Architecture (V8)
+## Architecture (V9 — Hybrid Streaming + Polling)
 
-3 processes under supervisor. Pro and Pop merged into Core.
+3 processes under supervisor. Real-time Tradier WebSocket for exit monitoring, REST polling for entry discovery.
 
 ```
-Supervisor
+Supervisor (startup cleanup: __pycache__, state validation, deprecated files)
+  |
   +-- Core (VWAP + Pro 11 strategies + Pop scanner)
-  |     +-- 13 detectors (11 technical + SentimentDetector + NewsVelocityDetector)
-  |     +-- Classifier (highest confidence wins, sentiment boosts thresholds)
-  |     +-- Tier-based stops/EOD (T1 intraday close, T2/T3 swing with trailing)
-  |     +-- Per-strategy risk engines (RiskEngine for VWAP, RiskAdapter for Pro)
-  |     +-- PortfolioRiskGate (unrealized P&L, buying power, drawdown)
-  |     +-- PerStrategyKillSwitch (per-strategy daily loss halt)
-  |     +-- SmartRouter -> Alpaca + Tradier (failover, circuit breaker)
-  |     +-- Pop periodic scan (10 min full, 2 min headline check)
+  |     +-- TradierStreamClient (WebSocket, <1s exit detection, prod $10/month)
+  |     +-- 13 detectors (V9: 2-phase cascade, 80% skip at open)
+  |     +-- FillLedger (lot-based P&L, FIFO matching, shadow mode)
+  |     +-- BrokerRegistry (extensible multi-broker)
+  |     +-- EquityTracker (hourly P&L drift detection)
+  |     +-- PortfolioRiskGate (V9: background buying power, <1ms)
+  |     +-- SmartRouter -> Alpaca + Tradier (V9: lot-aware routing)
+  |     +-- FailoverDataClient (Tradier -> Alpaca IEX auto-switch)
   |     +-- Publishes SIGNAL + POP_SIGNAL to Options via Redpanda
   |
   +-- Options (13 multi-leg strategies, separate Alpaca account)
+  |     +-- V9: _halted flag + persisted kill switch state
+  |     +-- tick() before BAR emit (defense-in-depth)
   |
-  +-- Data Collector (8 alt data sources, writes to DB + alt_data_cache.json)
+  +-- Data Collector (8 alt data sources)
 
 Event Flow:
-  BAR -> VWAP StrategyEngine -> SIGNAL -> RiskEngine -> ORDER_REQ
-  BAR -> ProSetupEngine (13 detectors) -> PRO_STRATEGY_SIGNAL -> RiskAdapter -> ORDER_REQ
-  ORDER_REQ -> PortfolioRiskGate -> RegistryGate -> SmartRouter -> Broker -> FILL
-  FILL -> PositionManager -> POSITION -> bot_state.json + event_store DB
+  Tradier WebSocket -> QUOTE -> StrategyEngine (exit checks, <1ms)
+  Tradier REST -> BAR -> StrategyEngine/ProSetupEngine -> SIGNAL
+  SIGNAL -> RiskEngine (V9: streaming ask price, 0.02ms) -> ORDER_REQ
+  ORDER_REQ -> PortfolioRiskGate (V9: <1ms buying power) -> SmartRouter
+  SmartRouter -> Broker -> FILL (V9: Alpaca WebSocket <100ms)
+  FILL -> PositionManager -> FillLedger (FIFO lot match) + bot_state.json
+  FILL -> PositionManager -> POSITION -> KillSwitch -> event_store DB
 ```
 
-### Process Map
+### Key V9 Changes
 
-| Process | Strategies | IPC |
-|---------|-----------|-----|
-| **Core** | VWAP (1) + Pro (11) + Pop scan | Publishes to th-signals, th-pop-signals |
-| **Options** | 13 multi-leg strategies | Consumes th-signals, th-pop-signals |
-| **Data Collector** | N/A (data pipeline) | Publishes to th-discovery |
-
-### Key V8 Changes
-
-| Change | V7 | V8 |
+| Change | V8 | V9 |
 |--------|----|----|
-| Processes | 5 (Core, Pro, Pop, Options, DataCol) | 3 (Core+Pro+Pop, Options, DataCol) |
-| Pro execution | Separate process via IPC | In-process on Core's EventBus |
-| Pop execution | Separate process, trades independently | Periodic scanner, no trading |
-| State files | 3 (bot_state, pro_state, pop_state) | 1 (bot_state.json) |
-| Position tracking | Cross-process sync issues | Single PositionManager |
-| Classifier | First tier match wins | Highest confidence wins |
-| Stops | Fixed per strategy | Tier-aligned (T1 tight, T2/T3 wide) |
-| Trailing | VWAP ATR-based only | T2/T3: breakeven at +1R, lock at +2R |
-| Sentiment | Not integrated | 8-source SentimentDetector, threshold relaxation |
-| EOD | All Pro partial sell | T1 full close, T2/T3 partial sell |
-| Kill switch | Per-process | Per-strategy (VWAP and Pro independent) |
-| Drawdown check | Realized P&L only | Realized + unrealized (BAR price updates) |
+| Exit detection | 0-60s (REST poll) | <1s (WebSocket streaming) |
+| Ask quote (risk check) | 300-3000ms (REST) | 0.02ms (streaming cache) |
+| Buying power check | 3-10s (inline API) | <1ms (background refresh) |
+| Market open spike | ~10s (all detectors) | <2s (Phase 1 cascade) |
+| Fill confirmation | 0.5-5s (REST poll) | <100ms (Alpaca WebSocket, FREE) |
+| Settlement verify | 1s (blind sleep) | 200-600ms (fast poll) |
+| Position tracking | Mutable dict (single entry_price) | FillLedger (lot-based, FIFO P&L) |
+| P&L calculation | (exit - entry) × qty (wrong after reconcile) | Per-lot FIFO matching (exact) |
+| Entry price on reconcile | 1% drift threshold | Always broker cost basis |
+| Shared cache format | Pickle (fragile) | JSON (human-readable, schema-stable) |
+| Bar persistence | event_store (97% bloat) | market_bars (10x smaller) |
+| Kill switch (options) | Resets on restart | Persisted to disk |
+| Alert blackout | 30 min | 5 min + CRITICAL bypass |
+| Stale orders | Orphaned forever | Cancelled after 60s |
+| Duplicate SELL | Not guarded | Dedup by ticker:order_id |
+| Fill dedup | Buggy set truncation | OrderedDict + 1hr TTL |
+| Data source failure | Full halt | Auto-failover to Alpaca IEX |
+| Fractional shares | Int qty only | Float qty (Alpaca: 0.01 increments) |
+
+---
+
+## Latency Profile
+
+### Entry Trade
+
+| Stage | Before V9 | After V9 |
+|-------|-----------|----------|
+| Data staleness | 0-73s | <0.5s (streaming) |
+| Strategy analysis | 35ms / 10s spike | 35ms / <2s spike |
+| Risk engine | 500-3000ms | <5ms |
+| Portfolio risk | 3-10s | <5ms |
+| Fill confirmation (Alpaca) | 0.5-5s | <100ms |
+| **Total (Alpaca)** | **8-25s** | **~1-3s** |
+
+### Exit Trade
+
+| Stage | Before V9 | After V9 |
+|-------|-----------|----------|
+| Detection | 0-60s | <1s (streaming) |
+| **Total (streaming + Alpaca)** | **1-70s** | **~1-4s** |
+
+### Full Round-Trip
+
+| Scenario | Before V9 | After V9 |
+|----------|-----------|----------|
+| Best case | ~10s | **~3s** |
+| Typical | ~2-3 min | **~15-30s** |
+| Worst case | 5+ min | **~1-2 min** |
+
+---
+
+## Token / Account Setup
+
+```
+TRADIER PRODUCTION ($10/month) ── TRADIER_TOKEN
+  Data: WebSocket streaming + REST bars
+  Orders: NEVER (data only)
+
+TRADIER SANDBOX (free) ── TRADIER_SANDBOX_TOKEN
+  Orders: Paper trading (buy/sell)
+  Data: No streaming
+
+ALPACA PAPER (free) ── APCA_API_KEY_ID
+  Orders: Paper trading (buy/sell)
+  Fill status: FREE WebSocket trade_updates
+  Data: NOT used (IEX only on free tier)
+```
 
 ---
 
 ## Data Sources (10 total)
 
-| # | Source | API Key | Data | DB Table |
-|---|--------|---------|------|----------|
-| 1 | Benzinga | Yes | Headlines, sentiment | `event_store` (NewsDataSnapshot) |
-| 2 | StockTwits | Optional | Social mentions, sentiment | `event_store` (SocialDataSnapshot) |
-| 3 | Fear & Greed | No | Market sentiment index | `data_source_snapshots` |
-| 4 | Finviz | No | Screener, insider, analyst | `data_source_snapshots` |
-| 5 | SEC EDGAR | No | Insider filings | `data_source_snapshots` |
-| 6 | Yahoo Finance | No | Earnings, recommendations | `data_source_snapshots` |
-| 7 | Polygon.io | Yes | Prev-day movers, options | `data_source_snapshots` |
-| 8 | Alpha Vantage | Yes | Technicals | `data_source_snapshots` |
-| 9 | FRED | Yes | Macro indicators (rates, VIX) | `data_source_snapshots` |
-| 10 | UOF Scanner | Via chain API | Unusual options flow | `data_source_snapshots` |
-
-All sources collected by Data Collector every 10 min. Written to `alt_data_cache.json` (file) and `data_source_snapshots` (DB).
+| # | Source | API Key | Data |
+|---|--------|---------|------|
+| 1 | Benzinga | Yes | Headlines, sentiment |
+| 2 | StockTwits | Optional | Social mentions, sentiment |
+| 3 | Fear & Greed | No | Market sentiment index |
+| 4 | Finviz | No | Screener, insider, analyst |
+| 5 | SEC EDGAR | No | Insider filings |
+| 6 | Yahoo Finance | No | Earnings, recommendations |
+| 7 | Polygon.io | Yes | Prev-day movers, options |
+| 8 | Alpha Vantage | Yes | Technicals |
+| 9 | FRED | Yes | Macro indicators (rates, VIX) |
+| 10 | UOF Scanner | Via chain API | Unusual options flow |
 
 ---
 
 ## Risk Stack (20+ Checks)
 
-| # | Check | Component | Action |
-|---|-------|-----------|--------|
-| 1 | Max positions (per-strategy) | RiskEngine/RiskAdapter | VWAP max 5, Pro max 15 |
-| 2 | Cooldown (300s per ticker) | RiskEngine/RiskAdapter | Block re-entry |
-| 3 | RVOL threshold | RiskEngine | >= 2.0 (1.5 with sentiment) |
-| 4 | RSI range | RiskEngine | 40-75 (35-80 with sentiment) |
-| 5 | Spread width | RiskEngine | <= 0.2% |
-| 6 | Price divergence | RiskEngine | Block if ask moved > 0.5% |
-| 7 | Correlation groups (14) | RiskSizer | Max 3 per group |
-| 8 | Beta-weighted exposure | RiskSizer | Max $200K beta-weighted |
-| 9 | Beta-adjusted sizing | RiskSizer | TQQQ: 10 -> 3 shares |
-| 10 | ATR-scaled sizing | RiskSizer | Volatility-based |
-| 11 | Confidence threshold (tier) | RiskAdapter | T1: 0.50, T2: 0.60, T3: 0.70 |
-| 12 | R:R ratio (tier) | RiskAdapter | T1: 1.5, T2: 2.0, T3: 3.5 |
-| 13 | Sector concentration | RiskAdapter | Max 2 per sector (cross-engine) |
-| 14 | Earnings block (T2/T3) | RiskAdapter | Block overnight holds near earnings |
-| 15 | Drawdown halt | PortfolioRiskGate | Block at -$5K (un-halts at -$4K) |
-| 16 | Notional cap | PortfolioRiskGate | Block > $100K exposure |
-| 17 | Buying power | PortfolioRiskGate | Fail-closed if unavailable |
-| 18 | Greeks limits | PortfolioRiskGate | Delta/gamma caps |
-| 19 | Per-strategy kill switch | PerStrategyKillSwitch | VWAP: -$10K, Pro: -$2K |
-| 20 | Cross-layer dedup | RegistryGate | One engine per ticker |
-| 21 | Sentiment-based priority | StrategyEngine | Defer to Pro when sentiment present |
+| # | Check | Component |
+|---|-------|-----------|
+| 1 | Max positions (per-strategy) | RiskEngine/RiskAdapter |
+| 2 | Cooldown (300s per ticker) | RiskEngine/RiskAdapter |
+| 3 | RVOL threshold | RiskEngine |
+| 4 | RSI range (sentiment-adaptive) | RiskEngine |
+| 5 | Fresh ask quote (V9: streaming) | RiskEngine |
+| 6 | Spread width | RiskEngine |
+| 7 | Price divergence | RiskEngine |
+| 8 | Correlation groups (14) | RiskSizer |
+| 9 | Beta-weighted exposure | RiskSizer |
+| 10 | Beta-adjusted sizing | RiskSizer |
+| 11 | ATR-scaled sizing | RiskSizer |
+| 12 | Confidence threshold (tier) | RiskAdapter |
+| 13 | R:R ratio (tier) | RiskAdapter |
+| 14 | Sector concentration | RiskAdapter |
+| 15 | Earnings block (T2/T3) | RiskAdapter |
+| 16 | Drawdown halt | PortfolioRiskGate |
+| 17 | Notional cap | PortfolioRiskGate |
+| 18 | Buying power (V9: background) | PortfolioRiskGate |
+| 19 | Greeks limits | PortfolioRiskGate |
+| 20 | Per-strategy kill switch | PerStrategyKillSwitch |
+| 21 | Cross-layer dedup | RegistryGate |
+| 22 | V9: Bar data validation | StrategyEngine |
+| 23 | V9: Duplicate SELL guard | PositionManager |
 
 ---
 
@@ -112,24 +165,26 @@ All sources collected by Data Collector every 10 min. Written to `alt_data_cache
 
 ### VWAP Reclaim (Core)
 
-Entry: 2-bar VWAP reclaim + opened above VWAP + RSI 50-70 + RVOL >= 2x + SPY above VWAP.
-Exit: Trailing stop (1x ATR), full target (2x ATR), partial at 1x ATR, RSI > 75, VWAP breakdown, EOD close.
+Entry: 2-bar VWAP reclaim + RSI 50-70 + RVOL >= 2x + SPY above VWAP.
+Exit: Trailing stop, target (2x ATR), partial at 1x ATR, RSI > 75, VWAP breakdown, EOD close.
+V9: Streaming exit detection (<1s).
 
 ### Pro Setups (13 detectors, 11 strategies, 3 tiers)
 
-| Tier | Strategies | Stop | Targets | EOD |
-|------|-----------|------|---------|-----|
-| T1 | sr_flip, trend_pullback, vwap_reclaim | 0.4-0.5 ATR | 1R/2R | Full close |
-| T2 | orb, gap_and_go, inside_bar, flag_pennant | 1.5-2.0 ATR | 1.5R/3R | Partial sell |
-| T3 | momentum_ignition, fib_confluence, bollinger_squeeze, liquidity_sweep | 2.0-2.5 ATR | 3R/6-8R | Partial sell |
+V9 multi-timeframe: 5 detectors use 5-min bars (SR, InsideBar, Flag, Fib, Trend), 8 stay on 1-min.
 
-### Pop Scanner (No Independent Trading)
+| Tier | Strategies | Stop | EOD |
+|------|-----------|------|-----|
+| T1 | sr_flip, trend_pullback, vwap_reclaim | 0.4-0.5 ATR | Full close |
+| T2 | orb, gap_and_go, inside_bar, flag_pennant | 1.5-2.0 ATR | Partial sell |
+| T3 | momentum_ignition, fib_confluence, bollinger_squeeze, liquidity_sweep | 2.0-2.5 ATR | Partial sell |
 
-Scans for momentum every 10 min. Adds tickers to VWAP/Pro universe. Sends POP_SIGNAL to Options.
+V9: 2-phase detector cascade. Phase 1 (Trend+VWAP+ORB, 1.5ms) skips Phase 2 for ~80% of tickers.
 
 ### Options (13 strategies, separate process)
 
 Iron condor, iron butterfly, bull/bear call/put spreads, long call/put, calendar, diagonal, straddle, strangle, collar.
+V9: Kill switch persisted to disk, _halted flag prevents churn on kill switch trigger.
 
 ---
 
@@ -141,68 +196,42 @@ Iron condor, iron butterfly, bull/bear call/put spreads, long call/put, calendar
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install websocket-client  # V9: for streaming
 ```
 
 Python 3.10+ required.
 
 ### 2. Configure `.env`
 
-```
-# Alpaca (main account)
-APCA_API_KEY_ID=PKxxxxxxxxxxxxxxxx
-APCA_API_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```env
+# Tradier (data streaming + paper trading)
+TRADIER_TOKEN=your_production_token         # $10/month — streaming + data
+TRADIER_SANDBOX_TOKEN=your_sandbox_token    # free — paper trading
+TRADIER_ACCOUNT_ID=your_account_id
+TRADIER_SANDBOX=true
 
-# Tradier (bar data + broker)
-TRADIER_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
-TRADIER_SANDBOX_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx
-TRADIER_ACCOUNT_ID=xxxxxxxx
+# Alpaca (paper trading + free fill WebSocket)
+APCA_API_KEY_ID=your_key
+APCA_API_SECRET_KEY=your_secret
+APCA_API_BASE_URL=https://paper-api.alpaca.markets
 
-# Broker mode
-BROKER=alpaca
+# Execution mode
 BROKER_MODE=smart
 MONITOR_MODE=supervisor
 DATA_SOURCE=tradier
 
-# Email alerts (Yahoo app password)
-ALERT_EMAIL_USER=you@yahoo.com
-ALERT_EMAIL_PASS=your16charapppassword
-ALERT_EMAIL_FROM=you@yahoo.com
-ALERT_EMAIL_TO=you@yahoo.com
-
-# Options account
-APCA_OPTIONS_KEY=PKxxxxxxxxxxxxxxxx
-APCA_OPTIONS_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Pop account (V8: merged into Core, credentials still needed for buying power check)
-APCA_POPUP_KEY=PKxxxxxxxxxxxxxxxx
-APCA_POPUP_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Pro config
-PRO_MAX_POSITIONS=15
-PRO_TRADE_BUDGET=1000
-PRO_ORDER_COOLDOWN=300
-
-# External data
-BENZINGA_API_KEY=bz.xxxxxxxxxxxxxxxxxxxx
-FRED_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-ALPHA_VANTAGE_KEY=xxxxxxxxxxxxxxxx
-POLYGON_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
 # Database
 DB_ENABLED=true
-DATABASE_URL=postgresql://postgres:trading_secret@localhost:5432/tradinghub
+DATABASE_URL=postgresql://trading:trading@localhost:5432/tradinghub
 REDPANDA_BROKERS=127.0.0.1:9092
-
-# Risk
-MAX_DAILY_LOSS=-10000
-GLOBAL_MAX_POSITIONS=75
 ```
 
 ### 3. Start infrastructure
 
 ```bash
-cd docker && docker compose up -d
-python -m db.migrations.run
+cd docker && docker compose up -d    # TimescaleDB + Redpanda
+python -m db.migrations.run          # schema migrations
+psql $DATABASE_URL < db/schema_v9_fill_ledger.sql  # V9 tables
 ```
 
 ### 4. Run
@@ -219,29 +248,32 @@ bash start_monitor.sh
 
 ---
 
-## Database (TimescaleDB)
+## Database
 
-All events persisted to TimescaleDB. 13 ordered migrations.
-
-Key tables:
-- `event_store` — immutable event log (all trading events)
-- `data_source_snapshots` — alt data from all 8 sources (V8)
-- `bar_events`, `signal_events`, `fill_events`, `position_events` — projections
-- `completed_trades` — trade summaries with strategy attribution
-
----
-
-## Logging
-
-Daily logs in `logs/YYYYMMDD/core.log`. EOD summary emailed automatically.
+| Table | Purpose | V9 |
+|-------|---------|-----|
+| `event_store` | Immutable event log | BarReceived writes stopped |
+| `market_bars` | V9: Lean bar table (10x smaller) | NEW |
+| `fill_lots` | V9: Lot-level position data | NEW |
+| `lot_matches` | V9: FIFO P&L audit trail | NEW |
+| `completed_trades` | Trade summaries | qty: NUMERIC(12,6) |
+| `data_source_snapshots` | Alt data from 8 sources | unchanged |
 
 ---
 
-## Docs
+## V9 Docs
 
-- `docs/V8_trading_hub/V8_ARCHITECTURE.md` — full V8 architecture
-- `docs/V8_trading_hub/V8_POST_RUN_CHECKLIST.md` — post-deployment verification
-- `docs/V7_trading_hub/` — previous architecture (reference)
+- `docs/V9_Trading_Hub/01_ARCHITECTURE_OVERVIEW.md` — system identity + process map
+- `docs/V9_Trading_Hub/02_DATA_PIPELINE.md` — streaming + polling + EventBus
+- `docs/V9_Trading_Hub/03_STRATEGY_AND_RISK.md` — detectors + risk checks + latency
+- `docs/V9_Trading_Hub/04_ORDER_EXECUTION.md` — brokers + fills + FillLedger
+- `docs/V9_Trading_Hub/05_LATENCY_PROFILE.md` — measured benchmarks + before/after
+- `docs/V9_Trading_Hub/06_SAFETY_AND_RECONCILIATION.md` — kill switch + reconciliation + guards
+- `docs/V9_Trading_Hub/07_MULTI_TIMEFRAME_DETECTORS.md` — 5-min bars for SR/Trend/Fib/Flag/InsideBar + activation timeline
+
+### Previous versions
+- `docs/V8_trading_hub/` — V8 architecture (reference)
+- `docs/V7_trading_hub/` — V7 design docs
 - `docs/V6_trading_hub/` — V6 design docs
 
 ---
@@ -250,7 +282,7 @@ Daily logs in `logs/YYYYMMDD/core.log`. EOD summary emailed automatically.
 
 - Python 3.10+
 - Docker (TimescaleDB 2.26+ / PostgreSQL 16 + Redpanda)
-- Alpaca account (paper trading free)
-- Tradier account (sandbox free)
+- Tradier account ($10/month for streaming, sandbox free for paper trading)
+- Alpaca account (paper trading free, WebSocket fills free)
 - Yahoo Mail app password for alerts (optional)
 - macOS/Linux

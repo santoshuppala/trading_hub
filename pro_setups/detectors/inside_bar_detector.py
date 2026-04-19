@@ -16,19 +16,27 @@ class InsideBarDetector(BaseDetector):
 
     Direction is determined by the trend context (EMA20 slope).
     """
-    name:     str = 'inside_bar'
-    MIN_BARS: int = 22
+    name:          str = 'inside_bar'
+    MIN_BARS:      int = 22
+    _MIN_5M_BARS:  int = 4       # V9: 4 5-min bars = 20 min
 
     def _detect(
         self,
         ticker:  str,
         df:      pd.DataFrame,
         rvol_df: Optional[pd.DataFrame],
+        precomputed: dict = None,
+        **kw,
     ) -> DetectorSignal:
-        cur_high  = float(df['high'].iloc[-1])
-        cur_low   = float(df['low'].iloc[-1])
-        prev_high = float(df['high'].iloc[-2])
-        prev_low  = float(df['low'].iloc[-2])
+        # V9: Use 5-min bars — inside bars on 1-min are noise (every 30s)
+        work_df = precomputed.get('df_5min', df) if precomputed else df
+        if len(work_df) < self._MIN_5M_BARS:
+            return DetectorSignal.no_signal()
+
+        cur_high  = float(work_df['high'].iloc[-1])
+        cur_low   = float(work_df['low'].iloc[-1])
+        prev_high = float(work_df['high'].iloc[-2])
+        prev_low  = float(work_df['low'].iloc[-2])
 
         if not (cur_high <= prev_high and cur_low >= prev_low):
             return DetectorSignal.no_signal()
@@ -38,9 +46,10 @@ class InsideBarDetector(BaseDetector):
         inside_range = cur_high - cur_low
         tightness    = 1.0 - (inside_range / mother_range)   # 0=same size, 1=zero size
 
-        # Direction from EMA20 slope (last 5 bars)
-        ema20 = compute_ema(df['close'], 20)
-        slope = float(ema20.iloc[-1]) - float(ema20.iloc[-6])
+        # Direction from EMA20 slope (last 5 bars of 5-min = 25 min)
+        ema20 = precomputed.get('ema_21_5m') if precomputed else compute_ema(work_df['close'], 20)
+        slope_bars = min(6, len(ema20))
+        slope = float(ema20.iloc[-1]) - float(ema20.iloc[-slope_bars])
         direction = 'long' if slope >= 0 else 'short'
 
         strength = max(0.3, min(tightness, 1.0))

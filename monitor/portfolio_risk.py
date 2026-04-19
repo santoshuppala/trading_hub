@@ -30,6 +30,50 @@ MAX_PORTFOLIO_DELTA   = float(os.getenv('MAX_PORTFOLIO_DELTA', 5.0))       # abs
 MAX_PORTFOLIO_GAMMA   = float(os.getenv('MAX_PORTFOLIO_GAMMA', 1.0))       # absolute gamma
 
 
+class _BuyingPowerRefresher(threading.Thread):
+    """Background daemon that refreshes buying power from all brokers every 30s.
+
+    Eliminates the 3-10s inline blocking on ORDER_REQ handler.
+    The main thread reads from cache in <1ms via get().
+    """
+
+    _REFRESH_INTERVAL = 30   # seconds between refreshes
+    _STALE_THRESHOLD = 90    # seconds before cache is considered stale
+
+    def __init__(self, fetch_fn):
+        super().__init__(daemon=True, name='BuyingPowerRefresher')
+        self._fetch_fn = fetch_fn
+        self._cached_value: Optional[float] = None
+        self._last_refresh: float = 0.0
+        self._lock = threading.Lock()
+        self._running = True
+
+    def run(self) -> None:
+        while self._running:
+            try:
+                bp = self._fetch_fn()
+                if bp is not None:
+                    with self._lock:
+                        self._cached_value = bp
+                        self._last_refresh = time.monotonic()
+                    log.debug("[BPRefresher] Updated: $%.2f", bp)
+            except Exception as exc:
+                log.debug("[BPRefresher] Fetch failed: %s", exc)
+            time.sleep(self._REFRESH_INTERVAL)
+
+    def get(self) -> tuple[Optional[float], bool]:
+        """Returns (buying_power, is_fresh). Never blocks."""
+        with self._lock:
+            if self._last_refresh == 0:
+                return None, False  # never refreshed yet
+            age = time.monotonic() - self._last_refresh
+            is_fresh = age < self._STALE_THRESHOLD
+            return self._cached_value, is_fresh
+
+    def stop(self) -> None:
+        self._running = False
+
+
 class PortfolioRiskGate:
     """
     Portfolio-level risk enforcement across all trading engines.
@@ -244,7 +288,24 @@ class PortfolioRiskGate:
             )
 
     def _get_buying_power_cached(self) -> Optional[float]:
-        """V8: Cache buying power for 60s. Prevents 12s+ blocking on repeated checks."""
+        """V9: Read from background refresher thread — NEVER blocks inline.
+
+        The _BuyingPowerRefresher daemon fetches from all brokers every 30s.
+        This method returns the cached value in <1ms. If cache is stale (>90s),
+        returns last known value with WARNING (fail-open — broker is ultimate
+        authority for rejection).
+        """
+        if hasattr(self, '_bp_refresher') and self._bp_refresher is not None:
+            bp, is_fresh = self._bp_refresher.get()
+            if bp is not None and not is_fresh:
+                log.warning("[PortfolioRisk] Buying power stale (>90s) — "
+                            "using last known: $%.2f", bp)
+            if bp is not None:
+                return bp
+            # Refresher hasn't succeeded yet (first 30s of startup)
+            # Fall through to inline fetch
+
+        # Fallback: inline fetch (legacy path, blocks for 3-10s)
         import time as _time
         now = _time.monotonic()
         if hasattr(self, '_bp_cached_value') and now - getattr(self, '_bp_cache_time', 0) < 60:
@@ -253,6 +314,16 @@ class PortfolioRiskGate:
         self._bp_cached_value = result
         self._bp_cache_time = now
         return result
+
+    def start_buying_power_refresher(self) -> None:
+        """Start the background buying power refresh thread.
+
+        Call after __init__ when the system is ready. The refresher
+        fetches from all brokers every 30s without blocking the EventBus.
+        """
+        self._bp_refresher = _BuyingPowerRefresher(self._get_buying_power)
+        self._bp_refresher.start()
+        log.info("[PortfolioRisk] Background buying power refresher started (30s interval)")
 
     def _get_buying_power(self) -> Optional[float]:
         """Fetch aggregate buying power from ALL brokers (Alpaca + Tradier)."""

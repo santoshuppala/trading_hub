@@ -400,9 +400,13 @@ def run_all_tests():
 
         # Load should return today's state
         loaded_pos, loaded_rec, loaded_log = load_state()
-        check("T11b: Loaded positions match",
-              len(loaded_pos) == open_count,
-              f"loaded={len(loaded_pos)} expected={open_count}")
+        # V8: load_state filters test tickers (DUP_TEST, FAIL_TEST, SAT1, etc.)
+        _test_tickers = {'DUP_TEST', 'FAIL_TEST', 'SAT1', 'SAT2', 'SAT3',
+                         'OVER_SELL', 'DEDUP1', 'TEST_TICKER'}
+        expected_count = sum(1 for t in positions if t not in _test_tickers)
+        check("T11b: Loaded positions match (V8: test tickers filtered)",
+              len(loaded_pos) == expected_count,
+              f"loaded={len(loaded_pos)} expected={expected_count}")
 
         # Verify stop prices survived persistence
         for ticker in positions:
@@ -505,9 +509,10 @@ def run_all_tests():
         from scripts.supervisor import (PROCESSES, _DEFAULT_PROCESSES,
                                          _load_engine_config, ProcessManager)
 
-        # Verify supervisor discovers all engines including data_collector
-        check("T15a: 5 engines in PROCESSES (incl data_collector)",
-              len(PROCESSES) >= 5 and 'data_collector' in PROCESSES,
+        # V8: 3 engines (core, options, data_collector). Pro/Pop merged into Core.
+        check("T15a: V8 default engines (core + options, no pro/pop)",
+              'core' in PROCESSES and 'options' in PROCESSES
+              and 'pro' not in _DEFAULT_PROCESSES and 'pop' not in _DEFAULT_PROCESSES,
               f"engines={list(PROCESSES.keys())}")
 
         # Verify ProcessManager can be instantiated for each engine
@@ -533,8 +538,9 @@ def run_all_tests():
               status == 'stopped')
 
         # Verify hung threshold constant exists
-        check("T15d: _HEARTBEAT_STALE_SEC = 120s",
-              pm_core._HEARTBEAT_STALE_SEC == 120.0)
+        # V8: Increased from 120s to 180s (background heartbeat + more work per cycle)
+        check("T15d: _HEARTBEAT_STALE_SEC = 180s (V8)",
+              pm_core._HEARTBEAT_STALE_SEC == 180.0)
 
         # Verify ENGINE_CONFIG merges correctly
         import json as _json

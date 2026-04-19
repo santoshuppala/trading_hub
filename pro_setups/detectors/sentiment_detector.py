@@ -125,51 +125,66 @@ class SentimentDetector(BaseDetector):
         except Exception:
             pass
 
-        # 4. Finviz: insider buys, analyst upgrades
+        # 4. Finviz: analyst rating + relative volume + short float
+        # ACTUAL fields: analyst_rating (1-5), relative_volume, short_float, change_pct
         try:
-            finviz = alt_data.short_float(ticker)
+            finviz = alt_data.finviz_data(ticker)
             if finviz:
-                insider_buy = 1.0 if finviz.get('insider_buying') else 0.0
-                analyst_upgrade = 1.0 if finviz.get('analyst_upgrade') else 0.0
-                score = 0.5 * insider_buy + 0.5 * analyst_upgrade
-                if score > 0:
+                # Analyst rating: 1.0=Strong Buy, 5.0=Strong Sell
+                rating = float(finviz.get('analyst_rating', 3.0) or 3.0)
+                bullish_analyst = max(0, (3.0 - rating) / 2.0)  # 1.0→1.0, 3.0→0, 5.0→-1.0
+                # Relative volume (>1.5 = unusual activity)
+                rvol = float(finviz.get('relative_volume', 1.0) or 1.0)
+                rvol_score = min(max(rvol - 1.0, 0) / 2.0, 1.0)  # 1→0, 3→1
+                # Combined
+                score = max(bullish_analyst, rvol_score)
+                if score > 0.1:
                     scores['finviz_insider'] = score
-                    direction_votes['finviz'] = 'long'
+                    if bullish_analyst > 0.3:
+                        direction_votes['finviz'] = 'long'
+                    elif bullish_analyst < -0.3:
+                        direction_votes['finviz'] = 'short'
         except Exception:
             pass
 
-        # 5. SEC EDGAR: insider filing activity
+        # 5. SEC EDGAR: filing activity (higher count = more corporate activity)
+        # ACTUAL fields: count, days
         try:
             sec = alt_data.sec_filings(ticker) if hasattr(alt_data, 'sec_filings') else None
             if sec:
-                buy_count = sec.get('insider_buys_30d', 0)
-                sell_count = sec.get('insider_sells_30d', 0)
-                total = buy_count + sell_count
-                if total > 0:
-                    ratio = buy_count / total
-                    scores['sec_filing'] = abs(ratio - 0.5) * 2
-                    direction_votes['sec'] = 'long' if ratio > 0.5 else 'short'
+                filing_count = int(sec.get('count', 0) or 0)
+                days = int(sec.get('days', 30) or 30)
+                # >5 filings in 30 days = high activity (M&A, offerings, insider reports)
+                if filing_count > 5:
+                    scores['sec_filing'] = min(filing_count / 15.0, 1.0)
+                    # Can't determine direction from filing count alone
         except Exception:
             pass
 
-        # 6. Yahoo: earnings surprises, recommendation changes
+        # 6. Yahoo: earnings proximity (days_until_earnings)
+        # ACTUAL fields: days_until_earnings, next_earnings_date, earnings_before_open
         try:
             yahoo = alt_data.earnings(ticker)
             if yahoo:
-                surprise = yahoo.get('earnings_surprise_pct', 0)
-                if surprise:
-                    scores['yahoo_recommendation'] = min(abs(surprise) / 10, 1.0)
-                    direction_votes['yahoo'] = 'long' if surprise > 0 else 'short'
+                days = yahoo.get('days_until_earnings')
+                if days is not None and isinstance(days, (int, float)) and days <= 7:
+                    # Earnings within 7 days = high attention, potential catalyst
+                    scores['yahoo_recommendation'] = max(0.3, 1.0 - days / 7.0)
+                    # Can't determine direction from proximity alone
         except Exception:
             pass
 
-        # 7. Polygon: prior-day volume anomaly
+        # 7. Polygon: prior-day price change as momentum signal
+        # ACTUAL fields: change_pct, volume, vwap, close
         try:
             polygon = alt_data.polygon_prev_day(ticker) if hasattr(alt_data, 'polygon_prev_day') else None
             if polygon:
-                vol_ratio = polygon.get('volume_vs_avg', 1.0)
-                if vol_ratio > 1:
-                    scores['polygon_volume'] = min((vol_ratio - 1.0) / 3.0, 1.0)
+                change = float(polygon.get('change_pct', 0) or 0)
+                volume = float(polygon.get('volume', 0) or 0)
+                # Big prev-day move = momentum continuation potential
+                if abs(change) > 2.0 and volume > 500000:
+                    scores['polygon_volume'] = min(abs(change) / 10.0, 1.0)
+                    direction_votes['polygon'] = 'long' if change > 0 else 'short'
         except Exception:
             pass
 

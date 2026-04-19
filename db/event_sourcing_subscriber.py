@@ -41,7 +41,10 @@ log = logging.getLogger(__name__)
 # Maps EventBus EventType to event_store event_type strings
 
 EVENT_TYPE_MAP = {
-    EventType.BAR:                  'BarReceived',
+    # V9: BarReceived REMOVED — market data bars are NOT trading events.
+    # They consumed 97% of event_store (808MB in 4 days, ~50GB/year).
+    # Bar data for analytics should go to a dedicated market_bars table.
+    # EventType.BAR:                'BarReceived',
     EventType.SIGNAL:               'StrategySignal',
     EventType.ORDER_REQ:            'OrderRequested',
     EventType.FILL:                 'FillExecuted',
@@ -107,7 +110,10 @@ class EventSourcingSubscriber:
     def register(self) -> None:
         """Subscribe to all event types at LOW priority (priority=10)."""
         handlers = {
-            EventType.BAR:                  self._on_bar,
+            # V9: Bars written to lean market_bars table instead of event_store.
+            # Saves ~97% of event_store bloat (808MB→~25MB in 4 days).
+            # Analytics/compliance queries updated to read from market_bars.
+            EventType.BAR:                  self._on_bar_lean,
             EventType.SIGNAL:               self._on_signal,
             EventType.ORDER_REQ:            self._on_order_req,
             EventType.FILL:                 self._on_fill,
@@ -208,7 +214,7 @@ class EventSourcingSubscriber:
     # ── Event Handlers (one per EventBus event type) ────────────────────────
 
     def _on_bar(self, event: Event) -> None:
-        """Bar price data received."""
+        """Legacy: Bar data to event_store (kept for reference, no longer called)."""
         try:
             p: BarPayload = event.payload
             if p.df is None or p.df.empty:
@@ -236,6 +242,48 @@ class EventSourcingSubscriber:
             )
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_bar error: %s", exc)
+
+    def _on_bar_lean(self, event: Event) -> None:
+        """V9: Write bar data to lean market_bars table (NOT event_store).
+
+        ~10x smaller than event_store rows (no UUID, no audit timestamps,
+        no JSONB overhead). Analytics and compliance queries read from here.
+
+        Falls back to event_store write if market_bars table doesn't exist yet
+        (pre-migration).
+        """
+        try:
+            p: BarPayload = event.payload
+            if p.df is None or p.df.empty:
+                return
+
+            last = p.df.iloc[-1]
+            ticker = p.ticker
+            bar_open = float(last.get("open", last.get("o", 0)))
+            bar_high = float(last.get("high", last.get("h", 0)))
+            bar_low = float(last.get("low", last.get("l", 0)))
+            bar_close = float(last.get("close", last.get("c", 0)))
+            bar_volume = int(last.get("volume", last.get("v", 0)))
+            bar_vwap = _safe_float(last.get("vwap"))
+            bar_rvol = _safe_float(getattr(p, "rvol_df", None))
+
+            if bar_close <= 0:
+                return
+
+            self._writer.enqueue(
+                table='market_bars',
+                columns=['ticker', 'bar_time', 'open', 'high', 'low', 'close',
+                         'volume', 'vwap', 'rvol', 'session_id'],
+                values=(ticker, event.timestamp, bar_open, bar_high, bar_low,
+                        bar_close, bar_volume, bar_vwap, bar_rvol,
+                        self._session_id),
+            )
+        except Exception as exc:
+            # Fallback: if market_bars table doesn't exist, write to event_store
+            if 'market_bars' in str(exc) or 'relation' in str(exc):
+                self._on_bar(event)
+            else:
+                log.debug("EventSourcingSubscriber._on_bar_lean error: %s", exc)
 
     def _on_signal(self, event: Event) -> None:
         """Strategy signal generated."""

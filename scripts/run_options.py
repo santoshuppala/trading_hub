@@ -171,11 +171,19 @@ def main():
     log.info("IPC consumer started (SIGNAL + POP_SIGNAL)")
 
     log.info("Options process running.")
+    _kill_switch_exit = False
     try:
         while True:
             now = datetime.now(ET)
             if now.hour >= 16:
                 log.info("4:00 PM ET — stopping options process.")
+                break
+
+            # V9: Kill switch check FIRST — before emitting BAR events that
+            # trigger new entries. Defense-in-depth alongside engine._halted flag.
+            if not lifecycle.tick():
+                log.error("Options engine halted by kill switch.")
+                _kill_switch_exit = True
                 break
 
             # Emit BAR events from shared cache (for position monitoring)
@@ -201,10 +209,6 @@ def main():
                 if bar_events:
                     bus.emit_batch(bar_events)
 
-            if not lifecycle.tick():
-                log.error("Options engine halted by kill switch.")
-                break
-
             time.sleep(10)
 
     except KeyboardInterrupt:
@@ -215,6 +219,9 @@ def main():
         if db_cleanup:
             db_cleanup()
         log.info("Options process stopped.")
+        # V8: Exit code 3 = kill switch halt. Supervisor should NOT restart.
+        if _kill_switch_exit:
+            sys.exit(3)
 
 
 if __name__ == '__main__':

@@ -103,6 +103,84 @@ def _parse_json(raw: Any) -> dict:
     return {}
 
 
+# ── V9: Bar data helpers (market_bars first, event_store fallback) ─────────
+
+def _fetch_bars(cur, ticker: str, start_time, end_time) -> list[dict]:
+    """Fetch bar data between start_time and end_time as list of dicts.
+
+    V9: Reads from market_bars table first (lean, fast).
+    Falls back to event_store BarReceived for pre-V9 data.
+
+    Returns list of {open, high, low, close, volume, vwap} dicts.
+    """
+    try:
+        cur.execute("""
+            SELECT open, high, low, close, volume, vwap
+            FROM market_bars
+            WHERE ticker = %s
+              AND bar_time >= %s AND bar_time <= %s
+            ORDER BY bar_time
+        """, (ticker, start_time, end_time))
+        rows = cur.fetchall()
+        if rows:
+            return [{'open': r[0], 'high': r[1], 'low': r[2],
+                     'close': r[3], 'volume': r[4], 'vwap': r[5]} for r in rows]
+    except Exception:
+        try:
+            cur.connection.rollback()
+        except Exception:
+            pass
+
+    # Fallback: legacy event_store BarReceived
+    cur.execute("""
+        SELECT event_payload
+        FROM event_store
+        WHERE event_type = 'BarReceived'
+          AND event_payload->>'ticker' = %s
+          AND event_time >= %s AND event_time <= %s
+        ORDER BY event_time
+    """, (ticker, start_time, end_time))
+    return [_parse_json(r["event_payload"]) for r in cur.fetchall()]
+
+
+def _fetch_latest_bar(cur, ticker: str, before_time) -> Optional[dict]:
+    """Fetch the most recent bar for ticker before a given time.
+
+    Returns {open, high, low, close, volume, vwap} dict or None.
+    """
+    try:
+        cur.execute("""
+            SELECT open, high, low, close, volume, vwap
+            FROM market_bars
+            WHERE ticker = %s AND bar_time <= %s
+            ORDER BY bar_time DESC
+            LIMIT 1
+        """, (ticker, before_time))
+        row = cur.fetchone()
+        if row:
+            return {'open': row[0], 'high': row[1], 'low': row[2],
+                    'close': row[3], 'volume': row[4], 'vwap': row[5]}
+    except Exception:
+        try:
+            cur.connection.rollback()
+        except Exception:
+            pass
+
+    # Fallback: legacy event_store
+    cur.execute("""
+        SELECT event_payload FROM event_store
+        WHERE event_type = 'BarReceived'
+          AND event_payload->>'ticker' = %s
+          AND event_time <= %s
+        ORDER BY event_time DESC
+        LIMIT 1
+    """, (ticker, before_time))
+    row = cur.fetchone()
+    if row:
+        return _parse_json(row["event_payload"])
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # JOB 1: ml_trade_outcomes — MFE / MAE excursion analysis
 # ═══════════════════════════════════════════════════════════════════════════
@@ -169,21 +247,13 @@ def job_trade_outcomes(conn, target_date: date) -> int:
         time_in_position_sec = int((exit_time - entry_time).total_seconds())
 
         # Step 3: Get bar data between entry and exit for MFE/MAE
-        cur.execute("""
-            SELECT event_payload
-            FROM event_store
-            WHERE event_type = 'BarReceived'
-              AND event_payload->>'ticker' = %s
-              AND event_time >= %s AND event_time <= %s
-            ORDER BY event_time
-        """, (ticker, entry_time, exit_time))
-        bar_rows = cur.fetchall()
+        # V9: market_bars first, fallback to event_store BarReceived
+        bar_rows = _fetch_bars(cur, ticker, entry_time, exit_time)
 
         mfe = 0.0
         mae = 0.0
 
-        for bar_row in bar_rows:
-            bp = _parse_json(bar_row["event_payload"])
+        for bp in bar_rows:
             high = _safe_float(bp.get("high"))
             low = _safe_float(bp.get("low"))
 
@@ -423,19 +493,11 @@ def job_signal_context(conn, target_date: date) -> int:
                         outcome_pnl_pct = outcome_pnl / (current_price * qty)
 
         # Bar context at signal time: find the most recent bar for this ticker
+        # V9: market_bars first, fallback to event_store
         bar_return = None
         bar_range_pct = None
-        cur.execute("""
-            SELECT event_payload FROM event_store
-            WHERE event_type = 'BarReceived'
-              AND event_payload->>'ticker' = %s
-              AND event_time <= %s
-            ORDER BY event_time DESC
-            LIMIT 1
-        """, (ticker, sig["event_time"]))
-        bar_row = cur.fetchone()
-        if bar_row:
-            bp = _parse_json(bar_row["event_payload"])
+        bp = _fetch_latest_bar(cur, ticker, sig["event_time"])
+        if bp:
             o = _safe_float(bp.get("open"))
             h = _safe_float(bp.get("high"))
             lo = _safe_float(bp.get("low"))
@@ -620,15 +682,9 @@ def job_rejection_log(conn, target_date: date) -> int:
         positions_held = pos_row["cnt"] if pos_row else 0
 
         # Counterfactual: look at next 30-60 min of bar data after rejection
+        # V9: market_bars first, fallback to event_store
         window_end = rej["event_time"] + timedelta(minutes=60)
-        cur.execute("""
-            SELECT event_payload FROM event_store
-            WHERE event_type = 'BarReceived'
-              AND event_payload->>'ticker' = %s
-              AND event_time > %s AND event_time <= %s
-            ORDER BY event_time
-        """, (ticker, rej["event_time"], window_end))
-        future_bars = cur.fetchall()
+        future_bars = _fetch_bars(cur, ticker, rej["event_time"], window_end)
 
         would_have_won = None
         counterfactual_pnl = None
@@ -640,8 +696,7 @@ def job_rejection_log(conn, target_date: date) -> int:
             max_favorable = 0.0
             atr_val = signal_atr or 1.0  # fallback to avoid division by zero
 
-            for fb in future_bars:
-                fbp = _parse_json(fb["event_payload"])
+            for fbp in future_bars:
                 high = _safe_float(fbp.get("high"))
                 low = _safe_float(fbp.get("low"))
                 close = _safe_float(fbp.get("close"))
@@ -819,16 +874,31 @@ def job_daily_regime(conn, target_date: date) -> int:
     wins = int(trade_stats["wins"] or 0)
     win_rate = (wins * 100.0 / total_trades) if total_trades > 0 else 0.0
 
-    # Compute average RVOL across all tickers from bar events
-    cur.execute("""
-        SELECT AVG((event_payload->>'rvol')::NUMERIC) AS avg_rvol
-        FROM event_store
-        WHERE event_type = 'BarReceived'
-          AND event_payload->>'rvol' IS NOT NULL
-          AND event_time >= %s AND event_time < %s
-    """, (day_start, day_end))
-    rvol_row = cur.fetchone()
-    avg_rvol = _safe_float(rvol_row["avg_rvol"]) if rvol_row else None
+    # Compute average RVOL across all tickers from bar data
+    # V9: market_bars first, fallback to event_store BarReceived
+    avg_rvol = None
+    try:
+        cur.execute("""
+            SELECT AVG(rvol) AS avg_rvol
+            FROM market_bars
+            WHERE rvol IS NOT NULL
+              AND bar_time >= %s AND bar_time < %s
+        """, (day_start, day_end))
+        rvol_row = cur.fetchone()
+        avg_rvol = _safe_float(rvol_row["avg_rvol"]) if rvol_row else None
+    except Exception:
+        conn.rollback()
+    if avg_rvol is None:
+        # Fallback: legacy event_store
+        cur.execute("""
+            SELECT AVG((event_payload->>'rvol')::NUMERIC) AS avg_rvol
+            FROM event_store
+            WHERE event_type = 'BarReceived'
+              AND event_payload->>'rvol' IS NOT NULL
+              AND event_time >= %s AND event_time < %s
+        """, (day_start, day_end))
+        rvol_row = cur.fetchone()
+        avg_rvol = _safe_float(rvol_row["avg_rvol"]) if rvol_row else None
 
     # Classify regime
     if total_trades == 0:

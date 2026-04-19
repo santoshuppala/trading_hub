@@ -255,13 +255,17 @@ class SignalAnalyzer:
         try:
             from monitor.rvol import _global_rvol_engine
             if _global_rvol_engine is not None:
-                # Lazy seed from rvol_cache if engine hasn't seen this ticker
-                hist_df = rvol_cache.get(ticker) if rvol_cache else None
-                _global_rvol_engine.seed_from_bar_payload(ticker, hist_df)
-                # Update with this bar's volume
-                last_vol = float(volume.iloc[-1]) if len(volume) > 0 else 0
-                result = _global_rvol_engine.update(ticker, last_vol)
-                rvol = result.rvol_smooth
+                # V9: Try streaming cvol first (real-time, survives restart)
+                rt_result = _global_rvol_engine.get_realtime_rvol(ticker)
+                if rt_result is not None:
+                    rvol = rt_result.rvol_smooth
+                else:
+                    # Fallback: BAR-based accumulation (original path)
+                    hist_df = rvol_cache.get(ticker) if rvol_cache else None
+                    _global_rvol_engine.seed_from_bar_payload(ticker, hist_df)
+                    last_vol = float(volume.iloc[-1]) if len(volume) > 0 else 0
+                    result = _global_rvol_engine.update(ticker, last_vol)
+                    rvol = result.rvol_smooth
             else:
                 raise ImportError
         except (ImportError, Exception):

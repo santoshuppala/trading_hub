@@ -77,11 +77,30 @@ def main():
     alt_cache = SafeStateFile(ALT_CACHE_PATH, max_age_seconds=900.0)  # 15 min
 
     # ── DB persistence ─────────────────────────────────────────────────
+    # Data Collector has no EventBus — it writes snapshots directly via
+    # DataSourceCollector's own DB calls.  init_satellite_db requires a bus
+    # for EventSourcingSubscriber, so we just init the pool + writer directly.
     db_cleanup = None
     try:
-        from scripts._db_helper import init_satellite_db
-        db_cleanup = init_satellite_db('data_collector', bus=None)
-        log.info("DB persistence initialized")
+        from config import DB_ENABLED, DATABASE_URL
+        if DB_ENABLED:
+            from db import init_db, close_db
+            from db.writer import init_writer
+            import asyncio, threading
+            _db_loop = asyncio.new_event_loop()
+            threading.Thread(target=_db_loop.run_forever, name="db-data_collector", daemon=True).start()
+            asyncio.run_coroutine_threadsafe(init_db(DATABASE_URL), _db_loop).result(timeout=15)
+            _db_writer = init_writer(_db_loop)
+            asyncio.run_coroutine_threadsafe(_db_writer.start(), _db_loop).result(timeout=5)
+            log.info("DB persistence initialized (pool + writer, no event subscriber)")
+            def _db_cleanup():
+                try:
+                    asyncio.run_coroutine_threadsafe(_db_writer.stop(), _db_loop).result(timeout=5)
+                    asyncio.run_coroutine_threadsafe(close_db(), _db_loop).result(timeout=5)
+                    _db_loop.call_soon_threadsafe(_db_loop.stop)
+                except Exception as exc:
+                    log.warning("DB cleanup error: %s", exc)
+            db_cleanup = _db_cleanup
     except Exception as exc:
         log.warning("DB init failed (non-fatal): %s", exc)
 
@@ -109,6 +128,118 @@ def main():
 
     # ── Initialize ticker discovery sources ────────────────────────────
     discovered_tickers = set()
+
+    def _discover_from_news():
+        """V8: Discover tickers from MARKET-WIDE Benzinga headlines.
+        1 API call → extracts all mentioned tickers from recent headlines.
+        Best used during pre-market to find overnight movers."""
+        tickers = set()
+        try:
+            if hasattr(_collect_and_cache, '_api_state') and _collect_and_cache._api_state.get('benz'):
+                benz = _collect_and_cache._api_state['benz']
+                trending = benz.discover_trending_tickers(hours=4.0, min_mentions=2)
+                for ticker, info in trending.items():
+                    if ticker not in TICKERS and len(ticker) <= 5 and ticker.isalpha():
+                        tickers.add(ticker)
+                if tickers:
+                    log.info("[Discovery] Benzinga news: %d tickers mentioned in headlines: %s",
+                             len(tickers), sorted(tickers)[:10])
+        except Exception as exc:
+            log.debug("[Discovery] Benzinga news discovery failed: %s", exc)
+        return tickers
+
+    def _discover_from_social_trending():
+        """V8: Discover tickers from StockTwits trending. 1 API call → top 30."""
+        tickers = set()
+        try:
+            if hasattr(_collect_and_cache, '_api_state') and _collect_and_cache._api_state.get('st'):
+                st = _collect_and_cache._api_state['st']
+                trending = st.discover_trending()
+                for ticker in trending:
+                    if ticker not in TICKERS and len(ticker) <= 5 and ticker.isalpha():
+                        tickers.add(ticker)
+                if tickers:
+                    log.info("[Discovery] StockTwits trending: %d new tickers: %s",
+                             len(tickers), sorted(tickers)[:10])
+        except Exception as exc:
+            log.debug("[Discovery] StockTwits trending failed: %s", exc)
+        return tickers
+
+    def _discover_from_finviz_intraday():
+        """V8: Scrape Finviz for intraday movers — top gainers, unusual volume.
+        1 page scrape, polite. Returns tickers with strong intraday moves."""
+        tickers = set()
+        try:
+            finviz = collector._sources.get('finviz')
+            if finviz and hasattr(finviz, 'top_gainers'):
+                gainers = finviz.top_gainers(limit=10)
+                if gainers:
+                    for g in gainers:
+                        sym = g.get('ticker', g.get('symbol', ''))
+                        if sym and len(sym) <= 5 and sym.isalpha():
+                            tickers.add(sym.upper())
+                    log.info("[Discovery] Finviz gainers: %d tickers", len(tickers))
+            elif finviz and hasattr(finviz, 'screener_scan'):
+                # Fallback: use screener with volume filter
+                results = finviz.screener_scan(
+                    signal='unusual_volume', limit=10)
+                if results:
+                    for r in results:
+                        sym = r.get('ticker', r.get('symbol', ''))
+                        if sym and len(sym) <= 5 and sym.isalpha():
+                            tickers.add(sym.upper())
+                    log.info("[Discovery] Finviz unusual vol: %d tickers", len(tickers))
+        except Exception as exc:
+            log.debug("[Discovery] Finviz intraday failed: %s", exc)
+        return tickers
+
+    def _discover_from_yahoo_intraday():
+        """V8: Check Yahoo for intraday upgrades/downgrades/earnings surprises.
+        Free, no rate limit. Returns tickers with significant analyst actions."""
+        tickers = set()
+        try:
+            yahoo = collector._sources.get('yahoo')
+            if yahoo:
+                # Check for upgrades/downgrades today
+                if hasattr(yahoo, 'analyst_actions'):
+                    actions = yahoo.analyst_actions()
+                    if actions:
+                        for a in actions[:15]:
+                            sym = a.get('ticker', a.get('symbol', ''))
+                            if sym and len(sym) <= 5 and sym.isalpha():
+                                tickers.add(sym.upper())
+                        log.info("[Discovery] Yahoo analyst actions: %d tickers", len(tickers))
+
+                # Also re-check earnings (companies report intraday)
+                if hasattr(yahoo, 'earnings_calendar'):
+                    calendar = yahoo.earnings_calendar()
+                    if calendar:
+                        for entry in calendar[:10]:
+                            sym = entry.get('ticker', entry.get('symbol', ''))
+                            if sym and len(sym) <= 5 and sym.isalpha():
+                                tickers.add(sym.upper())
+        except Exception as exc:
+            log.debug("[Discovery] Yahoo intraday failed: %s", exc)
+        return tickers
+
+    def _discover_from_polygon_intraday():
+        """V8: Check Polygon for intraday volume spikes.
+        Uses snapshot endpoint (1 call). Returns tickers with unusual intraday activity."""
+        tickers = set()
+        try:
+            polygon = collector._sources.get('polygon')
+            if polygon and hasattr(polygon, 'gainers_losers'):
+                movers = polygon.gainers_losers()
+                if movers:
+                    for m in movers[:15]:
+                        sym = m.get('ticker', m.get('symbol', ''))
+                        change = abs(float(m.get('change_pct', m.get('todaysChangePerc', 0))))
+                        if sym and change > 3.0 and len(sym) <= 5:
+                            tickers.add(sym.upper())
+                    log.info("[Discovery] Polygon intraday movers: %d tickers (>3%%)", len(tickers))
+        except Exception as exc:
+            log.debug("[Discovery] Polygon intraday failed: %s", exc)
+        return tickers
 
     def _discover_from_polygon_movers():
         """Discover tickers with big previous-day moves NOT in watchlist."""
@@ -226,25 +357,37 @@ def main():
         except Exception as exc:
             log.debug("[Collector] Yahoo earnings failed: %s", exc)
 
-        # ── Finviz Short Float & Screener ─────────────────────────────
+        # ── Finviz Short Float & Screener (web scraping — be polite) ───
+        # V8: Rotate 5 tickers per cycle with 1s delay between requests.
+        # Full coverage in 4 cycles (40 min). Avoids IP blocking.
         try:
             finviz = collector._sources.get('finviz')
             if finviz:
-                screener_data = {}
-                for ticker in tickers[:20]:
+                if not hasattr(_collect_and_cache, '_finviz_cache'):
+                    _collect_and_cache._finviz_cache = {}
+                    _collect_and_cache._finviz_cycle = 0
+
+                batch_start = (_collect_and_cache._finviz_cycle * 5) % max(len(tickers), 1)
+                batch = tickers[batch_start:batch_start + 5]
+                _collect_and_cache._finviz_cycle += 1
+
+                for ticker in batch:
                     try:
                         sd = finviz.screener_data(ticker)
                         if sd:
                             if hasattr(sd, '__dataclass_fields__'):
                                 from dataclasses import asdict
-                                screener_data[ticker] = asdict(sd)
+                                _collect_and_cache._finviz_cache[ticker] = asdict(sd)
                             elif hasattr(sd, '__dict__'):
-                                screener_data[ticker] = sd.__dict__
+                                _collect_and_cache._finviz_cache[ticker] = sd.__dict__
+                        time.sleep(1)  # polite delay between scrapes
                     except Exception:
                         pass
-                if screener_data:
-                    cache_data['finviz_screener'] = screener_data
-                    log.info("[Collector] Finviz screener for %d tickers", len(screener_data))
+
+                if _collect_and_cache._finviz_cache:
+                    cache_data['finviz_screener'] = dict(_collect_and_cache._finviz_cache)
+                    log.debug("[Collector] Finviz: batch of %d, total cache %d",
+                              len(batch), len(_collect_and_cache._finviz_cache))
         except Exception as exc:
             log.debug("[Collector] Finviz failed: %s", exc)
 
@@ -269,12 +412,20 @@ def main():
         except Exception as exc:
             log.debug("[Collector] SEC EDGAR failed: %s", exc)
 
-        # ── Polygon Previous Day ──────────────────────────────────────
+        # ── Polygon Previous Day (FREE: 5 calls/min) ─────────────────
+        # V8: 5 tickers per cycle with cache. Full coverage in 4 cycles.
         try:
             polygon = collector._sources.get('polygon')
             if polygon:
-                prev_data = {}
-                for ticker in tickers[:20]:
+                if not hasattr(_collect_and_cache, '_polygon_cache'):
+                    _collect_and_cache._polygon_cache = {}
+                    _collect_and_cache._polygon_cycle = 0
+
+                batch_start = (_collect_and_cache._polygon_cycle * 5) % max(len(tickers), 1)
+                batch = tickers[batch_start:batch_start + 5]
+                _collect_and_cache._polygon_cycle += 1
+                prev_data = dict(_collect_and_cache._polygon_cache)  # keep previous
+                for ticker in batch:
                     try:
                         prev = polygon.previous_close(ticker)
                         if prev:
@@ -285,11 +436,20 @@ def main():
                                 prev_data[ticker] = prev.__dict__
                     except Exception:
                         pass
+                _collect_and_cache._polygon_cache = prev_data
                 if prev_data:
                     cache_data['polygon_prev'] = prev_data
-                    log.info("[Collector] Polygon prev-day for %d tickers", len(prev_data))
+                    log.debug("[Collector] Polygon: batch of %d, total cache %d",
+                              len(batch), len(prev_data))
         except Exception as exc:
             log.debug("[Collector] Polygon failed: %s", exc)
+
+        # ── Alpha Vantage (FREE: 25 calls/day) ────────────────────────
+        # V8 AUDIT: No trading component reads Alpha Vantage data.
+        # RiskSizer.get_beta() calls Yahoo directly, not alt_data_cache.
+        # Disabled to save 25 API calls/day. Re-enable when a consumer exists.
+        # If needed: av.company_overview(ticker) provides beta, PE, sector.
+        pass
 
         # ── Unusual Options Flow ──────────────────────────────────────
         if uof_scanner:
@@ -307,60 +467,100 @@ def main():
             except Exception as exc:
                 log.debug("[Collector] Unusual options flow failed: %s", exc)
 
-        # ── V8: Benzinga News Sentiment (was in Pop, now collected here) ─
-        try:
-            from pop_screener.benzinga_news import BenzingaNewsSentimentSource
-            benz_key = os.getenv('BENZINGA_API_KEY', '')
-            if benz_key:
-                benz = BenzingaNewsSentimentSource(api_key=benz_key)
-                news_data = {}
-                for ticker in tickers[:20]:
-                    try:
-                        news_1h = benz.get_news(ticker, window_hours=1)
-                        news_24h = benz.get_news(ticker, window_hours=24)
-                        if news_1h or news_24h:
-                            avg_1h = sum(n.sentiment_score for n in news_1h) / len(news_1h) if news_1h else 0
-                            avg_24h = sum(n.sentiment_score for n in news_24h) / len(news_24h) if news_24h else 0
-                            news_data[ticker] = {
-                                'headlines_1h': len(news_1h),
-                                'headlines_24h': len(news_24h),
-                                'sentiment_delta': round(avg_1h - avg_24h, 4),
-                                'avg_sentiment_1h': round(avg_1h, 4),
-                                'avg_sentiment_24h': round(avg_24h, 4),
-                                'headline_baseline': 2.0,  # default, can improve
-                            }
-                    except Exception:
-                        pass
-                if news_data:
-                    cache_data['benzinga_news'] = news_data
-                    log.info("[Collector] Benzinga news for %d tickers", len(news_data))
-        except Exception as exc:
-            log.debug("[Collector] Benzinga collection failed: %s", exc)
+        # ═══════════════════════════════════════════════════════════════
+        # V8: News & Social — PRE-MARKET BURST + TRADING THROTTLE
+        #
+        # Pre-market (6:00-9:30 ET): BURST — use 60% of daily budget
+        #   to scan max tickers. Picks up overnight news, earnings, movers.
+        # Trading (9:30-4:00 ET): THROTTLE — use remaining 40% slowly.
+        #
+        # Benzinga:  50/day → 5/cycle pre-mkt (30 in 1hr) + 1/cycle trading (20)
+        # StockTwits: 200/hr → 15/cycle pre-mkt + 5/cycle trading
+        # ═══════════════════════════════════════════════════════════════
 
-        # ── V8: StockTwits Social Sentiment (was in Pop) ──────────────
-        try:
-            from pop_screener.stocktwits_social import StockTwitsSocialSource
-            st_token = os.getenv('STOCKTWITS_TOKEN', '')
-            st = StockTwitsSocialSource(access_token=st_token or None)
-            social_data = {}
-            for ticker in tickers[:20]:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        _now_et = _dt.now(_ZI('America/New_York'))
+        _is_premarket = _now_et.hour < 9 or (_now_et.hour == 9 and _now_et.minute < 30)
+
+        # Persistent API state (survives across cycles)
+        if not hasattr(_collect_and_cache, '_api_state'):
+            _collect_and_cache._api_state = {
+                'benz': None, 'benz_cache': {}, 'benz_calls': 0, 'benz_cycle': 0,
+                'st': None, 'st_cache': {}, 'st_cycle': 0,
+            }
+            try:
+                from pop_screener.benzinga_news import BenzingaNewsSentimentSource
+                bk = os.getenv('BENZINGA_API_KEY', '')
+                _collect_and_cache._api_state['benz'] = BenzingaNewsSentimentSource(api_key=bk) if bk else None
+            except Exception:
+                pass
+            try:
+                from pop_screener.stocktwits_social import StockTwitsSocialSource
+                st = os.getenv('STOCKTWITS_TOKEN', '')
+                _collect_and_cache._api_state['st'] = StockTwitsSocialSource(access_token=st or None)
+            except Exception:
+                pass
+
+        _s = _collect_and_cache._api_state
+
+        # ── Benzinga (50/day) ─────────────────────────────────────────
+        benz = _s['benz']
+        if benz and _s['benz_calls'] < 45:
+            batch_size = 5 if (_is_premarket and _s['benz_calls'] < 30) else 1
+            start = (_s['benz_cycle'] * batch_size) % len(tickers)
+            batch = tickers[start:start + batch_size]
+            _s['benz_cycle'] += 1
+
+            for tk in batch:
+                if _s['benz_calls'] >= 45:
+                    break
                 try:
-                    social = st.get_social(ticker, window_hours=1)
+                    news = benz.get_news(tk, window_hours=1)
+                    _s['benz_calls'] += 1
+                    if news:
+                        avg = sum(n.sentiment_score for n in news) / len(news)
+                        _s['benz_cache'][tk] = {
+                            'headlines_1h': len(news), 'headlines_24h': 0,
+                            'sentiment_delta': round(avg, 4),
+                            'avg_sentiment_1h': round(avg, 4),
+                            'avg_sentiment_24h': 0.0,
+                            'headline_baseline': 2.0,
+                        }
+                except Exception:
+                    pass
+
+            phase = 'PRE-MARKET' if _is_premarket else 'TRADING'
+            log.info("[Collector] Benzinga %s: batch=%d cached=%d calls=%d/50",
+                     phase, len(batch), len(_s['benz_cache']), _s['benz_calls'])
+
+        if _s.get('benz_cache'):
+            cache_data['benzinga_news'] = dict(_s['benz_cache'])
+
+        # ── StockTwits (200/hr) ───────────────────────────────────────
+        st_inst = _s['st']
+        if st_inst:
+            batch_size = 15 if _is_premarket else 5
+            start = (_s['st_cycle'] * batch_size) % len(tickers)
+            batch = tickers[start:start + batch_size]
+            _s['st_cycle'] += 1
+
+            for tk in batch:
+                try:
+                    social = st_inst.get_social(tk, window_hours=1)
                     if social and social.mention_count > 0:
-                        social_data[ticker] = {
+                        _s['st_cache'][tk] = {
                             'mention_count': social.mention_count,
                             'mention_velocity': round(social.mention_velocity, 4),
                             'bullish_pct': round(social.bullish_pct, 4),
                             'bearish_pct': round(social.bearish_pct, 4),
-                            'baseline': 100.0,  # default, can improve
+                            'baseline': 100.0,
                         }
                 except Exception:
                     pass
-            if social_data:
-                cache_data['stocktwits_social'] = social_data
-                log.info("[Collector] StockTwits social for %d tickers", len(social_data))
-        except Exception as exc:
-            log.debug("[Collector] StockTwits collection failed: %s", exc)
+
+            if _s['st_cache']:
+                cache_data['stocktwits_social'] = dict(_s['st_cache'])
 
         # ── Discovered tickers ────────────────────────────────────────
         cache_data['discovered_tickers'] = list(discovered_tickers)
@@ -399,7 +599,7 @@ def main():
             if not writer:
                 return
 
-            now_ts = datetime.now(ET).isoformat()
+            now_ts = datetime.now(ET)
             rows_written = 0
 
             # 1. Fear & Greed (market-wide, no ticker)
@@ -564,11 +764,25 @@ def main():
                 except Exception as exc:
                     log.warning("Session start collection failed: %s", exc)
 
-                # Initial discovery
+                # V8: Pre-market discovery burst — find new tickers from ALL sources
+                # These 2 calls use market-wide endpoints (1 API call each)
+                # to discover tickers we're NOT tracking but SHOULD be
+                news_tickers = _discover_from_news()          # 1 Benzinga call
+                social_tickers = _discover_from_social_trending()  # 1 StockTwits call
+                discovered_tickers.update(news_tickers)
+                discovered_tickers.update(social_tickers)
+
+                # Existing discovery sources
                 earnings_tickers = _discover_from_yahoo_earnings()
                 discovered_tickers.update(earnings_tickers)
                 polygon_tickers = _discover_from_polygon_movers()
                 discovered_tickers.update(polygon_tickers)
+
+                log.info("[Discovery] PRE-MARKET total: %d new tickers "
+                         "(news=%d social=%d earnings=%d polygon=%d)",
+                         len(discovered_tickers), len(news_tickers),
+                         len(social_tickers), len(earnings_tickers),
+                         len(polygon_tickers))
 
                 # Full collection
                 cache_data = _collect_and_cache(TICKERS)
@@ -595,10 +809,29 @@ def main():
 
             # ── Discovery refresh (every 30 min) ──────────────────────
             if now_mono - last_discovery >= DISCOVERY_INTERVAL:
-                log.info("Discovery refresh")
+                from datetime import datetime as _dt
+                from zoneinfo import ZoneInfo as _ZI
+                _now_et = _dt.now(_ZI('America/New_York'))
+                _is_trading = 9 <= _now_et.hour < 16
+
+                log.info("Discovery refresh (%s)",
+                         'TRADING' if _is_trading else 'PRE-MARKET')
                 new_tickers = set()
+
+                # Always: news + social trending (1 API call each, cheap)
+                new_tickers.update(_discover_from_news())
+                new_tickers.update(_discover_from_social_trending())
+
+                # Always: earnings + prev-day movers
                 new_tickers.update(_discover_from_yahoo_earnings())
                 new_tickers.update(_discover_from_polygon_movers())
+
+                # V8: During trading hours — also scan for intraday movers
+                # These are free/cheap and catch stocks moving NOW
+                if _is_trading:
+                    new_tickers.update(_discover_from_finviz_intraday())
+                    new_tickers.update(_discover_from_yahoo_intraday())
+                    new_tickers.update(_discover_from_polygon_intraday())
 
                 truly_new = new_tickers - discovered_tickers - set(TICKERS)
                 if truly_new:

@@ -55,6 +55,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
@@ -62,7 +63,7 @@ from zoneinfo import ZoneInfo
 from config import TRADE_START_TIME, FORCE_CLOSE_TIME, MIN_BARS_REQUIRED
 
 from .event_bus import Event, EventBus, EventType
-from .events import BarPayload, SignalPayload
+from .events import BarPayload, SignalPayload, QuotePayload
 from .signals import SignalAnalyzer
 
 ET = ZoneInfo('America/New_York')
@@ -100,8 +101,114 @@ class StrategyEngine:
         self._params     = strategy_params
 
         bus.subscribe(EventType.BAR, self._on_bar)
+        # V9: Subscribe to QUOTE for real-time exit monitoring (<1s detection).
+        # QUOTE handler ONLY checks stop/target for open positions.
+        # No entry signals, no full analysis — just fast price comparison.
+        bus.subscribe(EventType.QUOTE, self._on_quote)
 
-    # ── Handler ───────────────────────────────────────────────────────────────
+        # V9: Track last BAR timestamp per ticker to reject stale QUOTEs
+        self._last_bar_mono: Dict[str, float] = {}
+
+    # ── QUOTE Handler (V9 — real-time exit monitoring) ────────────────────────
+
+    def _on_quote(self, event: Event) -> None:
+        """Fast exit check against streaming bid price.
+
+        Only checks stop_price and target_price for open positions.
+        No indicator analysis, no entry signals — just arithmetic comparison.
+
+        Correctness guards:
+          - Skip if no position open for this ticker
+          - Skip if position opened <500ms ago (stop/target not yet set by ExecutionFeedback)
+          - Use bid price for long exits (what you'd actually get when selling)
+          - Skip outside trading window
+        """
+        p: QuotePayload = event.payload
+        ticker = p.ticker
+
+        # Only check tickers with open positions
+        if ticker not in self._positions:
+            return
+
+        pos = self._positions[ticker]
+
+        # Grace window: skip QUOTEs arriving within 500ms of position open.
+        # ExecutionFeedback needs time to patch real stop/target onto the position.
+        import time as _time
+        fill_ts = pos.get('_opened_mono', 0)
+        if fill_ts > 0 and _time.monotonic() - fill_ts < 0.5:
+            return
+
+        # Trading window check
+        now = datetime.now(ET)
+        hour, minute = now.hour, now.minute
+        in_window = (
+            (hour == _TRADE_START[0] and minute >= _TRADE_START[1])
+            or (_TRADE_START[0] < hour < _FORCE_CLOSE[0])
+        )
+        if not in_window:
+            return
+        stop_price = pos.get('stop_price', 0)
+        target_price = pos.get('target_price', 0)
+        entry_price = pos.get('entry_price', 0)
+
+        # Need valid stop/target (ExecutionFeedback may not have patched yet)
+        if stop_price <= 0 or target_price <= 0:
+            return
+
+        # Use BID for long exit checks (what you'd receive when selling)
+        bid = p.bid
+        if bid <= 0:
+            return
+
+        # Stop-loss check: bid dropped to or below stop
+        if bid <= stop_price:
+            log.info("[StrategyEngine] QUOTE EXIT (stop): %s bid=$%.2f <= stop=$%.2f",
+                     ticker, bid, stop_price)
+            self._emit_quote_exit(ticker, bid, 'SELL_STOP', pos, event)
+            return
+
+        # Target check: bid reached or exceeded target
+        if bid >= target_price:
+            log.info("[StrategyEngine] QUOTE EXIT (target): %s bid=$%.2f >= target=$%.2f",
+                     ticker, bid, target_price)
+            self._emit_quote_exit(ticker, bid, 'SELL_TARGET', pos, event)
+            return
+
+        # Half target: partial sell if not already done
+        half_target = pos.get('half_target', 0)
+        if half_target > 0 and bid >= half_target and not pos.get('partial_done'):
+            qty = pos.get('quantity', 0)
+            if qty >= 2:
+                log.info("[StrategyEngine] QUOTE EXIT (half_target): %s bid=$%.2f >= half=$%.2f",
+                         ticker, bid, half_target)
+                self._emit_quote_exit(ticker, bid, 'PARTIAL_SELL', pos, event)
+                return
+
+    def _emit_quote_exit(self, ticker: str, price: float, action: str,
+                          pos: dict, parent: Event) -> None:
+        """Emit a SIGNAL from QUOTE-based exit check."""
+        atr_value = pos.get('atr_value', 1.0) or 1.0
+        self._bus.emit(Event(
+            type=EventType.SIGNAL,
+            payload=SignalPayload(
+                ticker=ticker,
+                action=action,
+                current_price=price,
+                ask_price=price,
+                atr_value=atr_value,
+                rsi_value=50.0,               # not computed from QUOTE
+                rvol=1.0,                      # not computed from QUOTE
+                vwap=price,                    # placeholder
+                stop_price=pos.get('stop_price', price * 0.97),
+                target_price=pos.get('target_price', price * 1.05),
+                half_target=pos.get('half_target', price * 1.025),
+                reclaim_candle_low=price,      # placeholder
+            ),
+            correlation_id=parent.event_id,
+        ))
+
+    # ── BAR Handler ───────────────────────────────────────────────────────────
 
     def _on_bar(self, event: Event) -> None:
         p: BarPayload = event.payload
@@ -111,6 +218,55 @@ class StrategyEngine:
 
         if df is None or df.empty or len(df) < _MIN_BARS:
             return
+
+        # V9 (R1): Validate bar data before strategy processing
+        # Rejects: price=0, NaN, negative volume, stale, OHLC inconsistent,
+        # out-of-order bars (sequence check)
+        try:
+            _last = df.iloc[-1]
+            _close = float(_last.get('close', _last.get('c', 0)))
+            _vol = float(_last.get('volume', _last.get('v', 0)))
+            _high = float(_last.get('high', _last.get('h', 0)))
+            _low = float(_last.get('low', _last.get('l', 0)))
+            _open = float(_last.get('open', _last.get('o', 0)))
+
+            # Basic: price and volume
+            if _close <= 0 or not math.isfinite(_close):
+                log.warning("[StrategyEngine] BAD BAR %s: close=%.4f — skipping", ticker, _close)
+                return
+            if _vol < 0 or not math.isfinite(_vol):
+                log.warning("[StrategyEngine] BAD BAR %s: volume=%.0f — skipping", ticker, _vol)
+                return
+
+            # OHLC consistency: high >= low, O/C within [L,H]
+            if _high > 0 and _low > 0 and _high < _low:
+                log.warning("[StrategyEngine] BAD BAR %s: high=%.2f < low=%.2f — skipping",
+                            ticker, _high, _low)
+                return
+            if _high > 0 and _close > _high * 1.001:
+                log.warning("[StrategyEngine] BAD BAR %s: close=%.2f > high=%.2f — skipping",
+                            ticker, _close, _high)
+                return
+
+            # Stale duplicate: same close + zero volume
+            if len(df) >= 2:
+                _prev = df.iloc[-2]
+                _prev_close = float(_prev.get('close', _prev.get('c', 0)))
+                if _close == _prev_close and _vol == 0:
+                    return  # stale bar, silently skip
+
+            # Sequence check: reject BAR if older than last processed for this ticker
+            # Prevents out-of-order BAR processing from dual-frequency polling
+            if not hasattr(self, '_last_bar_seq'):
+                self._last_bar_seq = {}
+            _seq = getattr(event, 'stream_seq', 0) or 0
+            if _seq > 0:
+                _prev_seq = self._last_bar_seq.get(ticker, 0)
+                if _seq <= _prev_seq:
+                    return  # out-of-order BAR, silently skip
+                self._last_bar_seq[ticker] = _seq
+        except Exception:
+            pass  # don't block on validation errors
 
         now  = datetime.now(ET)
         hour, minute = now.hour, now.minute

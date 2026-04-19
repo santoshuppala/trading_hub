@@ -208,6 +208,7 @@ class RealTimeMonitor:
         # state lost track of (e.g. positions opened in a previous session
         # that didn't survive a restart cleanly).
         # V7.2: Returns broker ticker sets so SmartRouter can be re-seeded.
+        self._trading_client = trading_client  # V8: stored for live reconciliation
         self._reconciled_alpaca, self._reconciled_tradier = \
             self._sync_broker_positions(trading_client)
 
@@ -304,6 +305,104 @@ class RealTimeMonitor:
             f"max_pos={max_positions} cooldown={order_cooldown}s "
             f"redpanda={rp_brokers}"
         )
+
+    # ── V9: Component injection for FillLedger / BrokerRegistry / EquityTracker ──
+
+    def set_fill_ledger(self, ledger) -> None:
+        """Attach FillLedger for shadow mode position tracking."""
+        self._fill_ledger = ledger
+        # Wire into PositionManager
+        if hasattr(self, '_pos_manager'):
+            self._pos_manager._ledger = ledger
+        log.info("[Monitor] FillLedger attached (shadow mode)")
+
+    def set_broker_registry(self, registry) -> None:
+        """Attach BrokerRegistry for extensible broker iteration."""
+        self._broker_registry = registry
+        log.info("[Monitor] BrokerRegistry attached (%d brokers)", len(registry))
+
+    def set_equity_tracker(self, tracker) -> None:
+        """Attach EquityTracker for hourly P&L drift detection."""
+        self._equity_tracker = tracker
+        log.info("[Monitor] EquityTracker attached")
+
+    def set_stream_client(self, stream_client) -> None:
+        """Attach TradierStreamClient for instant price lookups in RiskEngine."""
+        if hasattr(self, '_risk') and self._risk:
+            self._risk.set_stream_client(stream_client)
+        self._stream_client = stream_client
+        log.info("[Monitor] Stream client attached to RiskEngine")
+
+    # ── V9 (R3): Stale order cleanup ────────────────────────────────────────
+
+    def _cleanup_stale_open_orders(self) -> None:
+        """Cancel open orders older than 60 seconds at both brokers.
+
+        Prevents orphaned orders from accumulating after partial fills,
+        network timeouts, or process crashes.
+        """
+        import requests as _req
+        from datetime import datetime, timedelta
+
+        cancelled = 0
+        now = datetime.now(ET)
+        cutoff = now - timedelta(seconds=60)
+
+        # Alpaca: cancel stale orders
+        try:
+            tc = getattr(self, '_trading_client', None)
+            if tc:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+                open_orders = tc.get_orders(
+                    filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+                for order in open_orders:
+                    created = order.created_at
+                    if created and created.replace(tzinfo=None) < cutoff.replace(tzinfo=None):
+                        try:
+                            tc.cancel_order_by_id(str(order.id))
+                            cancelled += 1
+                            log.info("[order-cleanup] Cancelled stale Alpaca order: %s %s %s",
+                                     order.side, order.symbol, order.id)
+                        except Exception:
+                            pass
+        except Exception as exc:
+            log.debug("[order-cleanup] Alpaca cleanup failed: %s", exc)
+
+        # Tradier: cancel stale orders
+        try:
+            t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TOKEN', '')
+            t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+            if t_token and t_acct:
+                t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+                t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+                resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/orders',
+                                headers=t_headers, timeout=5)
+                if resp.status_code == 200:
+                    orders_data = resp.json().get('orders', {})
+                    if orders_data and orders_data != 'null':
+                        order_list = orders_data.get('order', [])
+                        if isinstance(order_list, dict):
+                            order_list = [order_list]
+                        for o in order_list:
+                            status = o.get('status', '')
+                            if status in ('pending', 'open', 'partially_filled'):
+                                created = o.get('create_date', '')
+                                if created and created < cutoff.isoformat():
+                                    oid = o.get('id')
+                                    if oid:
+                                        _req.delete(
+                                            f'{t_base}/v1/accounts/{t_acct}/orders/{oid}',
+                                            headers=t_headers, timeout=5)
+                                        cancelled += 1
+                                        log.info("[order-cleanup] Cancelled stale Tradier order: %s",
+                                                 oid)
+        except Exception as exc:
+            log.debug("[order-cleanup] Tradier cleanup failed: %s", exc)
+
+        if cancelled:
+            log.info("[order-cleanup] Cancelled %d stale orders", cancelled)
 
     # ── DB position cache for reconciliation enrichment ─────────────────────
 
@@ -489,19 +588,35 @@ class RealTimeMonitor:
 
             if ticker in self.positions:
                 existing_broker = self.positions[ticker].get('_broker', '')
-                # V7.2: Detect dual-broker overlap — same ticker at both brokers
+                # V8: Dual-broker overlap — merge into one logical position
+                # Track per-broker qty so SmartRouter can split sells correctly
                 if existing_broker and existing_broker != broker_name:
-                    log.error(
-                        "[reconcile] DUAL-BROKER OVERLAP for %s: already imported "
-                        "from %s (%d shares), now also at %s (%d shares). "
-                        "Using %s (larger qty) as authoritative.",
-                        ticker, existing_broker,
-                        self.positions[ticker].get('quantity', 0),
-                        broker_name, qty, broker_name if qty > self.positions[ticker].get('quantity', 0) else existing_broker)
-                    # Keep the larger position as authoritative
-                    if qty <= self.positions[ticker].get('quantity', 0):
-                        return  # existing is larger, skip
-                    # Fall through to update with larger qty from this broker
+                    pos = self.positions[ticker]
+                    existing_qty = pos.get('quantity', 0)
+                    combined_qty = existing_qty + qty
+                    broker_qty = pos.get('_broker_qty', {existing_broker: existing_qty})
+                    broker_qty[broker_name] = qty
+                    pos['_broker_qty'] = broker_qty
+                    pos['quantity'] = combined_qty
+                    pos['qty'] = combined_qty
+                    # Primary broker = larger qty (for stop/target routing)
+                    if qty > existing_qty:
+                        pos['_broker'] = broker_name
+                        pos['entry_price'] = avg_entry  # use larger broker's cost basis
+                    log.warning(
+                        "[reconcile] DUAL-BROKER MERGE for %s: %s=%d + %s=%d = %d total. "
+                        "Primary broker: %s. SmartRouter will split sells.",
+                        ticker, existing_broker, existing_qty,
+                        broker_name, qty, combined_qty, pos['_broker'])
+                    reconciled += 1
+                    log.info(
+                        "[reconcile] %s: verified at %s+%s (qty=%d entry=$%.2f). "
+                        "Local stop=$%.2f target=$%.2f strategy=%s",
+                        ticker, existing_broker, broker_name, combined_qty,
+                        pos.get('entry_price', 0),
+                        pos.get('stop_price', 0), pos.get('target_price', 0),
+                        pos.get('strategy', 'unknown'))
+                    return
 
                 # V7.2: Verify local state against broker truth.
                 # Broker is authoritative for: qty, entry_price (cost basis).
@@ -519,18 +634,20 @@ class RealTimeMonitor:
                     pos['qty'] = qty
                     changed = True
 
-                # 2. Entry price — broker's cost basis wins if local drifted
+                # 2. Entry price — broker cost basis is ALWAYS authoritative (V9)
+                # Removed 1% drift threshold — any difference means local is wrong.
+                # This fixes the $3,098 P&L gap from Apr 17 where reconciled
+                # positions had ATR-estimated entries instead of actual cost basis.
                 local_entry = pos.get('entry_price', 0)
-                if avg_entry > 0 and local_entry > 0:
+                if avg_entry > 0 and local_entry > 0 and avg_entry != local_entry:
                     drift_pct = abs(avg_entry - local_entry) / local_entry
-                    if drift_pct > 0.01:  # >1% drift = something is wrong
-                        log.warning(
-                            "[reconcile] %s entry_price drift: local=$%.2f, "
-                            "%s=$%.2f (%.1f%%) — using broker cost basis",
-                            ticker, local_entry, broker_name, avg_entry,
-                            drift_pct * 100)
-                        pos['entry_price'] = avg_entry
-                        changed = True
+                    log.info(
+                        "[reconcile] %s entry_price sync: local=$%.2f → "
+                        "%s=$%.2f (%.2f%% drift) — using broker cost basis",
+                        ticker, local_entry, broker_name, avg_entry,
+                        drift_pct * 100)
+                    pos['entry_price'] = avg_entry
+                    changed = True
 
                 # 3. Broker tag — always update
                 pos['_broker'] = broker_name
@@ -557,13 +674,13 @@ class RealTimeMonitor:
                 stop_price   = db_pos.get('stop_price') or 0
                 target_price = db_pos.get('target_price') or 0
                 half_target  = db_pos.get('half_target') or 0
-                strategy     = db_pos.get('strategy') or 'unknown'
+                strategy     = db_pos.get('strategy') or f'{broker_name}_reconciled'
                 atr_value    = db_pos.get('atr_value')
                 entry_time   = db_pos.get('entry_time', f'{broker_name}_restored')
                 order_id     = db_pos.get('order_id') or f'{broker_name}_reconciliation'
                 source = 'db'
             else:
-                strategy = 'unknown'
+                strategy = f'{broker_name}_reconciled'
                 atr_value = None
                 entry_time = f'{broker_name}_restored'
                 order_id = f'{broker_name}_reconciliation'
@@ -608,6 +725,37 @@ class RealTimeMonitor:
                 broker_name, qty, ticker, avg_entry, stop_price, target_price,
                 strategy, source)
             reconciled += 1
+
+            # V9: Shadow FillLedger — create synthetic BUY lot for imported position
+            if hasattr(self, '_fill_ledger') and self._fill_ledger:
+                try:
+                    import uuid as _uuid
+                    from .fill_lot import FillLot, PositionMeta
+                    synth_lot = FillLot(
+                        lot_id=str(_uuid.uuid4()),
+                        ticker=ticker, side='BUY', qty=float(qty),
+                        fill_price=avg_entry,
+                        timestamp=datetime.now(ET),
+                        order_id=order_id or f'{broker_name}_reconciliation',
+                        broker=broker_name,
+                        strategy=strategy,
+                        reason='broker_reconciliation',
+                        synthetic=True,
+                        signal_price=avg_entry,
+                        init_stop=stop_price,
+                        init_target=target_price,
+                        init_atr=atr_value,
+                    )
+                    self._fill_ledger.append(synth_lot)
+                    self._fill_ledger.set_meta(ticker, PositionMeta(
+                        stop_price=stop_price,
+                        target_price=target_price,
+                        half_target=half_target,
+                        atr_value=atr_value,
+                    ))
+                except Exception as le:
+                    log.debug("[reconcile] Shadow ledger import failed for %s: %s",
+                              ticker, le)
 
         # ── 1. Alpaca positions ───────────────────────────────────────
         alpaca_tickers = set()
@@ -686,8 +834,261 @@ class RealTimeMonitor:
         else:
             log.info("[reconcile] Local positions are in sync with brokers.")
 
+        # ── 4. Open order validation ─────────────────────────────────────
+        # Cancel stale/orphaned orders at both brokers that don't correspond
+        # to any tracked position. Prevents "more shares than position" rejections.
+        try:
+            self._reconcile_open_orders(trading_client, all_broker_tickers)
+        except Exception as exc:
+            log.warning("[reconcile] Open order cleanup failed (non-fatal): %s", exc)
+
         # V7.2: Return broker ticker sets so SmartRouter can be re-seeded
         return alpaca_tickers, tradier_tickers
+
+    def _reconcile_open_orders(self, trading_client, tracked_tickers: set) -> None:
+        """V8: Cancel stale open orders at both brokers during reconciliation.
+
+        Stale orders (from previous sessions, crashed processes, or bracket stops)
+        can block new sells with 'more shares than position' errors.
+        Only cancels orders for tickers NOT in our tracked positions, or
+        stop/sell orders that exceed tracked position qty.
+        """
+        import requests as _req
+
+        # ── Alpaca open orders ────────────────────────────────────────────
+        try:
+            if trading_client:
+                from alpaca.trading.requests import GetOrdersRequest
+                from alpaca.trading.enums import QueryOrderStatus
+                open_orders = trading_client.get_orders(
+                    filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+                cancelled = 0
+                for o in open_orders:
+                    ticker = str(o.symbol)
+                    # Cancel sell orders for tickers we don't track
+                    if ticker not in self.positions and str(o.side).upper() == 'SELL':
+                        trading_client.cancel_order_by_id(str(o.id))
+                        cancelled += 1
+                    # Cancel stop orders that exceed our tracked qty
+                    elif ticker in self.positions and str(o.type) in ('stop', 'stop_limit'):
+                        pos_qty = self.positions[ticker].get('quantity', 0)
+                        order_qty = int(float(o.qty or 0))
+                        if order_qty > pos_qty:
+                            trading_client.cancel_order_by_id(str(o.id))
+                            cancelled += 1
+                            log.info("[reconcile] Cancelled oversized Alpaca stop for %s: "
+                                     "order_qty=%d > pos_qty=%d", ticker, order_qty, pos_qty)
+                if cancelled:
+                    log.info("[reconcile] Cancelled %d stale Alpaca orders", cancelled)
+                else:
+                    log.info("[reconcile] Alpaca orders: all in sync")
+        except Exception as exc:
+            log.warning("[reconcile] Alpaca order cleanup failed: %s", exc)
+
+        # ── Tradier open orders ───────────────────────────────────────────
+        try:
+            t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TOKEN', '')
+            t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+            if t_token and t_acct:
+                t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+                t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+                resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/orders',
+                               headers=t_headers, timeout=10)
+                if resp.status_code == 200:
+                    orders = resp.json().get('orders', {})
+                    if orders and orders != 'null':
+                        order_list = orders.get('order', [])
+                        if isinstance(order_list, dict):
+                            order_list = [order_list]
+                        cancelled = 0
+                        for o in order_list:
+                            status = o.get('status', '')
+                            if status not in ('pending', 'open', 'partially_filled'):
+                                continue
+                            ticker = o.get('symbol', '')
+                            oid = o.get('id')
+                            side = o.get('side', '')
+                            order_qty = int(float(o.get('quantity', 0)))
+                            if not oid:
+                                continue
+                            # Cancel sell orders for tickers we don't track
+                            if ticker not in self.positions and side in ('sell', 'sell_short'):
+                                _req.delete(f'{t_base}/v1/accounts/{t_acct}/orders/{oid}',
+                                           headers=t_headers, timeout=5)
+                                cancelled += 1
+                            # Cancel stop orders that exceed tracked qty
+                            elif ticker in self.positions and o.get('type') == 'stop':
+                                pos_qty = self.positions[ticker].get('quantity', 0)
+                                if order_qty > pos_qty:
+                                    _req.delete(f'{t_base}/v1/accounts/{t_acct}/orders/{oid}',
+                                               headers=t_headers, timeout=5)
+                                    cancelled += 1
+                                    log.info("[reconcile] Cancelled oversized Tradier stop for %s: "
+                                             "order_qty=%d > pos_qty=%d", ticker, order_qty, pos_qty)
+                        if cancelled:
+                            log.info("[reconcile] Cancelled %d stale Tradier orders", cancelled)
+                        else:
+                            log.info("[reconcile] Tradier orders: all in sync")
+        except Exception as exc:
+            log.warning("[reconcile] Tradier order cleanup failed: %s", exc)
+
+    # ── Live reconciliation (periodic, lightweight) ────────────────────────
+
+    def _live_reconcile(self) -> None:
+        """V8: Periodic lightweight reconciliation during trading hours.
+
+        Compares bot_state positions against actual broker positions every 10 min.
+        Fixes three types of drift:
+          1. Phantom: in state but not at broker → remove from state
+          2. Orphan: at broker but not in state → import into state
+          3. Qty mismatch: state qty != broker qty → update state
+        """
+        import requests as _req
+
+        broker_positions = {}  # {ticker: {'qty': N, 'entry': X, 'broker': name}}
+
+        # ── Fetch Alpaca positions ────────────────────────────────────────
+        try:
+            tc = getattr(self, '_trading_client', None)
+            if tc:
+                for p in tc.get_all_positions():
+                    sym = str(p.symbol)
+                    # Skip options (symbol > 10 chars or contains '/')
+                    if len(sym) > 10 or '/' in sym:
+                        continue
+                    qty = int(float(p.qty or 0))
+                    entry = float(p.avg_entry_price or 0)
+                    if qty > 0:
+                        if sym in broker_positions:
+                            # Dual broker — add qty
+                            broker_positions[sym]['qty'] += qty
+                            broker_positions[sym].setdefault('_broker_qty', {})[
+                                'alpaca'] = qty
+                        else:
+                            broker_positions[sym] = {
+                                'qty': qty, 'entry': entry, 'broker': 'alpaca'}
+        except Exception as exc:
+            log.warning("[live-reconcile] Alpaca fetch failed: %s", exc)
+            return  # don't reconcile on partial data
+
+        # ── Fetch Tradier positions ───────────────────────────────────────
+        try:
+            t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TOKEN', '')
+            t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+            if t_token and t_acct:
+                t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+                t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+                resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/positions',
+                               headers=t_headers, timeout=5)
+                if resp.status_code == 200:
+                    t_data = resp.json().get('positions', {})
+                    if t_data and t_data != 'null':
+                        t_list = t_data.get('position', [])
+                        if isinstance(t_list, dict):
+                            t_list = [t_list]
+                        for p in t_list:
+                            sym = p.get('symbol', '')
+                            qty = int(float(p.get('quantity', 0)))
+                            entry = float(p.get('cost_basis', 0)) / qty if qty > 0 else 0
+                            if qty > 0 and sym:
+                                if sym in broker_positions:
+                                    broker_positions[sym]['qty'] += qty
+                                    broker_positions[sym].setdefault('_broker_qty', {})[
+                                        'tradier'] = qty
+                                    # Keep larger broker as primary
+                                    if qty > broker_positions[sym].get('_broker_qty', {}).get(
+                                            broker_positions[sym]['broker'], 0):
+                                        broker_positions[sym]['broker'] = 'tradier'
+                                        broker_positions[sym]['entry'] = entry
+                                else:
+                                    broker_positions[sym] = {
+                                        'qty': qty, 'entry': entry, 'broker': 'tradier'}
+        except Exception as exc:
+            log.warning("[live-reconcile] Tradier fetch failed: %s", exc)
+            return
+
+        # ── Compare against local state ───────────────────────────────────
+        fixes = 0
+
+        # 1. Phantoms — in state but not at any broker
+        for ticker in list(self.positions.keys()):
+            if ticker not in broker_positions:
+                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. Removing.",
+                            ticker)
+                del self.positions[ticker]
+                fixes += 1
+
+        # 2. Orphans — at broker but not in state
+        for ticker, bp in broker_positions.items():
+            if ticker not in self.positions:
+                log.warning("[live-reconcile] ORPHAN %s — %d shares at %s, not in state. Importing.",
+                            ticker, bp['qty'], bp['broker'])
+                # Import with ATR-based defaults (same as startup reconciliation)
+                atr = self._fetch_last_atr(ticker)
+                entry = bp['entry']
+                if atr and atr > 0:
+                    stop = round(entry - 2.0 * atr, 4)
+                    target = round(entry + 3.0 * atr, 4)
+                else:
+                    stop = round(entry * 0.97, 4)
+                    target = round(entry * 1.05, 4)
+                self.positions[ticker] = {
+                    'entry_price': entry,
+                    'entry_time': f'{bp["broker"]}_live_reconcile',
+                    'quantity': bp['qty'],
+                    'qty': bp['qty'],
+                    'partial_done': False,
+                    'stop_price': stop,
+                    'target_price': target,
+                    'half_target': round((entry + target) / 2, 4),
+                    'atr_value': atr or round((target - stop) / 2, 4),
+                    'strategy': f'{bp["broker"]}_reconciled',
+                    '_broker': bp['broker'],
+                }
+                if '_broker_qty' in bp:
+                    self.positions[ticker]['_broker_qty'] = bp['_broker_qty']
+                self._reclaimed_today.add(ticker)
+                fixes += 1
+
+        # 3. Qty mismatches — state qty != broker qty
+        for ticker, bp in broker_positions.items():
+            if ticker in self.positions:
+                local_qty = self.positions[ticker].get('quantity', 0)
+                broker_qty = bp['qty']
+                if local_qty != broker_qty:
+                    log.warning("[live-reconcile] QTY MISMATCH %s: state=%d broker=%d. Fixing.",
+                                ticker, local_qty, broker_qty)
+                    self.positions[ticker]['quantity'] = broker_qty
+                    self.positions[ticker]['qty'] = broker_qty
+                    if '_broker_qty' in bp:
+                        self.positions[ticker]['_broker_qty'] = bp['_broker_qty']
+                    fixes += 1
+
+        # 4. V9: Entry price — broker cost basis is authoritative
+        for ticker, bp in broker_positions.items():
+            if ticker in self.positions:
+                local_entry = self.positions[ticker].get('entry_price', 0)
+                broker_entry = bp.get('entry', 0)
+                if broker_entry > 0 and local_entry > 0 and broker_entry != local_entry:
+                    log.info("[live-reconcile] ENTRY_PRICE sync %s: local=$%.2f → broker=$%.2f",
+                             ticker, local_entry, broker_entry)
+                    self.positions[ticker]['entry_price'] = broker_entry
+                    fixes += 1
+
+        if fixes:
+            log.warning("[live-reconcile] Fixed %d position(s). State now matches brokers.", fixes)
+            # Persist immediately
+            try:
+                from .state import save_state
+                save_state(dict(self.positions), set(self._reclaimed_today),
+                           list(self.trade_log))
+            except Exception:
+                pass
+        else:
+            log.info("[live-reconcile] Positions in sync (%d local, %d broker)",
+                     len(self.positions), len(broker_positions))
 
     # ── Run loop ─────────────────────────────────────────────────────────────
 
@@ -768,10 +1169,12 @@ class RealTimeMonitor:
             # Tick heartbeat (emits at most once per 60 s)
             self._heartbeat.tick()
 
-            # V8: Pop periodic scans — ticker discovery from alt data
+            # V8: Pop periodic scans + ticker conviction ranking + live reconciliation
             if not hasattr(self, '_last_pop_scan'):
                 self._last_pop_scan = 0.0
                 self._last_headline_check = 0.0
+                self._last_ranking = 0.0
+                self._last_live_reconcile = 0.0
             now_mono = time.monotonic()
             # Full scan every 10 min (reads alt_data_cache.json)
             if now_mono - self._last_pop_scan > 600:
@@ -781,6 +1184,40 @@ class RealTimeMonitor:
             if now_mono - self._last_headline_check > 120:
                 self._last_headline_check = now_mono
                 self._quick_headline_check()
+            # V8: Ticker conviction ranking every 10 min
+            # Ranks ALL tickers by institutional-grade signals, logs top picks
+            if now_mono - self._last_ranking > 600:
+                self._last_ranking = now_mono
+                self._rank_tickers()
+
+            # V8: Live position reconciliation every 10 min
+            # Detects drift between bot_state and broker reality:
+            #  - Phantom positions (in state but not at broker → remove)
+            #  - Orphaned positions (at broker but not in state → import)
+            #  - Qty mismatches (state qty != broker qty → fix)
+            if now_mono - self._last_live_reconcile > 600:
+                self._last_live_reconcile = now_mono
+                try:
+                    self._live_reconcile()
+                except Exception as exc:
+                    log.warning("[live-reconcile] failed: %s", exc)
+
+            # V9: Hourly equity tracking + P&L drift detection
+            if hasattr(self, '_equity_tracker') and self._equity_tracker:
+                if now_mono - getattr(self, '_last_equity_check', 0) > 3600:
+                    self._last_equity_check = now_mono
+                    try:
+                        self._equity_tracker.check_drift()
+                    except Exception as exc:
+                        log.warning("[equity] drift check failed: %s", exc)
+
+            # V9 (R3): Stale order cleanup — cancel orphaned orders >60s old
+            if now_mono - getattr(self, '_last_order_cleanup', 0) > 300:
+                self._last_order_cleanup = now_mono
+                try:
+                    self._cleanup_stale_open_orders()
+                except Exception as exc:
+                    log.debug("[order-cleanup] failed: %s", exc)
 
             # V7.2: Periodic state persist every loop cycle.
             # PositionManager persists on every mutation, but if Core gets
@@ -798,7 +1235,7 @@ class RealTimeMonitor:
                 except Exception:
                     pass  # best-effort; PositionManager is the primary writer
 
-            # Sleep until next cycle
+            # Sleep until next cycle — V9: dual-frequency for HOT tickers
             now = datetime.now(ET)
             market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
             if now < market_open_time:
@@ -806,7 +1243,40 @@ class RealTimeMonitor:
                 log.info(f"Pre-market: sleeping {wait / 60:.1f} min until near open.")
                 time.sleep(wait)
             else:
-                time.sleep(60)
+                # V9: Fast-poll HOT tickers (open positions) every 12s while
+                # counting down to the next full scan. If streaming is active,
+                # skip fast-poll (streaming handles exit monitoring faster).
+                _hot_interval = 12
+                _slow_remaining = 60
+                while _slow_remaining > 0 and self.running:
+                    time.sleep(_hot_interval)
+                    _slow_remaining -= _hot_interval
+
+                    # Fast-poll only if no streaming AND positions are open
+                    _stream_active = getattr(self, '_stream_active', False)
+                    if not _stream_active:
+                        hot_tickers = list(self.positions.keys())
+                        if hot_tickers:
+                            try:
+                                hot_bars, hot_rvol = self._data.fetch_batch_bars(hot_tickers)
+                                self._bars_cache.update(hot_bars)
+                                self._rvol_cache.update(hot_rvol)
+                                today = datetime.now(ET).date()
+                                hot_events = [
+                                    self._build_bar_event(t, today)
+                                    for t in hot_tickers
+                                ]
+                                hot_events = [e for e in hot_events if e is not None]
+                                if hot_events:
+                                    self._bus.emit_batch(hot_events)
+                                    log.debug(
+                                        "[HOT_FETCH] %d tickers refreshed",
+                                        len(hot_events),
+                                    )
+                            except Exception as exc:
+                                log.debug("[HOT_FETCH] failed: %s", exc)
+
+                    self._heartbeat.tick()
 
     def _build_bar_event(self, ticker: str, today) -> Optional[Event]:
         """Slice today's bars from the cache and return a BAR Event (or None)."""
@@ -887,6 +1357,38 @@ class RealTimeMonitor:
                              ticker, count)
         except Exception as exc:
             log.debug("[PopScan] Headline check failed: %s", exc)
+
+    def _rank_tickers(self):
+        """V8: Rank all tickers by conviction using hedge-fund-grade signals.
+
+        Logs top tickers with reasoning. Rankings influence:
+        - Which tickers get priority in tiered scanning
+        - Position sizing via conviction multiplier
+        - Strategy selection (momentum vs swing vs mean_reversion)
+        """
+        try:
+            from data_sources.ticker_ranking import rank_tickers, TickerRanking
+            rankings = rank_tickers(self.tickers)
+            top = [r for r in rankings if r.conviction > 0.2][:15]
+
+            if top:
+                log.info("[TickerRanking] Top %d by conviction:", len(top))
+                for r in top[:10]:
+                    log.info("  %s conv=%.2f %s %s | %s",
+                             r.ticker, r.conviction, r.strategy,
+                             r.entry_urgency, r.reasoning[:60])
+
+                # Store rankings for use by tiered scanner (hot tickers)
+                self._conviction_rankings = {r.ticker: r for r in rankings}
+
+                # Add 'immediate' urgency tickers to the hot set if not already scanning
+                for r in top:
+                    if r.entry_urgency == 'immediate' and r.ticker not in self.tickers:
+                        self.tickers.append(r.ticker)
+                        log.info("[TickerRanking] Added %s (conv=%.2f, %s) to scan universe",
+                                 r.ticker, r.conviction, r.catalyst)
+        except Exception as exc:
+            log.debug("[TickerRanking] Ranking failed: %s", exc)
 
     def _reset_daily_state(self):
         today = datetime.now(ET).date()

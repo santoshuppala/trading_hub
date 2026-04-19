@@ -48,6 +48,7 @@ from zoneinfo import ZoneInfo
 from .alerts import send_alert
 from .event_bus import Event, EventBus, EventType
 from .events import FillPayload, PositionPayload, PositionSnapshot
+from .fill_lot import FillLot, PositionMeta, QTY_EPSILON
 from .state import save_state
 
 ET = ZoneInfo('America/New_York')
@@ -71,6 +72,7 @@ class PositionManager:
         last_order_time: Dict[str, float],
         trade_log: List[dict],
         alert_email: Optional[str] = None,
+        fill_ledger=None,
     ):
         self._bus             = bus
         self._positions       = positions
@@ -79,6 +81,10 @@ class PositionManager:
         self._trade_log       = trade_log
         self._alert_email     = alert_email
         self._lock            = threading.Lock()
+
+        # V9: FillLedger shadow mode — when set, all fills are also
+        # appended to the ledger for parallel tracking and validation.
+        self._ledger = fill_ledger
 
         bus.subscribe(EventType.FILL, self._on_fill)
         # V8: Clean up phantom positions when SELL fails with "no position"
@@ -130,22 +136,55 @@ class PositionManager:
                             },
                         ),
                     ))
+
+                    # V9: Shadow FillLedger — synthetic SELL for phantom
+                    if self._ledger is not None:
+                        try:
+                            import uuid as _uuid
+                            qty = float(pos.get('quantity', 0))
+                            if qty > QTY_EPSILON:
+                                # Use entry_price as estimated fill (E1: never $0)
+                                est_price = pos.get('entry_price', 0)
+                                phantom_lot = FillLot(
+                                    lot_id=str(_uuid.uuid4()),
+                                    ticker=ticker, side='SELL', qty=qty,
+                                    fill_price=est_price,
+                                    timestamp=datetime.now(ET),
+                                    order_id='phantom_cleanup',
+                                    broker=pos.get('_broker', 'unknown'),
+                                    strategy=pos_strategy,
+                                    reason='phantom_cleanup_broker_stop',
+                                    synthetic=True,
+                                )
+                                self._ledger.append(phantom_lot)
+                        except Exception as le:
+                            log.debug("[PositionManager] Shadow phantom SELL failed: %s", le)
+
         except Exception as exc:
             log.debug("[PositionManager] _on_order_fail error: %s", exc)
 
     # ── Fill Handler ─────────────────────────────────────────────────────────
 
     def _on_fill(self, event: Event) -> None:
-        # Dedup: skip if we've already processed this FILL event
+        # V9 (R7): Dedup with OrderedDict + TTL (was: buggy set truncation)
+        # OrderedDict preserves insertion order, so oldest entries evicted first.
+        # 1-hour TTL instead of count-based cap — handles long sessions correctly.
+        import time as _time
+        from collections import OrderedDict
         if not hasattr(self, '_processed_fill_ids'):
-            self._processed_fill_ids = set()
+            self._processed_fill_ids = OrderedDict()
         if event.event_id in self._processed_fill_ids:
             log.debug("[PositionManager] Duplicate FILL skipped: %s", event.event_id)
             return
-        self._processed_fill_ids.add(event.event_id)
-        # Prevent unbounded growth
-        if len(self._processed_fill_ids) > 10000:
-            self._processed_fill_ids = set(list(self._processed_fill_ids)[-5000:])
+        self._processed_fill_ids[event.event_id] = _time.monotonic()
+        # Evict entries older than 1 hour
+        _cutoff = _time.monotonic() - 3600
+        while self._processed_fill_ids:
+            _oldest_id, _oldest_time = next(iter(self._processed_fill_ids.items()))
+            if _oldest_time < _cutoff:
+                del self._processed_fill_ids[_oldest_id]
+            else:
+                break
 
         p: FillPayload = event.payload
         with self._lock:
@@ -210,6 +249,7 @@ class PositionManager:
         reason_str = str(p.reason or '')
         strategy = reason_str.split(':')[0] + ':' + reason_str.split(':')[1] if ':' in reason_str else 'vwap_reclaim'
 
+        import time as _time_mod
         pos = {
             'entry_price':  fill_price,
             'entry_time':   now.strftime('%H:%M:%S'),
@@ -221,6 +261,7 @@ class PositionManager:
             'half_target':  half_target,
             'atr_value':    getattr(p, 'atr_value', None),
             'strategy':     strategy,
+            '_opened_mono': _time_mod.monotonic(),  # V9: grace window for QUOTE exits
         }
         self._positions[ticker] = pos
 
@@ -272,6 +313,39 @@ class PositionManager:
         self._bus.emit(pos_event)
         self._persist()
 
+        # ── V9: Shadow FillLedger write ──────────────────────────────────
+        if self._ledger is not None:
+            try:
+                import uuid as _uuid
+                lot = FillLot(
+                    lot_id=str(_uuid.uuid4()),
+                    ticker=ticker,
+                    side='BUY',
+                    qty=float(qty),
+                    fill_price=fill_price,
+                    timestamp=now,
+                    order_id=p.order_id,
+                    broker=_broker,
+                    strategy=strategy,
+                    reason=str(p.reason or ''),
+                    correlation_id=getattr(parent, 'event_id', None),
+                    signal_price=getattr(p, 'signal_price', fill_price),
+                    order_mode=getattr(p, 'order_mode', 'qty'),
+                    init_stop=stop_price,
+                    init_target=target_price,
+                    init_atr=getattr(p, 'atr_value', None),
+                )
+                self._ledger.append(lot)
+                self._ledger.set_meta(ticker, PositionMeta(
+                    stop_price=stop_price,
+                    target_price=target_price,
+                    half_target=half_target,
+                    atr_value=getattr(p, 'atr_value', None),
+                    partial_done=False,
+                ))
+            except Exception as exc:
+                log.warning("[PositionManager] Shadow ledger BUY failed: %s", exc)
+
     # ── Close / partial ───────────────────────────────────────────────────────
 
     def _close_position(self, p: FillPayload, parent: Event) -> None:
@@ -280,6 +354,18 @@ class PositionManager:
         qty        = p.qty
         reason     = p.reason
         now        = datetime.now(ET)
+
+        # V9 (R4): Duplicate SELL guard — prevent same order being processed twice
+        # (e.g., from Redpanda replay or network retransmit)
+        if not hasattr(self, '_processed_sell_keys'):
+            self._processed_sell_keys = set()
+        sell_key = f"{ticker}:{p.order_id}"
+        if sell_key in self._processed_sell_keys:
+            log.warning("[PositionManager] Duplicate SELL skipped: %s", sell_key)
+            return
+        self._processed_sell_keys.add(sell_key)
+        if len(self._processed_sell_keys) > 5000:
+            self._processed_sell_keys = set(list(self._processed_sell_keys)[-2500:])
 
         if ticker not in self._positions:
             log.warning(
@@ -291,6 +377,15 @@ class PositionManager:
         pos = self._positions[ticker]
         entry_price = pos['entry_price']
         pos_strategy = pos.get('strategy', 'unknown')
+
+        # V9: Log when selling a reconciled position (observability for P&L tracing)
+        _source = pos.get('_source', '')
+        _entry_time = pos.get('entry_time', '')
+        if _source in ('atr', 'pct_default') or 'reconcile' in str(_entry_time) or 'restored' in str(_entry_time):
+            log.info(
+                "[PositionManager] SELL reconciled %s: source=%s entry=$%.2f qty=%s",
+                ticker, _source or _entry_time, entry_price, qty,
+            )
 
         # V7.2: Detect overfill — broker sold more than local position qty
         position_qty = pos['quantity']
@@ -320,6 +415,18 @@ class PositionManager:
             'time':        now.strftime('%H:%M:%S'),
             'is_win':      pnl >= 0,
         }
+
+        # V8: Update per-broker qty tracking on any sell
+        _sell_broker = getattr(parent, '_routed_broker', None) if parent else None
+        if _sell_broker and '_broker_qty' in pos:
+            bq = pos['_broker_qty']
+            if _sell_broker in bq:
+                bq[_sell_broker] = max(0, bq[_sell_broker] - qty)
+                if bq[_sell_broker] == 0:
+                    del bq[_sell_broker]
+                # If only one broker left, clean up _broker_qty
+                if len(bq) <= 1:
+                    pos.pop('_broker_qty', None)
 
         # Partial exit: qty sold is less than total position
         remaining = pos['quantity'] - qty
@@ -368,6 +475,9 @@ class PositionManager:
             partial_event._routed_broker = getattr(parent, '_routed_broker', None)
             self._bus.emit(partial_event)
             self._persist()
+
+            # V9: Shadow FillLedger write (partial SELL)
+            self._shadow_sell_lot(p, parent, now, pnl, reason)
             return
 
         # Full close
@@ -419,6 +529,54 @@ class PositionManager:
         close_event._routed_broker = broker
         self._bus.emit(close_event)
         self._persist()
+
+        # ── V9: Shadow FillLedger write (SELL) ───────────────────────────
+        self._shadow_sell_lot(p, parent, now, pnl, reason)
+
+    # ── Shadow ledger SELL helper ─────────────────────────────────────────────
+
+    def _shadow_sell_lot(self, p: FillPayload, parent: Event,
+                          now: datetime, pnl: float, reason: str) -> None:
+        """Append a SELL lot to the shadow FillLedger (if attached)."""
+        if self._ledger is None:
+            return
+        try:
+            import uuid as _uuid
+            _broker = getattr(parent, '_routed_broker', 'unknown') if parent else 'unknown'
+            sell_lot = FillLot(
+                lot_id=str(_uuid.uuid4()),
+                ticker=p.ticker,
+                side='SELL',
+                qty=float(p.qty),
+                fill_price=p.fill_price,
+                timestamp=now,
+                order_id=p.order_id,
+                broker=_broker,
+                strategy='',  # strategy comes from the position, not the sell
+                reason=str(reason or ''),
+                correlation_id=getattr(parent, 'event_id', None),
+                signal_price=getattr(p, 'signal_price', p.fill_price),
+                order_mode=getattr(p, 'order_mode', 'qty'),
+            )
+            matches = self._ledger.append(sell_lot)
+
+            # Shadow validation: compare ledger P&L vs computed P&L
+            if matches:
+                ledger_pnl = sum(m.realized_pnl for m in matches)
+                if abs(ledger_pnl - pnl) > 0.02:
+                    log.warning(
+                        "[PositionManager] SHADOW PNL DRIFT %s: "
+                        "dict_pnl=$%.2f ledger_pnl=$%.2f (diff=$%.2f)",
+                        p.ticker, pnl, ledger_pnl, ledger_pnl - pnl,
+                    )
+
+            # Update partial_done in ledger meta
+            remaining = self._ledger.total_qty(p.ticker)
+            if remaining > QTY_EPSILON and reason == 'PARTIAL_SELL':
+                self._ledger.patch_meta(p.ticker, partial_done=True)
+
+        except Exception as exc:
+            log.warning("[PositionManager] Shadow ledger SELL failed: %s", exc)
 
     # ── Persistence ───────────────────────────────────────────────────────────
 

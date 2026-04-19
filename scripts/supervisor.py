@@ -262,12 +262,60 @@ class ProcessManager:
         if retcode == 0:
             self.status = 'stopped'
             log.info("[%s] Exited cleanly (code 0)", self.name)
+        elif retcode == 3:
+            # V8: Exit code 3 = kill switch halt (daily loss limit breached).
+            # Engine intentionally stopped itself. Do NOT restart — restarting
+            # would just trigger the kill switch again (same daily PnL in state).
+            self.status = 'disabled'
+            # Extract kill reason from engine's log
+            kill_detail = self._get_kill_reason()
+            self.last_error = f"Kill switch: {kill_detail}"
+            log.warning("[%s] KILL SWITCH EXIT — %s — disabled until next trading day",
+                        self.name, kill_detail)
+        elif retcode in (-9, -15):
+            # V8: SIGKILL (-9) or SIGTERM (-15) are external signals (manual kill,
+            # OOM killer, supervisor stop), not application crashes. Don't count
+            # toward max_restarts — operator shouldn't lose an engine because
+            # they manually killed it during debugging.
+            self.status = 'stopped'
+            self.last_error = f"Exit code {retcode} (external signal)"
+            log.warning("[%s] Killed by signal %d (external) — will restart without counting",
+                        self.name, -retcode)
         else:
             self.status = 'crashed'
-            self.last_error = f"Exit code {retcode}"
-            log.error("[%s] CRASHED (exit code %d)", self.name, retcode)
+            tb = self.get_crash_traceback()
+            short_reason = tb.splitlines()[-1].strip() if tb else f"exit code {retcode}"
+            self.last_error = f"Exit code {retcode}: {short_reason[:200]}"
+            log.error("[%s] CRASHED (exit code %d) — %s", self.name, retcode, short_reason[:300])
 
         return self.status
+
+    def _get_kill_reason(self) -> str:
+        """Extract the kill switch reason from the engine's log file."""
+        date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
+        log_path = os.path.join(date_dir, f"{self.name}.log")
+        try:
+            with open(log_path, 'rb') as f:
+                # Read last 5KB — kill reason is near the end
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 5000))
+                tail = f.read().decode('utf-8', errors='replace')
+            # Look for kill switch details
+            for line in reversed(tail.splitlines()):
+                if 'KILL SWITCH' in line and 'P&L' in line:
+                    # Extract: "daily P&L $-3400.00 breached limit $-3000.00"
+                    import re
+                    m = re.search(r'P&L \$([^ ]+) breached (?:limit )?\$([^ ]+)', line)
+                    if m:
+                        return f"daily P&L ${m.group(1)} breached ${m.group(2)}"
+                if 'KILL SWITCH' in line:
+                    # Generic: return the log line content
+                    parts = line.split('] ', 1)
+                    return parts[-1].strip() if len(parts) > 1 else line.strip()
+            return "daily loss limit breached (details not found in log)"
+        except Exception:
+            return "daily loss limit breached"
 
     def get_crash_traceback(self) -> str:
         """Read the process log file and extract the last traceback."""
@@ -357,24 +405,27 @@ class ProcessManager:
 
     def restart(self) -> bool:
         """Diagnose crash, fix if possible, then restart."""
-        if self.restart_count >= self.max_restarts:
-            self.status = 'disabled'
-            log.error("[%s] Max restarts (%d) reached — DISABLED",
-                      self.name, self.max_restarts)
-            return False
+        # V8: Only count actual crashes toward max_restarts, not external signals
+        is_crash = self.status == 'crashed'
 
-        # Only run crash analysis if the process actually crashed (non-zero exit)
-        if self.status == 'crashed':
+        if is_crash:
+            if self.restart_count >= self.max_restarts:
+                self.status = 'disabled'
+                log.error("[%s] Max restarts (%d) reached — DISABLED",
+                          self.name, self.max_restarts)
+                return False
             fixed = self.diagnose_and_fix()
             if fixed:
                 log.info("[%s] Bug fixed — restarting with patched code", self.name)
             else:
                 log.info("[%s] No fix applied — restarting as-is (may crash again)", self.name)
+            self.restart_count += 1
         else:
-            log.info("[%s] Clean exit — restarting without crash analysis", self.name)
+            # External signal (SIGKILL/SIGTERM) or clean exit — don't count
+            log.info("[%s] External signal or clean exit — restarting (not counted toward max)",
+                     self.name)
 
-        self.restart_count += 1
-        log.info("[%s] Restarting (%d/%d) after %ds cooldown...",
+        log.info("[%s] Restarting (crashes=%d/%d) after %ds cooldown...",
                  self.name, self.restart_count, self.max_restarts,
                  self.restart_delay)
         time.sleep(self.restart_delay)
@@ -437,6 +488,82 @@ def send_alert(subject: str, body: str):
         log.error("Supervisor alert send failed: %s", exc)
 
 
+def _startup_cleanup():
+    """V9: Clean caches and validate state files before starting processes.
+
+    Addresses:
+    - L1: __pycache__ stale bytecode after code changes (caused 32 crashes on Apr 17)
+    - L3: Corrupt/stale state files from previous crash
+    - L4: Deprecated V7 state files lingering
+    """
+    import shutil
+    from zoneinfo import ZoneInfo
+    ET_local = ZoneInfo('America/New_York')
+
+    # L1: Clear __pycache__ — prevents stale .pyc after code changes
+    cleared = 0
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        if 'venv' in root or '.git' in root:
+            continue
+        if '__pycache__' in dirs:
+            cache_dir = os.path.join(root, '__pycache__')
+            try:
+                shutil.rmtree(cache_dir)
+                cleared += 1
+            except Exception:
+                pass
+    if cleared:
+        log.info("[startup] Cleared %d __pycache__ directories", cleared)
+
+    # L3: Validate state files + clean .tmp leftovers
+    data_dir = os.path.join(PROJECT_ROOT, 'data')
+    if os.path.isdir(data_dir):
+        today_str = datetime.now(ET_local).strftime('%Y-%m-%d')
+
+        # Remove stale .tmp files from crashed writes
+        for f in os.listdir(data_dir):
+            if f.endswith('.tmp'):
+                try:
+                    os.unlink(os.path.join(data_dir, f))
+                    log.info("[startup] Removed stale temp file: %s", f)
+                except Exception:
+                    pass
+
+        # Validate JSON state files
+        for name in ['bot_state.json', 'position_registry.json',
+                     'position_broker_map.json', 'options_state.json']:
+            path = os.path.join(data_dir, name)
+            if os.path.exists(path):
+                try:
+                    import json as _json
+                    with open(path) as f:
+                        data = _json.load(f)
+                    file_date = data.get('_date', '')
+                    if file_date and file_date != today_str:
+                        log.info("[startup] %s is from %s (not today) — "
+                                 "reconciliation will update", name, file_date)
+                except (_json.JSONDecodeError, Exception) as exc:
+                    log.error("[startup] %s is CORRUPT (%s) — "
+                              "removing (will recover from backup)", name, exc)
+                    try:
+                        os.unlink(path)
+                    except Exception:
+                        pass
+
+        # L4: Remove deprecated V7 state files
+        deprecated = ['pop_state.json', 'pro_state.json']
+        for name in deprecated:
+            for suffix in ['', '.prev', '.prev2', '.sha256', '.flock', '.v7_archive',
+                           '.prev.sha256', '.prev2.sha256']:
+                path = os.path.join(data_dir, name + suffix)
+                if os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                        log.info("[startup] Removed deprecated %s", name + suffix)
+                    except Exception:
+                        pass
+
+
 def main():
     # Tell child processes they're running under supervisor (skip lock file)
     os.environ['SUPERVISED_MODE'] = '1'
@@ -444,6 +571,10 @@ def main():
     log.info("=" * 60)
     log.info("SUPERVISOR STARTING — Process Isolation Mode")
     log.info("=" * 60)
+
+    # V9: Clean caches and validate state before starting anything
+    _startup_cleanup()
+
     log.info("Processes: %s", ', '.join(PROCESSES.keys()))
 
     # Handle SIGTERM gracefully

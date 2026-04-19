@@ -666,26 +666,56 @@ def _lookup_vwap_window(
     conn, ticker: str, fill_time: datetime, window_minutes: int = 5
 ) -> Optional[float]:
     """
-    Compute VWAP from BarReceived events over the execution window
+    Compute VWAP from bar data over the execution window
     (fill_time - window_minutes to fill_time).
+
+    V9: Reads from market_bars table first (lean, ~10x faster).
+    Falls back to event_store BarReceived for historical data pre-V9.
 
     Uses close * volume weighted average. Returns None if no bars found.
     """
     window_start = fill_time - timedelta(minutes=window_minutes)
 
+    rows = []
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT event_payload
-            FROM event_store
-            WHERE event_type = 'BarReceived'
-              AND event_payload->>'ticker' = %s
-              AND event_time >= %s AND event_time <= %s
-            ORDER BY event_time ASC
-            """,
-            (ticker, window_start, fill_time),
-        )
-        rows = cur.fetchall()
+        # V9: Try market_bars first (lean table)
+        try:
+            cur.execute(
+                """
+                SELECT close, volume
+                FROM market_bars
+                WHERE ticker = %s
+                  AND bar_time >= %s AND bar_time <= %s
+                ORDER BY bar_time ASC
+                """,
+                (ticker, window_start, fill_time),
+            )
+            rows = cur.fetchall()
+        except Exception:
+            conn.rollback()
+
+        # Fallback: legacy event_store BarReceived (pre-V9 data)
+        if not rows:
+            cur.execute(
+                """
+                SELECT event_payload
+                FROM event_store
+                WHERE event_type = 'BarReceived'
+                  AND event_payload->>'ticker' = %s
+                  AND event_time >= %s AND event_time <= %s
+                ORDER BY event_time ASC
+                """,
+                (ticker, window_start, fill_time),
+            )
+            legacy_rows = cur.fetchall()
+            if legacy_rows:
+                rows = []
+                for row in legacy_rows:
+                    payload = _safe_json(row[0])
+                    rows.append({
+                        'close': payload.get("close", 0),
+                        'volume': payload.get("volume", 0),
+                    })
 
     if not rows:
         return None
@@ -693,10 +723,10 @@ def _lookup_vwap_window(
     total_pv = 0.0
     total_vol = 0.0
     for row in rows:
-        payload = _safe_json(row[0])
-        # Prefer the stored vwap if available on the bar
-        close = payload.get("close", 0)
-        volume = payload.get("volume", 0)
+        if isinstance(row, dict):
+            close, volume = row.get('close', 0), row.get('volume', 0)
+        else:
+            close, volume = row[0], row[1]
         try:
             close = float(close)
             volume = float(volume)

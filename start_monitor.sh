@@ -30,6 +30,11 @@ fi
 # Activate virtual environment
 source venv/bin/activate
 
+# V9: Clear __pycache__ to prevent stale bytecode after code changes
+# (caused 32 data_collector crashes on Apr 17 from renamed function)
+find . -path ./venv -prune -o -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+echo "$(date) Cleared __pycache__ directories"
+
 # ── Execution mode ───────────────────────────────────────────────────────
 # MONITOR_MODE controls how the trading system runs:
 #   "monolith"    — single process (run_monitor.py via watchdog) [LEGACY]
@@ -41,39 +46,19 @@ source venv/bin/activate
 MONITOR_MODE="${MONITOR_MODE:-monolith}"
 
 if [ "$MONITOR_MODE" = "supervisor" ] || [ "$MONITOR_MODE" = "isolated" ]; then
-    # ── Supervisor Mode (V7) ────────────────────────────────────────────
+    # ── Supervisor Mode (V8) ────────────────────────────────────────────
     # V8: 3 processes — core (VWAP+Pro+Pop), options, data_collector
     # Pro and Pop merged into Core. Supervisor manages lifecycle.
     echo "$(date) Starting in SUPERVISOR mode (V8 — 3 engines)"
     python scripts/supervisor.py
     EXIT=$?
     if [ "$EXIT" -ne 0 ]; then
-        echo "$(date) Supervisor exited with code $EXIT"
-        # Fall back to monolith mode
-        echo "$(date) Falling back to monolith mode (watchdog)"
-        python scripts/watchdog.py || python run_monitor.py
+        echo "$(date) Supervisor exited with code $EXIT — NOT falling back to monolith"
+        echo "$(date) V8: Monolith fallback disabled. Fix supervisor and restart manually."
     fi
 else
-    # ── Monolith Mode (default) ──────────────────────────────────────────
-    # Single process via watchdog (auto-recovery on crash)
-    echo "$(date) Starting in MONOLITH mode (watchdog)"
-    WATCHDOG_EXIT=0
-    python scripts/watchdog.py || WATCHDOG_EXIT=$?
-
-    if [ "$WATCHDOG_EXIT" -ne 0 ]; then
-        echo "$(date) WATCHDOG FAILED (exit=$WATCHDOG_EXIT) — attempting direct run_monitor.py"
-        python run_monitor.py
-        MONITOR_EXIT=$?
-        if [ "$MONITOR_EXIT" -ne 0 ]; then
-            echo "$(date) CRITICAL: Both watchdog and direct monitor failed. No trading today."
-            echo "$(date) Check logs/watchdog_*.log and logs/crash_report_*.json for details."
-            python -c "
-try:
-    from monitor.alerts import send_alert
-    send_alert('CRITICAL: Trading monitor failed to start — both watchdog and direct run crashed. Check logs immediately.', severity='CRITICAL')
-except Exception:
-    pass
-" 2>/dev/null
-        fi
-    fi
+    # ── Monolith Mode REMOVED in V8 ─────────────────────────────────────
+    echo "$(date) ERROR: MONITOR_MODE must be 'supervisor'. Monolith mode removed in V8."
+    echo "$(date) Set MONITOR_MODE=supervisor in .env"
+    exit 1
 fi

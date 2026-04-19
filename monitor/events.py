@@ -166,7 +166,7 @@ class PositionSnapshot:
     """
     entry_price:  float
     entry_time:   str          # HH:MM:SS
-    quantity:     int
+    quantity:     float         # V9: float for fractional shares (was int)
     partial_done: bool
     order_id:     str
     stop_price:   float
@@ -176,7 +176,7 @@ class PositionSnapshot:
 
     def __post_init__(self):
         _require_positive('entry_price',  self.entry_price)
-        if self.quantity <= 0:
+        if not math.isfinite(self.quantity) or self.quantity <= 0:
             raise ValueError(f"quantity must be > 0, got {self.quantity}")
         _require_positive('stop_price',   self.stop_price)
         _require_positive('target_price', self.target_price)
@@ -375,9 +375,9 @@ class OrderRequestPayload:
     """
     ticker:            str
     side:              Side
-    qty:               int
-    price:             float  # ask for buys; last price for sells
-    reason:            str    # human-readable entry/exit reason
+    qty:               float             # V9: float for fractional shares (was int)
+    price:             float             # ask for buys; last price for sells
+    reason:            str               # human-readable entry/exit reason
     needs_ask_refresh: bool = False
     # Signal metadata forwarded so FillPayload can carry it for CrashRecovery
     stop_price:        Optional[float] = None
@@ -385,12 +385,20 @@ class OrderRequestPayload:
     atr_value:         Optional[float] = None
     # V7: Layer tag for centralized registry — Core acquires on behalf of sender
     layer:             Optional[str] = None  # 'vwap', 'pro', 'pop', 'options'
+    # V9: Order mode — how the broker should interpret the order
+    order_mode:        str = 'qty'       # 'qty' | 'notional'
+    notional:          Optional[float] = None  # dollar amount (when order_mode='notional')
 
     def __post_init__(self):
         _require_ticker(self.ticker)
         object.__setattr__(self, 'side', Side(self.side))
-        if self.qty <= 0:
-            raise ValueError(f"qty must be > 0, got {self.qty}")
+        if self.order_mode == 'notional':
+            # Notional orders: qty may be 0 (broker computes it), notional required
+            if self.notional is not None and self.notional <= 0:
+                raise ValueError(f"notional must be > 0, got {self.notional}")
+        else:
+            if not math.isfinite(self.qty) or self.qty <= 0:
+                raise ValueError(f"qty must be > 0, got {self.qty}")
         _require_positive('price', self.price)
         if not self.reason:
             raise ValueError("reason must be a non-empty string")
@@ -414,7 +422,7 @@ class FillPayload:
     """
     ticker:      str
     side:        Side   # 'BUY' | 'SELL'
-    qty:         int    # shares actually filled > 0
+    qty:         float  # V9: float for fractional shares (was int)
     fill_price:  float  # average fill price > 0
     order_id:    str    # broker order ID
     reason:      str    # why the order was placed
@@ -423,11 +431,15 @@ class FillPayload:
     stop_price:  Optional[float] = None
     target_price: Optional[float] = None
     atr_value:   Optional[float] = None
+    # V9: Slippage tracking — bar close price at signal time
+    signal_price: float = 0.0
+    # V9: How the order was submitted ('qty' | 'notional')
+    order_mode:  str = 'qty'
 
     def __post_init__(self):
         _require_ticker(self.ticker)
         object.__setattr__(self, 'side', Side(self.side))
-        if self.qty <= 0:
+        if not math.isfinite(self.qty) or self.qty <= 0:
             raise ValueError(f"qty must be > 0, got {self.qty}")
         _require_positive('fill_price', self.fill_price)
         if not self.order_id:
@@ -454,14 +466,14 @@ class OrderFailPayload:
     """
     ticker: str
     side:   Side   # 'buy' | 'sell'
-    qty:    int
+    qty:    float  # V9: float for fractional shares (was int)
     price:  float
     reason: str
 
     def __post_init__(self):
         _require_ticker(self.ticker)
         object.__setattr__(self, 'side', Side(self.side))
-        if self.qty <= 0:
+        if not math.isfinite(self.qty) or self.qty <= 0:
             raise ValueError(f"qty must be > 0, got {self.qty}")
         _require_positive('price', self.price)
 

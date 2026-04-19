@@ -3,22 +3,26 @@ Shared market data cache for process-isolated engines.
 
 V7 hardening:
   - fcntl.flock: exclusive on write, shared on read
-  - SHA256 checksum sidecar prevents corrupt-pickle reads
+  - SHA256 checksum sidecar prevents corrupt reads
   - Version number for change detection (skip if unchanged)
   - Staleness enforcement: get_bars() returns empty if cache too old
-  - Timeout on pickle.load() via alarm signal
 
-Core process writes bars + rvol data to a pickle file.
+V9: Replaced pickle with JSON.
+  - JSON is human-readable, schema-stable, and debuggable
+  - No class dependency — survives code changes without deserialization errors
+  - Atomic write (tmp → fsync → replace) prevents corruption on crash
+  - Backward compat: if legacy .pkl exists, reads it once then writes .json
+
+Core process writes bars + rvol data to a JSON file.
 Satellite processes read from it with freshness validation.
 
-File: data/live_cache.pkl
+File: data/live_cache.json (was data/live_cache.pkl)
 """
 import fcntl
 import hashlib
+import json
 import logging
 import os
-import pickle
-import signal
 import tempfile
 import time
 from typing import Dict, Optional, Tuple
@@ -28,19 +32,22 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_PATH = os.path.join(PROJECT_ROOT, 'data', 'live_cache.pkl')
+CACHE_PATH = os.path.join(PROJECT_ROOT, 'data', 'live_cache.json')
 CACHE_DIR = os.path.dirname(CACHE_PATH)
 CHECKSUM_PATH = CACHE_PATH + '.sha256'
 LOCK_PATH = CACHE_PATH + '.flock'
 
-_PICKLE_READ_TIMEOUT = 5   # seconds — kill hung pickle.load()
-_MAX_CACHE_BYTES = 50 * 1024 * 1024  # 50MB — cap file read to prevent OOM on corrupt file
+# Legacy pickle path — used for one-time migration only
+_LEGACY_PKL_PATH = os.path.join(PROJECT_ROOT, 'data', 'live_cache.pkl')
+
+_MAX_CACHE_BYTES = 50 * 1024 * 1024  # 50MB — cap file read
 
 
 class CacheWriter:
     """Write market data to shared cache (used by core process only).
 
     V7: exclusive fcntl lock, version number, SHA256 checksum.
+    V9: JSON format replaces pickle — human-readable, schema-stable.
     """
 
     def __init__(self, cache_path: str = None):
@@ -52,7 +59,7 @@ class CacheWriter:
         self._version = 0
 
     def write(self, bars_cache: dict, rvol_cache: dict) -> None:
-        """Atomically write bars and rvol data with exclusive lock + checksum."""
+        """Atomically write bars and rvol data as JSON with exclusive lock + checksum."""
         bars_data = {}
         for ticker, df in bars_cache.items():
             if df is not None and not df.empty:
@@ -66,6 +73,7 @@ class CacheWriter:
         self._version += 1
         cache = {
             '_version': self._version,
+            '_format': 'json_v1',
             'timestamp': time.monotonic(),
             'updated_at': pd.Timestamp.now('UTC').isoformat(),
             'wall_clock': time.time(),
@@ -73,22 +81,25 @@ class CacheWriter:
             'rvol': rvol_data,
         }
 
-        fd = None
         tmp_path = None
         try:
             # Exclusive lock for write
             lock_fd = open(self._lock_path, 'w')
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             try:
-                fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR,
-                                                suffix='.pkl.tmp')
-                with os.fdopen(fd, 'wb') as f:
-                    pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
-                fd = None  # os.fdopen closed it
+                # Serialize to JSON (default=str handles Timestamp, numpy types)
+                serialized = json.dumps(cache, default=str)
 
-                # Compute checksum of the tmp file
-                with open(tmp_path, 'rb') as f:
-                    file_hash = hashlib.sha256(f.read()).hexdigest()
+                # Atomic write: tmp → fsync → replace
+                fd, tmp_path = tempfile.mkstemp(dir=CACHE_DIR,
+                                                suffix='.json.tmp')
+                with os.fdopen(fd, 'w') as f:
+                    f.write(serialized)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Compute checksum
+                file_hash = hashlib.sha256(serialized.encode()).hexdigest()
 
                 # Atomic replace
                 os.replace(tmp_path, self._path)
@@ -114,8 +125,8 @@ class CacheWriter:
 class CacheReader:
     """Read market data from shared cache (used by satellite processes).
 
-    V7: shared fcntl lock, checksum validation, staleness enforcement,
-    timeout on pickle.load().
+    V7: shared fcntl lock, checksum validation, staleness enforcement.
+    V9: Reads JSON format. Falls back to legacy pickle for one-time migration.
     """
 
     def __init__(self, cache_path: str = None, max_age_seconds: float = 15.0):
@@ -128,42 +139,50 @@ class CacheReader:
         self._cached_data = None
 
     def read(self) -> Optional[dict]:
-        """Read cache with shared lock, checksum validation, and timeout.
+        """Read cache with shared lock and checksum validation.
 
-        Returns None if file missing, corrupt, or read times out.
+        Returns None if file missing or corrupt.
         Returns cached_data if file unchanged since last read.
+        Falls back to legacy .pkl if .json doesn't exist yet.
         """
+        # Determine which file to read
+        read_path = self._path
+        is_legacy = False
+        if not os.path.exists(self._path) and os.path.exists(_LEGACY_PKL_PATH):
+            read_path = _LEGACY_PKL_PATH
+            is_legacy = True
+
         try:
-            mtime = os.path.getmtime(self._path)
-            if mtime <= self._last_mtime:
+            mtime = os.path.getmtime(read_path)
+            if mtime <= self._last_mtime and not is_legacy:
                 return self._cached_data
 
             # Shared lock for read
             lock_fd = open(self._lock_path, 'a+')
             fcntl.flock(lock_fd, fcntl.LOCK_SH)
             try:
-                # Validate checksum before deserializing
-                if os.path.exists(self._checksum_path):
-                    with open(self._path, 'rb') as f:
-                        raw = f.read()
+                with open(read_path, 'rb' if is_legacy else 'r') as f:
+                    raw = f.read(_MAX_CACHE_BYTES if is_legacy else None)
+
+                # Checksum validation (for JSON path)
+                if not is_legacy and os.path.exists(self._checksum_path):
                     with open(self._checksum_path) as f:
                         expected = f.read().strip()
-                    actual = hashlib.sha256(raw).hexdigest()
+                    raw_bytes = raw.encode() if isinstance(raw, str) else raw
+                    actual = hashlib.sha256(raw_bytes).hexdigest()
                     if actual != expected:
                         log.warning("[SharedCache] Checksum mismatch — "
                                     "skipping corrupt cache")
                         return self._cached_data
 
-                    # Deserialize from bytes (already read)
+                # Deserialize
+                if is_legacy:
+                    import pickle
                     data = pickle.loads(raw)
+                    log.info("[SharedCache] Read legacy .pkl — "
+                             "will be replaced by .json on next Core write")
                 else:
-                    # No checksum sidecar (pre-V7 cache) — read with timeout
-                    # V7 P1-6: Wrap pickle.load in timeout to prevent hang on
-                    # corrupted file. Read raw bytes first (bounded by file size),
-                    # then deserialize from memory.
-                    with open(self._path, 'rb') as f:
-                        raw = f.read(_MAX_CACHE_BYTES)
-                    data = pickle.loads(raw)
+                    data = json.loads(raw)
 
                 self._last_mtime = mtime
                 self._cached_data = data

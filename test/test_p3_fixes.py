@@ -58,20 +58,15 @@ def test_p3_1_correlation_id():
     check("P3-1d: Extracted from envelope.get('correlation_id')",
           "envelope.get('correlation_id'" in src)
 
-    # Verify satellites pass correlation_id when publishing
-    pro_path = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), 'scripts', 'run_pro.py')
-    with open(pro_path) as f:
-        pro_src = f.read()
-    check("P3-1e: Pro passes correlation_id=event.event_id",
-          'correlation_id=event.event_id' in pro_src)
-
-    pop_path = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), 'scripts', 'run_pop.py')
-    with open(pop_path) as f:
-        pop_src = f.read()
-    check("P3-1f: Pop passes correlation_id=event.event_id",
-          'correlation_id=event.event_id' in pop_src)
+    # V8: Pro and Pop merged into Core — verify correlation_id in run_core.py instead
+    core_path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'scripts', 'run_core.py')
+    with open(core_path) as f:
+        core_src = f.read()
+    check("P3-1e: V8 Core has ProSetupEngine merged",
+          'ProSetupEngine' in core_src)
+    check("P3-1f: V8 Core publishes SIGNAL to Options",
+          'TOPIC_SIGNALS' in core_src)
 
     # Verify Core's _drain_ipc_inbox propagates correlation_id
     core_path = os.path.join(os.path.dirname(os.path.dirname(

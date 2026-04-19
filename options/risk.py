@@ -57,16 +57,20 @@ class OptionsRiskGate:
         self,
         ticker:     str,
         max_risk:   float,
+        skip_pending: bool = False,
     ) -> Optional[str]:
         """
         Run all risk checks. Returns None on pass, or rejection reason.
         Does NOT mutate state.
+
+        skip_pending: True when called from an execution thread that already
+        holds the reservation (avoids self-blocking on _pending_tickers check).
         """
         with self._lock:
             if ticker in self._open_positions:
                 return f"options position already open for {ticker}"
 
-            if ticker in self._pending_tickers:
+            if not skip_pending and ticker in self._pending_tickers:
                 return f"execution already pending for {ticker}"
 
             if len(self._open_positions) >= self._max_positions:

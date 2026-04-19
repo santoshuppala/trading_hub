@@ -67,7 +67,7 @@ def main():
     from monitor.event_bus import EventType, Event
 
     log.info("=" * 60)
-    log.info("V8 CORE PROCESS STARTING (VWAP + Pro + Pop scan)")
+    log.info("V9 CORE PROCESS STARTING")
     log.info("=" * 60)
 
     # ── V8: Validate SMTP at startup ──────────────────────────────────────
@@ -125,6 +125,22 @@ def main():
         data_source=DATA_SOURCE,
     )
 
+    # ── V9 (R2): Wrap data client in FailoverDataClient ────────────────────
+    try:
+        from monitor.data_client import FailoverDataClient
+        from monitor.alpaca_data_client import AlpacaDataClient
+        alpaca_fallback = AlpacaDataClient(ALPACA_API_KEY, ALPACA_SECRET)
+        failover_client = FailoverDataClient(
+            primary=monitor._data,
+            secondary=alpaca_fallback,
+            alert_fn=lambda msg: send_alert(ALERT_EMAIL, msg, severity='CRITICAL')
+                     if ALERT_EMAIL else None,
+        )
+        monitor._data = failover_client
+        log.info("FailoverDataClient active | primary=Tradier secondary=Alpaca(IEX)")
+    except Exception as exc:
+        log.warning("FailoverDataClient init failed (non-fatal): %s", exc)
+
     # ── V8: Seed RVOL profiles from monitor's data client ─────────────────
     if rvol_engine:
         try:
@@ -168,21 +184,28 @@ def main():
             t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
             t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
             t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
-            # Get open orders
+            # Cancel only truly open/pending orders (not filled/rejected/expired)
+            # V8: Don't use filter=open — Tradier sandbox returns wrong results
             resp = _req.get(f'{t_base}/v1/accounts/{t_acct}/orders',
-                           params={'filter': 'open'}, headers=t_headers, timeout=5)
+                           headers=t_headers, timeout=10)
             if resp.status_code == 200:
                 orders = resp.json().get('orders', {})
                 if orders and orders != 'null':
                     order_list = orders.get('order', [])
                     if isinstance(order_list, dict):
                         order_list = [order_list]
+                    cancelled = 0
                     for o in order_list:
                         oid = o.get('id')
-                        if oid:
+                        status = o.get('status', '')
+                        if oid and status in ('pending', 'open', 'partially_filled'):
                             _req.delete(f'{t_base}/v1/accounts/{t_acct}/orders/{oid}',
                                        headers=t_headers, timeout=5)
-                            log.info("[Startup] Cancelled stale Tradier order: %s", oid)
+                            cancelled += 1
+                            log.info("[Startup] Cancelled stale Tradier order: %s (%s %s)",
+                                     oid, o.get('symbol', '?'), o.get('type', '?'))
+                    log.info("[Startup] Cancelled %d open Tradier orders (of %d total)",
+                             cancelled, len(order_list))
     except Exception as exc:
         log.warning("[Startup] Stale Tradier order cancel failed: %s", exc)
 
@@ -190,11 +213,57 @@ def main():
     from scripts._db_helper import init_satellite_db
     db_cleanup = init_satellite_db(monitor._bus, process_name='core')
 
+    # ── V9: FillLedger (shadow mode — parallel tracking) ─────────────────
+    fill_ledger = None
+    try:
+        from monitor.fill_ledger import FillLedger
+        fill_ledger = FillLedger(state_file='data/fill_ledger.json')
+        fill_ledger.load()
+        monitor.set_fill_ledger(fill_ledger)
+        log.info("FillLedger attached (shadow mode) | lots=%d open=%d daily_pnl=$%.2f",
+                 fill_ledger.lot_count, fill_ledger.open_position_count,
+                 fill_ledger.daily_realized_pnl())
+    except Exception as exc:
+        log.warning("FillLedger init failed (non-fatal, shadow mode skipped): %s", exc)
+
+    # ── V9: BrokerRegistry (extensible broker collection) ────────────────
+    broker_registry = None
+    try:
+        from monitor.broker_registry import BrokerRegistry
+        broker_registry = BrokerRegistry()
+
+        # Register Alpaca broker
+        alpaca_broker = getattr(monitor, '_broker', None)
+        if alpaca_broker:
+            broker_registry.register('alpaca', alpaca_broker)
+
+        # Tradier broker will be registered after SmartRouter creation (below)
+        monitor.set_broker_registry(broker_registry)
+    except Exception as exc:
+        log.warning("BrokerRegistry init failed (non-fatal): %s", exc)
+
+    # ── V9: EquityTracker (hourly P&L drift detection) ───────────────────
+    try:
+        if broker_registry and len(broker_registry) > 0:
+            from monitor.equity_tracker import EquityTracker
+            pnl_fn = lambda: sum(t.get('pnl', 0) for t in monitor.trade_log)
+            equity_tracker = EquityTracker(broker_registry, pnl_fn=pnl_fn,
+                                            alert_email=ALERT_EMAIL)
+            equity_tracker.set_baseline()
+            monitor.set_equity_tracker(equity_tracker)
+    except Exception as exc:
+        log.warning("EquityTracker init failed (non-fatal): %s", exc)
+
     # ── Portfolio-level risk gate ─────────────────────────────────────────
     from monitor.portfolio_risk import PortfolioRiskGate
     portfolio_risk = PortfolioRiskGate(bus=monitor._bus, monitor=monitor)
     log.info("PortfolioRiskGate active")
     portfolio_risk.reset_day()
+    # V9 (L3): Start background buying power refresh (30s interval, <10ms reads)
+    try:
+        portfolio_risk.start_buying_power_refresher()
+    except Exception as exc:
+        log.warning("BuyingPower refresher failed (non-fatal): %s", exc)
 
     # ── V8: Per-strategy kill switch ─────────────────────────────────────
     from monitor.kill_switch import PerStrategyKillSwitch
@@ -239,6 +308,8 @@ def main():
                     tradier_broker=tradier_broker,
                     default_broker='alpaca',
                 )
+                # V8: Share positions ref so SmartRouter can read _broker_qty for split sells
+                smart_router._positions_ref = monitor.positions
                 log.info("SmartRouter active | brokers=alpaca+tradier | mode=%s", BROKER_MODE)
 
                 # V7.2: Seed from reconciliation results
@@ -251,6 +322,9 @@ def main():
                     smart_router.seed_position_broker(alpaca_tickers, tradier_tickers)
                 except Exception as seed_exc:
                     log.warning("SmartRouter position seed failed: %s", seed_exc)
+                # V9: Register Tradier in BrokerRegistry
+                if broker_registry and tradier_broker:
+                    broker_registry.register('tradier', tradier_broker)
             else:
                 log.warning("BROKER_MODE=smart but Tradier credentials missing")
         except Exception as exc:
@@ -356,10 +430,63 @@ def main():
     except Exception as exc:
         log.warning("Discovery consumer failed (non-fatal): %s", exc)
 
+    # ── V9 (L1): Tradier WebSocket streaming (PRODUCTION token for data) ──
+    tradier_stream = None
+    try:
+        tradier_prod_token = os.getenv('TRADIER_TOKEN', '')
+        if tradier_prod_token:
+            from monitor.tradier_stream import TradierStreamClient
+            tradier_stream = TradierStreamClient(
+                token=tradier_prod_token, bus=monitor._bus,
+            )
+            # Subscribe to tickers with open positions (HOT tickers)
+            hot_tickers = set(monitor.positions.keys()) if monitor.positions else set()
+            if tradier_stream.start(initial_tickers=hot_tickers):
+                monitor._stream_active = True
+                # V9: Wire streaming prices into RiskEngine for <1ms spread checks
+                monitor.set_stream_client(tradier_stream)
+                # V9: Wire streaming cvol into RVOLEngine for real-time RVOL
+                if rvol_engine:
+                    rvol_engine.set_stream_client(tradier_stream)
+                log.info("Tradier streaming active | HOT tickers=%d", len(hot_tickers))
+            else:
+                log.warning("Tradier streaming unavailable — using REST polling fallback")
+    except Exception as exc:
+        log.warning("Tradier streaming init failed (non-fatal): %s", exc)
+
     # ── Start monitor ─────────────────────────────────────────────────────
     monitor.start()
-    log.info("V8 Core running | VWAP + Pro strategies active | %d tickers",
-             len(monitor.tickers))
+
+    # ── V9 Component Status Banner ────────────────────────────────────────
+    _v9_status = {
+        'FillLedger (shadow)':     'ON' if fill_ledger else 'OFF',
+        'BrokerRegistry':          f'ON ({len(broker_registry)} brokers)' if broker_registry else 'OFF',
+        'EquityTracker':           'ON' if getattr(monitor, '_equity_tracker', None) else 'OFF',
+        'Tradier Streaming':       'ON' if tradier_stream and tradier_stream.is_connected else 'OFF (REST fallback)',
+        'Streaming → RiskEngine':  'ON' if getattr(getattr(monitor, '_risk', None), '_stream_client', None) else 'OFF',
+        'Buying Power Background': 'ON' if getattr(portfolio_risk, '_bp_refresher', None) else 'OFF (inline)',
+        'Data Failover':           'ON' if hasattr(monitor._data, '_secondary') else 'OFF',
+        'Detector Cascade (L4)':   'ON',  # always on (code change, not config)
+        'Bar Validation (R1)':     'ON',  # always on
+        'Kill Switch Persist':     'ON',  # always on
+        'Cache Format':            'JSON' if hasattr(cache_writer, '_path') and '.json' in cache_writer._path else 'Pickle',
+        'Dual-Freq Polling (L2)':  'STANDBY' if tradier_stream else 'ACTIVE (12s HOT)',
+    }
+
+    _version = 'V9' if any(v.startswith('ON') for v in _v9_status.values()) else 'V8 (legacy)'
+    _active_count = sum(1 for v in _v9_status.values() if v.startswith('ON'))
+
+    log.info("=" * 60)
+    log.info("SYSTEM VERSION: %s (%d/%d V9 components active)",
+             _version, _active_count, len(_v9_status))
+    log.info("-" * 60)
+    for component, status in _v9_status.items():
+        icon = 'ON ' if status.startswith('ON') else 'OFF'
+        log.info("  [%s] %s: %s", icon, component, status)
+    log.info("-" * 60)
+    log.info("Tickers: %d | Positions: %d | Strategies: VWAP + Pro",
+             len(monitor.tickers), len(monitor.positions))
+    log.info("=" * 60)
 
     # Write initial cache (Options reads from this)
     if hasattr(monitor, '_bars_cache') and hasattr(monitor, '_rvol_cache'):
@@ -381,6 +508,12 @@ def main():
     except KeyboardInterrupt:
         log.info("Core process interrupted.")
     finally:
+        # V9: Stop streaming first (clean WebSocket disconnect)
+        if tradier_stream:
+            try:
+                tradier_stream.stop()
+            except Exception:
+                pass
         monitor.stop()
         if discovery_consumer:
             discovery_consumer.stop()

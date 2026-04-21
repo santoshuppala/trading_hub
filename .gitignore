@@ -12,28 +12,24 @@ venv/
 .venv/
 env/
 
-# --- Data & Logs ---
+# --- Data & Logs (all runtime, never commit) ---
+data/
+logs/
+backtest_results/
 *.parquet
 *.csv
 *.log
 trade_log.json
 test/logs/
-logs/
 
-# --- V7 State Files (generated at runtime, never commit) ---
+# --- Runtime State Files ---
 bot_state.*
 position_registry.*
 position_broker_map.*
-data/*.json
-data/*.pkl
-data/*.flock
-data/*.sha256
-data/*.prev
-data/*.prev2
-data/*.tmp
-data/*.lock
 *.heartbeat.json
 .monitor.lock
+*.bak
+*.pre_autofix
 
 # --- Docker / Database ---
 docker/data/
@@ -46,8 +42,5 @@ docker/data/
 *.swp
 *.swo
 
-#----Docs---
-docs/
-# V8: Archived satellite state files
-data/*_state.json.v7_archive
-*.pre_autofix
+# --- Docs (keep in repo, ignore generated) ---
+# docs/ is tracked — remove this line if you want to exclude docs

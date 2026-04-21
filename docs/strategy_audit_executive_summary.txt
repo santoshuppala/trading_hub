@@ -1,0 +1,221 @@
+═══════════════════════════════════════════════════════════════════════════════
+EXECUTIVE SUMMARY — COMPREHENSIVE STRATEGY AUDIT
+═══════════════════════════════════════════════════════════════════════════════
+
+CRITICAL FINDING: confirmed_crossover incident on 2026-04-10 reveals fundamental
+architectural flaw in strategy implementation.
+
+───────────────────────────────────────────────────────────────────────────────
+THE INCIDENT
+───────────────────────────────────────────────────────────────────────────────
+
+Date: 2026-04-10 08:32:26 ET
+Log: "Starting monitor | Strategy: confirmed_crossover"
+Expected: vwap_reclaim
+Actual: vwap_reclaim (but configured for confirmed_crossover)
+Impact: Major discrepancy between expected and actual trading behavior
+
+───────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE: ARCHITECTURE FLAW
+───────────────────────────────────────────────────────────────────────────────
+
+Configuration is disconnected from implementation:
+
+1. config.py says: STRATEGY = 'confirmed_crossover' (on 2026-04-10)
+2. System actually runs: VWAP Reclaim (hardcoded in SignalAnalyzer)
+3. Analyst caught: "We're configured for confirmed_crossover but it's not in the code!"
+
+WHY THIS HAPPENED:
+- Live trading system (run_monitor.py) is hardcoded to VWAP Reclaim
+- STRATEGY variable in config.py is never used by StrategyEngine
+- StrategyEngine doesn't accept strategy_name parameter
+- SignalAnalyzer is monolithic (only knows VWAP Reclaim)
+
+───────────────────────────────────────────────────────────────────────────────
+WHAT ACTUALLY RUNS IN LIVE TRADING
+───────────────────────────────────────────────────────────────────────────────
+
+✓ WORKS (Hardcoded):
+  - VWAP Reclaim (SignalAnalyzer in monitor/signals.py)
+  - Only strategy that works in live trading
+  - Implements: reclaim detection, VWAP breakdown exits, RSI filters
+
+✗ DOES NOT WORK (Configured but not implemented):
+  - confirmed_crossover: Config says use it; system ignores it
+  - ema_rsi: Exists for backtesting only (main.py)
+  - trend_atr: Exists for backtesting only (main.py)
+  - momentum_breakout: Exists for backtesting only (main.py)
+  - mean_reversion: Exists for backtesting only (main.py)
+
+BOTTOM LINE: Only 1 of 6 strategies works in live trading, and you can't change it
+by editing config.py because the system doesn't read STRATEGY.
+
+───────────────────────────────────────────────────────────────────────────────
+TWO SEPARATE SYSTEMS
+───────────────────────────────────────────────────────────────────────────────
+
+Live Trading (run_monitor.py):
+  └─ RealTimeMonitor
+     └─ StrategyEngine
+        └─ SignalAnalyzer (VWAP Reclaim only)
+
+Backtesting (main.py):
+  └─ Backtrader
+     └─ strategies/ package (6 different strategies)
+
+PROBLEM: They don't share code. Changes to backtesting strategies don't affect
+live trading. Live trading can't use any backtesting strategies.
+
+───────────────────────────────────────────────────────────────────────────────
+ARCHITECTURAL ISSUES
+───────────────────────────────────────────────────────────────────────────────
+
+Issue 1: Configuration is Ignored
+  - STRATEGY variable: Logged but never used
+  - STRATEGY_PARAMS: Partially used (volume_factor ignored)
+  - Fix: Either implement strategy selection or stop logging STRATEGY
+
+Issue 2: No Strategy Abstraction
+  - SignalAnalyzer is hardcoded to VWAP Reclaim
+  - No BaseStrategy interface
+  - No way to switch strategies at runtime
+  - Fix: Create pluggable strategy system
+
+Issue 3: Strategy Registry is Dead Code
+  - strategies/__init__.py defines get_strategy_class()
+  - Never called by live trading code
+  - Only used in backtesting (main.py)
+  - Fix: Wire strategy registry to live trading
+
+Issue 4: Misleading Logs
+  - Log shows configured strategy, not actual strategy
+  - Analyst can't understand what's running
+  - Fix: Log actual running strategy (currently hardcoded as "vwap_reclaim")
+
+Issue 5: Testing Blind Spot
+  - Tests only verify VWAP Reclaim works
+  - No tests verify that STRATEGY config actually selects strategy
+  - No tests for multi-strategy switching
+  - Fix: Add integration tests for strategy selection
+
+───────────────────────────────────────────────────────────────────────────────
+IMPACT ASSESSMENT
+───────────────────────────────────────────────────────────────────────────────
+
+Live Trading:
+  - Can only run VWAP Reclaim regardless of config
+  - Cannot switch strategies without code changes
+  - Cannot use any backtesting strategies
+  - Risk: Misconfigured strategies silently fail to execute
+
+Backtesting:
+  - Has 6 strategies but they're disconnected from live
+  - Optimizations in backtest don't improve live trading
+  - Risk: Backtest results don't predict live behavior
+
+Operations:
+  - Analyst cannot change strategy by editing config.py
+  - Logs mislead operators about what's running
+  - No clear way to understand which strategy is active
+  - Risk: Operational confusion, loss of trust in system
+
+───────────────────────────────────────────────────────────────────────────────
+WHAT WAS FIXED
+───────────────────────────────────────────────────────────────────────────────
+
+Commit dd7e6fc (2026-04-12 23:20:12):
+  "fix: change strategy from confirmed_crossover to vwap_reclaim + add tickers"
+
+Action: Changed config.py STRATEGY from 'confirmed_crossover' to 'vwap_reclaim'
+
+Why: To match the actual hardcoded implementation so that configuration and
+     reality are aligned
+
+Effect: Removes the discrepancy but DOES NOT fix the underlying architecture
+
+───────────────────────────────────────────────────────────────────────────────
+FINANCIAL ANALYST VERDICT
+───────────────────────────────────────────────────────────────────────────────
+
+Status: CONFIGURATION AND IMPLEMENTATION MISALIGNED
+
+The confirmed_crossover incident was NOT a bug in trading logic. It was a
+fundamental architectural flaw where the configuration system and implementation
+system are completely disconnected.
+
+Grade: C (Configuration management is broken; implementation is sound but inflexible)
+
+Risk: HIGH — System cannot adapt to strategy changes; future configuration errors
+will silently fail.
+
+───────────────────────────────────────────────────────────────────────────────
+RECOMMENDED ACTIONS
+───────────────────────────────────────────────────────────────────────────────
+
+IMMEDIATE (Do now):
+1. ✓ Fix STRATEGY config to match reality (confirmed_crossover → vwap_reclaim)
+   Status: DONE (commit dd7e6fc)
+
+2. Update documentation
+   - Document that only VWAP Reclaim is available in live trading
+   - Explain that STRATEGY_PARAMS are VWAP-specific
+   - List which strategies only work in backtesting
+
+3. Fix logging
+   - Stop logging STRATEGY variable (it's misleading)
+   - Log actual running strategy (hardcoded: "vwap_reclaim")
+   - Log warnings if config strategy doesn't match running strategy
+
+SHORT-TERM (Next sprint):
+1. Validate all configuration variables
+   - Audit which variables are actually used
+   - Remove dead configuration
+   - Add validation to fail fast if config is wrong
+
+2. Add configuration tests
+   - Test that STRATEGY config is properly used
+   - Test that missing configs fail with clear error
+   - Test that strategy parameters match implementation
+
+MEDIUM-TERM (Architecture fix):
+1. Create strategy abstraction
+   - Design BaseStrategyEngine interface
+   - Implement concrete engines for each strategy
+   - Make StrategyEngine a factory
+
+2. Consolidate live and backtest
+   - Share strategy implementations
+   - Use same strategy parameters
+   - Enable backtested strategies in live
+
+3. Add strategy validation
+   - Validate at startup that strategy exists
+   - Fail fast if strategy not found
+   - Log selected strategy clearly
+
+───────────────────────────────────────────────────────────────────────────────
+AUDIT COMPLETENESS
+───────────────────────────────────────────────────────────────────────────────
+
+Strategies Audited: 6
+  ✓ VWAP Reclaim (works in live, hardcoded)
+  ✗ confirmed_crossover (configured but not used)
+  ✗ ema_rsi (backtesting only)
+  ✗ trend_atr (backtesting only)
+  ✗ momentum_breakout (backtesting only)
+  ✗ mean_reversion (backtesting only)
+
+Code Paths Analyzed: 7
+  ✓ config.py (configuration)
+  ✓ run_monitor.py (live trading launcher)
+  ✓ monitor/monitor.py (RealTimeMonitor)
+  ✓ monitor/strategy_engine.py (StrategyEngine)
+  ✓ monitor/signals.py (SignalAnalyzer + VWAP logic)
+  ✓ main.py (backtesting)
+  ✓ strategies/ package (strategy definitions)
+
+Issues Found: 5 CRITICAL, 1 HIGH, 1 MEDIUM
+
+═══════════════════════════════════════════════════════════════════════════════
+END OF EXECUTIVE SUMMARY
+═══════════════════════════════════════════════════════════════════════════════

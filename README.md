@@ -270,6 +270,10 @@ bash start_monitor.sh
 - `docs/V9_Trading_Hub/05_LATENCY_PROFILE.md` — measured benchmarks + before/after
 - `docs/V9_Trading_Hub/06_SAFETY_AND_RECONCILIATION.md` — kill switch + reconciliation + guards
 - `docs/V9_Trading_Hub/07_MULTI_TIMEFRAME_DETECTORS.md` — 5-min bars for SR/Trend/Fib/Flag/InsideBar + activation timeline
+- `docs/V9_Trading_Hub/08_DATABASE_AND_OPERATIONS.md` — schema, analytics queries, startup sequence, RVOL optimization
+- `docs/V9_Trading_Hub/09_WATCHDOG_AND_SELF_HEALING.md` — session watchdog, self-healing, HotfixManager
+- `docs/V9_Trading_Hub/10_BACKTESTING.md` — backtest engine, data pipeline, strategies, results
+- `docs/V9_Trading_Hub/11_EVOLUTION_AND_ROADMAP.md` — V1-V9 timeline, system metrics, future roadmap
 
 ### Previous versions
 - `docs/V8_trading_hub/` — V8 architecture (reference)
@@ -286,3 +290,36 @@ bash start_monitor.sh
 - Alpaca account (paper trading free, WebSocket fills free)
 - Yahoo Mail app password for alerts (optional)
 - macOS/Linux
+
+---
+
+## Backtesting
+
+V9 includes a full backtesting framework with a Tradier + DB data pipeline.
+
+- **Data pipeline (Option C)**: Fetch 1m/5m bars from Tradier API, persist to `market_bars` DB table, future loads read from DB instantly (no API calls).
+- **Dual timeframe**: 1-minute bars for recent 20 days, 5-minute bars for full 40-day window. `BarDataLoader` supports yfinance, Tradier, and DB sources.
+- **Backfill**: `python scripts/backfill_bars.py` populates DB from Tradier history.
+- **Run**: `python backtests/run_backtest.py --data tradier --save-to-db --csv`
+- **Dashboard**: `streamlit run dashboards/backtest_dashboard.py` (port 8502) — interactive results viewer with per-strategy breakdown.
+
+---
+
+## Session Watchdog
+
+`scripts/session_watchdog.py` provides self-healing monitoring for all 4 processes (Supervisor, Core, Options, DataCollector).
+
+- **Health checks**: Process alive, zombie detection (log staleness), log error scanning, signal rate monitoring, position tracking, kill switch state, fill ledger integrity, data freshness, memory usage, gap_and_go detection.
+- **Self-healing**: Corrupt JSON restore from `.prev` backups, stale `.lock` file removal, `__pycache__` clearing, supervisor restart, zombie process kill.
+- **HotfixManager**: Auto-applies fixes for common runtime errors (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError, ZeroDivisionError) during paper trading. Creates `.bak` backups, syntax-checks before write, max 5 fixes per session, protected files list.
+- **Email updates**: 7 hourly status reports during market hours (9:30 AM - 4:00 PM ET).
+- **Resilient loop**: `_run_one_cycle()` with cycle-level try/except. Escalates after 10 consecutive errors.
+
+---
+
+## First Production Run (April 20, 2026)
+
+The system ran its first production session on April 20. All 4 processes started and stayed alive for the full session. No trades were executed due to a `gap_and_go` low-coverage crash that caused the strategy engine to halt early. The root cause was identified and fixed:
+
+- `gap_and_go` threshold raised from 0.5% to 1.5% with added volume confirmation, trend alignment, VWAP requirement, and tighter continuation filters (70/30).
+- Backtesting confirmed the fix: trades dropped from 34K to 20K, win rate improved from 30.6% to 38.7%, P&L swung from -$587 to +$568, profit factor improved from 0.96 to 1.06.

@@ -63,9 +63,16 @@ class HotfixProposal:
 
 
 class HotfixManager:
-    """Email-based hotfix approval system."""
+    """
+    Auto-fix system for paper trading sessions.
 
-    def __init__(self):
+    Modes:
+      auto_apply=True  (default for paper): Apply fixes immediately, email notification
+      auto_apply=False (for live trading):  Email approval required before applying
+    """
+
+    def __init__(self, auto_apply: bool = True):
+        self._auto_apply = auto_apply
         self._smtp_server = os.getenv('ALERT_EMAIL_SERVER', 'smtp.mail.yahoo.com')
         self._smtp_port = int(os.getenv('ALERT_EMAIL_PORT', '587'))
         self._imap_server = 'imap.mail.yahoo.com'
@@ -128,12 +135,23 @@ class HotfixManager:
             old_code=old_code, new_code=new_code, explanation=explanation,
         )
 
-        self._pending[fix_id] = proposal
-        self._send_approval_request(proposal)
-        log.info("[Hotfix] Proposed fix %s for %s:%d — awaiting email approval",
-                 fix_id, rel_path, line_num)
-
-        return proposal
+        if self._auto_apply:
+            # Paper trading: apply immediately, notify via email
+            if self._apply_fix(proposal):
+                log.info("[Hotfix] AUTO-APPLIED fix %s for %s:%d — %s",
+                         fix_id, rel_path, line_num, explanation)
+                return proposal
+            else:
+                # Fix failed to apply — send error report
+                self._send_error_report(proposal)
+                return None
+        else:
+            # Live trading: require email approval
+            self._pending[fix_id] = proposal
+            self._send_approval_request(proposal)
+            log.info("[Hotfix] Proposed fix %s for %s:%d — awaiting email approval",
+                     fix_id, rel_path, line_num)
+            return proposal
 
     def check_approvals(self) -> list:
         """
@@ -288,15 +306,96 @@ class HotfixManager:
 
         # ── Pattern 5: KeyError — missing dict key ──────────────────────
         if error_type == 'KeyError':
-            match = re.search(r"KeyError: '(\w+)'", error_msg)
+            # Extract the missing key (handles 'key' and "key")
+            match = re.search(r"KeyError: ['\"](\w+)['\"]", error_msg)
             if match:
                 key = match.group(1)
-                if f"['{key}']" in error_line:
+                # Case A: literal string key: data['missing_key']
+                for quote in ["'", '"']:
+                    bracket = f"[{quote}{key}{quote}]"
+                    getter = f".get({quote}{key}{quote}, None)"
+                    if bracket in error_line:
+                        return (
+                            error_line.rstrip(),
+                            error_line.replace(bracket, getter).rstrip(),
+                            f"Changed [{quote}{key}{quote}] to .get() for safe access",
+                        )
+
+            # Case B: variable key: data[ticker] where ticker='AAPL'
+            # Find any [variable] access on the error line
+            bracket_match = re.search(r'(\w+)\[(\w+)\]', error_line)
+            if bracket_match:
+                dict_name = bracket_match.group(1)
+                var_name = bracket_match.group(2)
+                old = f"{dict_name}[{var_name}]"
+                new = f"{dict_name}.get({var_name})"
+                if old in error_line:
                     return (
                         error_line.rstrip(),
-                        error_line.replace(f"['{key}']", f".get('{key}', None)").rstrip(),
-                        f"Changed ['{key}'] to .get('{key}', None) for safe access",
+                        error_line.replace(old, new).rstrip(),
+                        f"Changed {old} to .get() for safe access",
                     )
+
+        # ── Pattern 6: IndexError — list index out of range ─────────────
+        if error_type == 'IndexError':
+            if 'iloc[-1]' in error_line or 'iloc[-2]' in error_line:
+                idx = '-1' if 'iloc[-1]' in error_line else '-2'
+                min_len = '1' if idx == '-1' else '2'
+                # Find the variable being indexed
+                match = re.search(r'(\w+)\[', error_line.split('iloc')[0])
+                indent = len(error_line) - len(error_line.lstrip())
+                pad = ' ' * indent
+                return (
+                    error_line.rstrip(),
+                    f"{pad}if len({match.group(1) if match else 'df'}) >= {min_len}:\n"
+                    f"{pad}    {error_line.strip()}\n"
+                    f"{pad}else:\n"
+                    f"{pad}    pass  # V9: skip when insufficient data",
+                    f"Added length check before iloc[{idx}] access",
+                )
+
+        # ── Pattern 7: ValueError — common conversion errors ────────────
+        if error_type == 'ValueError':
+            if 'could not convert string to float' in error_msg:
+                if 'float(' in error_line:
+                    return (
+                        error_line.rstrip(),
+                        error_line.replace('float(', 'float(str(').replace(')', '))', 1).rstrip()
+                        if error_line.count('float(') == 1 else error_line.rstrip(),
+                        "Wrapped float() arg in str() for safe conversion",
+                    )
+
+        # ── Pattern 8: ZeroDivisionError ────────────────────────────────
+        if error_type == 'ZeroDivisionError':
+            if '/' in error_line:
+                # Find the divisor and add max(x, 1e-9)
+                match = re.search(r'/\s*(\w+)', error_line)
+                if match:
+                    divisor = match.group(1)
+                    return (
+                        error_line.rstrip(),
+                        error_line.replace(f'/ {divisor}', f'/ max({divisor}, 1e-9)').rstrip(),
+                        f"Added max({divisor}, 1e-9) to prevent division by zero",
+                    )
+
+        # ── Pattern 9: FileNotFoundError ────────────────────────────────
+        if error_type == 'FileNotFoundError':
+            match = re.search(r"'([^']+)'", error_msg)
+            if match:
+                missing_file = match.group(1)
+                if missing_file.endswith('.json'):
+                    return '', '', ''  # handled by self-healer (create empty JSON)
+
+        # ── Pattern 10: StopIteration — empty iterator ──────────────────
+        if error_type == 'StopIteration':
+            if 'next(' in error_line:
+                return (
+                    error_line.rstrip(),
+                    error_line.replace('next(', 'next(iter([None]) if False else ').rstrip()
+                    if False else  # too risky, use default
+                    error_line.replace('next(', 'next(').replace(')', ', None)').rstrip(),
+                    "Added default=None to next() call",
+                )
 
         return '', '', ''
 

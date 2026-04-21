@@ -102,6 +102,9 @@ class HealthCheck:
 class SessionWatchdog:
     """Autonomous trading session monitor."""
 
+    # Periodic update schedule (ET hours)
+    _UPDATE_HOURS = [10, 11, 12, 13, 14, 15, 16]
+
     def __init__(self, check_interval: int = 120, enable_healing: bool = True):
         self.check_interval = check_interval
         self.enable_healing = enable_healing
@@ -115,14 +118,15 @@ class SessionWatchdog:
         self._prev_check_time = None
         self._prev_crash_count = {}            # engine → crash count
         self._session_report = []
+        self._updates_sent = set()             # hours already sent
 
-        # Email-based hotfix manager
+        # Auto-fix manager (paper trading = auto-apply, no approval needed)
         self._hotfix_mgr = None
         if enable_healing:
             try:
                 from scripts.hotfix_manager import HotfixManager
-                self._hotfix_mgr = HotfixManager()
-                log.info("HotfixManager active — email approval workflow enabled")
+                self._hotfix_mgr = HotfixManager(auto_apply=True)
+                log.info("HotfixManager active — auto-apply mode (paper trading)")
             except Exception as e:
                 log.warning("HotfixManager init failed: %s", e)
 
@@ -174,6 +178,9 @@ class SessionWatchdog:
                     if check.severity == 'CRITICAL':
                         self._send_alert(check)
 
+                # Periodic status update (hourly)
+                self._maybe_send_periodic_update(results)
+
                 self.checks_run += 1
                 time.sleep(self.check_interval)
 
@@ -181,10 +188,18 @@ class SessionWatchdog:
             log.info("Watchdog interrupted")
             self._generate_session_report()
 
+    # All managed processes — script name, log name, critical flag
+    _MANAGED_PROCESSES = {
+        'supervisor': {'script': 'supervisor.py', 'log': 'supervisor.log', 'critical': True},
+        'core':       {'script': 'run_core.py',   'log': 'core.log',       'critical': True},
+        'options':    {'script': 'run_options.py', 'log': 'options.log',    'critical': False},
+        'data_collector': {'script': 'run_data_collector.py', 'log': 'data_collector.log', 'critical': False},
+    }
+
     def _run_all_checks(self) -> list:
         """Run all health checks. Returns list of HealthCheck."""
         results = []
-        results.append(self._check_process_health())
+        results.extend(self._check_all_processes())
         results.append(self._check_supervisor_status())
         results.extend(self._check_log_errors())
         results.append(self._check_signal_rate())
@@ -194,37 +209,72 @@ class SessionWatchdog:
         results.append(self._check_data_freshness())
         results.append(self._check_memory())
         results.append(self._check_gap_and_go())
-        # Filter out None results
         return [r for r in results if r is not None]
 
     # ── Individual checks ─────────────────────────────────────────────────
 
-    def _check_process_health(self) -> HealthCheck:
-        """Check if core and options processes are running."""
+    def _get_ps_output(self) -> str:
+        """Get process list, handling PATH issues."""
+        for ps_cmd in ['/bin/ps', '/usr/bin/ps', 'ps']:
+            try:
+                result = subprocess.run(
+                    [ps_cmd, 'aux'], capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    return result.stdout
+            except FileNotFoundError:
+                continue
+        # Fallback
         try:
             result = subprocess.run(
-                ['ps', 'aux'], capture_output=True, text=True, timeout=5,
+                ['pgrep', '-fl', 'python'], capture_output=True, text=True, timeout=5,
             )
-            output = result.stdout
+            return result.stdout
+        except Exception:
+            return ''
 
-            core_running = 'run_core.py' in output
-            options_running = 'run_options.py' in output
-            supervisor_running = 'supervisor.py' in output
+    def _check_all_processes(self) -> list:
+        """Check ALL managed processes: alive + not zombie."""
+        results = []
+        ps_output = self._get_ps_output()
+        now = datetime.now(ET)
+        in_market = (now.hour >= 9 and now.minute >= 30) and now.hour < 16
+        today = now.strftime('%Y%m%d')
 
-            if not supervisor_running:
-                return HealthCheck('process_health', 'CRITICAL',
-                                   'Supervisor NOT running', 'CRITICAL')
-            if not core_running:
-                return HealthCheck('process_health', 'CRITICAL',
-                                   'Core process NOT running', 'CRITICAL')
-            if not options_running:
-                return HealthCheck('process_health', 'WARN',
-                                   'Options process not running (non-critical)', 'WARNING')
+        for name, info in self._MANAGED_PROCESSES.items():
+            script = info['script']
+            log_name = info['log']
+            critical = info['critical']
 
-            return HealthCheck('process_health', 'OK',
-                               f'supervisor=OK core=OK options={"OK" if options_running else "OFF"}')
-        except Exception as e:
-            return HealthCheck('process_health', 'WARN', f'Check failed: {e}', 'WARNING')
+            # Check 1: Is the process running?
+            is_running = script in ps_output
+
+            if not is_running:
+                severity = 'CRITICAL' if critical else 'WARNING'
+                results.append(HealthCheck(
+                    f'proc_{name}', 'CRITICAL' if critical else 'WARN',
+                    f'{name} NOT running', severity,
+                ))
+                continue
+
+            # Check 2: Is it a zombie? (process alive but log stale during market hours)
+            if in_market:
+                log_path = os.path.join(PROJECT_ROOT, 'logs', today, log_name)
+                if os.path.exists(log_path):
+                    log_age = time.time() - os.path.getmtime(log_path)
+                    stale_threshold = 300 if critical else 600  # 5 min for critical, 10 for others
+                    if log_age > stale_threshold:
+                        self.issues_found[f'{name}_zombie'] += 1
+                        results.append(HealthCheck(
+                            f'proc_{name}', 'CRITICAL',
+                            f'{name} ZOMBIE: alive but log stale ({log_age/60:.0f}min) — needs restart',
+                            'CRITICAL' if critical else 'WARNING',
+                        ))
+                        continue
+
+            results.append(HealthCheck(f'proc_{name}', 'OK', f'{name} running'))
+
+        return results
 
     def _check_supervisor_status(self) -> HealthCheck:
         """Check supervisor_status.json for restart counts."""
@@ -255,46 +305,63 @@ class SessionWatchdog:
             return HealthCheck('supervisor', 'WARN', f'Check failed: {e}', 'WARNING')
 
     def _check_log_errors(self) -> list:
-        """Scan core.log for new ERROR/CRITICAL lines since last check."""
+        """Scan ALL process logs for new ERROR/CRITICAL lines since last check."""
         results = []
         today = datetime.now().strftime('%Y%m%d')
-        core_log = os.path.join(PROJECT_ROOT, 'logs', today, 'core.log')
+        log_dir = os.path.join(PROJECT_ROOT, 'logs', today)
 
-        if not os.path.exists(core_log):
-            return [HealthCheck('log_errors', 'WARN', 'core.log not found', 'WARNING')]
+        if not os.path.exists(log_dir):
+            return [HealthCheck('log_errors', 'WARN', 'No log directory for today', 'WARNING')]
 
-        try:
-            last_pos = self._last_log_pos.get(core_log, 0)
-            file_size = os.path.getsize(core_log)
+        total_errors = 0
+        worst_severity = 'INFO'
+        samples = []
 
-            if file_size < last_pos:
-                # Log was rotated
-                last_pos = 0
+        for name, info in self._MANAGED_PROCESSES.items():
+            log_path = os.path.join(log_dir, info['log'])
+            if not os.path.exists(log_path):
+                continue
 
-            if file_size == last_pos:
-                return [HealthCheck('log_errors', 'OK', 'No new log entries')]
+            try:
+                last_pos = self._last_log_pos.get(log_path, 0)
+                file_size = os.path.getsize(log_path)
 
-            errors = []
-            with open(core_log, 'r') as f:
-                f.seek(last_pos)
-                for line in f:
-                    if ' ERROR ' in line or ' CRITICAL ' in line:
-                        errors.append(line.strip()[:150])
-                self._last_log_pos[core_log] = f.tell()
+                if file_size < last_pos:
+                    last_pos = 0  # log rotated
+                if file_size == last_pos:
+                    continue
 
-            if errors:
-                # Categorize
-                unique_errors = list(set(errors))[:5]  # top 5 unique
-                severity = 'CRITICAL' if any('CRITICAL' in e for e in errors) else 'WARNING'
-                self.issues_found['log_errors'] += len(errors)
-                return [HealthCheck('log_errors', 'WARN',
-                                     f'{len(errors)} new errors. Sample: {unique_errors[0]}',
-                                     severity)]
+                errors = []
+                with open(log_path, 'r') as f:
+                    f.seek(last_pos)
+                    for line in f:
+                        if ' ERROR ' in line or ' CRITICAL ' in line:
+                            errors.append(line.strip()[:150])
+                    self._last_log_pos[log_path] = f.tell()
 
-            return [HealthCheck('log_errors', 'OK',
-                                f'Scanned {file_size - last_pos} bytes, no errors')]
-        except Exception as e:
-            return [HealthCheck('log_errors', 'WARN', f'Check failed: {e}', 'WARNING')]
+                if errors:
+                    total_errors += len(errors)
+                    self.issues_found[f'log_errors_{name}'] += len(errors)
+                    has_critical = any('CRITICAL' in e for e in errors)
+                    if has_critical:
+                        worst_severity = 'CRITICAL'
+                    elif worst_severity != 'CRITICAL':
+                        worst_severity = 'WARNING'
+                    # Keep top 2 unique errors per process
+                    unique = list(set(errors))[:2]
+                    for e in unique:
+                        samples.append(f"[{name}] {e[:100]}")
+
+            except Exception:
+                pass
+
+        if total_errors > 0:
+            msg = f'{total_errors} errors across logs'
+            if samples:
+                msg += f'. Latest: {samples[0]}'
+            return [HealthCheck('log_errors', 'WARN', msg, worst_severity)]
+
+        return [HealthCheck('log_errors', 'OK', 'All logs clean')]
 
     def _check_signal_rate(self) -> HealthCheck:
         """Check if signal rate is abnormal (too high = detector issue)."""
@@ -521,25 +588,32 @@ class SessionWatchdog:
                 continue
 
             # ── Fix 1: Supervisor not running → restart it ────────────
-            if check.name == 'process_health' and 'Supervisor NOT running' in check.message:
+            if check.name == 'proc_supervisor' and 'NOT running' in check.message:
                 self._heal_restart_supervisor()
 
-            # ── Fix 2: Core not running (but supervisor is) → diagnose ─
-            if check.name == 'process_health' and 'Core process NOT running' in check.message:
-                self._heal_diagnose_crash('core')
+            # ── Fix 2: Any process not running → diagnose crash ───────
+            if check.name.startswith('proc_') and 'NOT running' in check.message:
+                engine = check.name.replace('proc_', '')
+                if engine != 'supervisor':
+                    self._heal_diagnose_crash(engine)
 
-            # ── Fix 3: Stale data → clear cache to force fresh fetch ───
+            # ── Fix 3: Any process zombie → kill for supervisor restart ─
+            if check.name.startswith('proc_') and 'ZOMBIE' in check.message:
+                engine = check.name.replace('proc_', '')
+                self._heal_kill_zombie(engine)
+
+            # ── Fix 4: Stale data → clear cache to force fresh fetch ───
             if check.name == 'data_freshness' and 'stale' in check.message:
                 self._heal_stale_cache()
 
-            # ── Fix 4: Log errors with known patterns ──────────────────
+            # ── Fix 5: Log errors with known patterns ──────────────────
             if check.name == 'log_errors' and check.severity in ('WARNING', 'CRITICAL'):
                 self._heal_from_log_errors()
 
-        # ── Fix 5: Always check for corrupt state files ────────────────
+        # ── Fix 6: Always check for corrupt state files ────────────────
         self._heal_corrupt_state_files()
 
-        # ── Fix 6: Always clean stale lock files ───────────────────────
+        # ── Fix 7: Always clean stale lock files ───────────────────────
         self._heal_stale_locks()
 
     def _heal_restart_supervisor(self):
@@ -579,10 +653,47 @@ class SessionWatchdog:
             self._record_heal("Restart supervisor", f"ERROR: {e}")
             log.error("[HEAL] Supervisor restart error: %s", e)
 
+    def _heal_kill_zombie(self, engine: str):
+        """Kill a zombie process (alive but not working) so supervisor restarts it."""
+        script_name = self._MANAGED_PROCESSES.get(engine, {}).get('script', f'run_{engine}.py')
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', script_name],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+            if not pids:
+                log.warning("[HEAL] No PID found for %s (%s)", engine, script_name)
+                return
+
+            for pid in pids:
+                os.kill(int(pid), 9)  # SIGKILL
+                self._record_heal(
+                    f"Killed zombie {engine} (PID {pid})",
+                    "OK — supervisor will restart",
+                )
+                log.info("[HEAL] Killed zombie %s PID %s — supervisor will restart",
+                         engine, pid)
+
+            # Send notification
+            try:
+                from config import ALERT_EMAIL
+                self._send_alert(HealthCheck(
+                    f'zombie_{engine}', 'WARNING',
+                    f'{engine} was zombie (log stale) — killed PID {",".join(pids)}, supervisor restarting',
+                    'WARNING',
+                ))
+            except Exception:
+                pass
+
+        except Exception as e:
+            log.warning("[HEAL] Zombie kill for %s failed: %s", engine, e)
+
     def _heal_diagnose_crash(self, engine: str):
         """Diagnose why an engine crashed and apply fixes if possible."""
         today = datetime.now().strftime('%Y%m%d')
-        log_path = os.path.join(PROJECT_ROOT, 'logs', today, f'{engine}.log')
+        log_name = self._MANAGED_PROCESSES.get(engine, {}).get('log', f'{engine}.log')
+        log_path = os.path.join(PROJECT_ROOT, 'logs', today, log_name)
 
         if not os.path.exists(log_path):
             return
@@ -653,6 +764,8 @@ class SessionWatchdog:
                 if self._hotfix_mgr and error_type in (
                     'NameError', 'AttributeError', 'TypeError',
                     'ImportError', 'ModuleNotFoundError', 'KeyError',
+                    'IndexError', 'ValueError', 'ZeroDivisionError',
+                    'StopIteration', 'FileNotFoundError',
                 ):
                     full_tb = '\n'.join(traceback_lines)
                     proposal = self._hotfix_mgr.propose_fix_from_traceback(full_tb)
@@ -699,29 +812,61 @@ class SessionWatchdog:
                         log.warning("[HEAL] Cache removal failed: %s", e)
 
     def _heal_from_log_errors(self):
-        """Scan recent log errors for fixable patterns."""
+        """Scan recent errors from ALL process logs for fixable patterns."""
         today = datetime.now().strftime('%Y%m%d')
-        core_log = os.path.join(PROJECT_ROOT, 'logs', today, 'core.log')
-        if not os.path.exists(core_log):
-            return
 
-        try:
-            result = subprocess.run(
-                ['tail', '-50', core_log],
-                capture_output=True, text=True, timeout=5,
-            )
-            recent = result.stdout
+        for name, info in self._MANAGED_PROCESSES.items():
+            log_path = os.path.join(PROJECT_ROOT, 'logs', today, info['log'])
+            if not os.path.exists(log_path):
+                continue
 
-            # Lock file errors → remove stale locks
-            if '.lock' in recent and ('LockError' in recent or 'locked' in recent.lower()):
-                self._heal_stale_locks()
+            try:
+                result = subprocess.run(
+                    ['tail', '-50', log_path],
+                    capture_output=True, text=True, timeout=5,
+                )
+                recent = result.stdout
 
-            # "No space left on device" → clear old logs
-            if 'No space left' in recent:
-                self._clear_old_logs()
+                # Lock file errors → remove stale locks
+                if '.lock' in recent and ('LockError' in recent or 'locked' in recent.lower()):
+                    self._heal_stale_locks()
 
-        except Exception:
-            pass
+                # "No space left on device" → clear old logs
+                if 'No space left' in recent:
+                    self._clear_old_logs()
+
+                # Traceback in log → try hotfix
+                if 'Traceback (most recent call last)' in recent and self._hotfix_mgr:
+                    # Extract the traceback
+                    lines = recent.split('\n')
+                    tb_lines = []
+                    in_tb = False
+                    for line in lines:
+                        if 'Traceback (most recent call last)' in line:
+                            in_tb = True
+                            tb_lines = [line]
+                        elif in_tb:
+                            tb_lines.append(line)
+                            if line.strip() and not line.startswith(' ') and 'Error' in line:
+                                in_tb = False
+                    if tb_lines:
+                        tb = '\n'.join(tb_lines)
+                        error_type = tb_lines[-1].split(':')[0].strip() if tb_lines else ''
+                        if error_type in (
+                            'NameError', 'AttributeError', 'TypeError',
+                            'ImportError', 'ModuleNotFoundError', 'KeyError',
+                            'IndexError', 'ValueError', 'ZeroDivisionError',
+                            'StopIteration',
+                        ):
+                            proposal = self._hotfix_mgr.propose_fix_from_traceback(tb)
+                            if proposal and proposal.applied:
+                                self._record_heal(
+                                    f"Auto-fixed {name}: {proposal.explanation}",
+                                    "OK — supervisor will restart",
+                                )
+
+            except Exception:
+                pass
 
     def _heal_corrupt_state_files(self):
         """Check all JSON state files for corruption, restore from backups."""
@@ -864,6 +1009,138 @@ class SessionWatchdog:
             action,
             result,
         ))
+
+    # ── Periodic Updates ─────────────────────────────────────────────────
+
+    def _maybe_send_periodic_update(self, results: list):
+        """Send hourly status email during market hours."""
+        now = datetime.now(ET)
+        hour = now.hour
+
+        if hour not in self._UPDATE_HOURS or hour in self._updates_sent:
+            return
+
+        self._updates_sent.add(hour)
+
+        # Build status summary
+        ok_count = sum(1 for r in results if r.status == 'OK')
+        warn_count = sum(1 for r in results if r.status == 'WARN')
+        crit_count = sum(1 for r in results if r.status == 'CRITICAL')
+
+        # Read current P&L and positions
+        pnl = 0.0
+        open_positions = 0
+        closed_trades = 0
+        position_list = []
+        try:
+            state_file = os.path.join(DATA_DIR, 'bot_state.json')
+            if os.path.exists(state_file):
+                with open(state_file) as f:
+                    state = json.load(f)
+                positions = state.get('positions', {})
+                trade_log = state.get('trade_log', [])
+                pnl = sum(t.get('pnl', 0) for t in trade_log)
+                open_positions = len(positions)
+                closed_trades = len(trade_log)
+                for ticker, pos in positions.items():
+                    entry = pos.get('entry_price', 0)
+                    strategy = pos.get('strategy', '?')
+                    position_list.append(f"  {ticker}: ${entry:.2f} ({strategy})")
+        except Exception:
+            pass
+
+        # Overall status
+        if crit_count > 0:
+            status_emoji = "RED"
+            status_text = f"{crit_count} CRITICAL issues"
+        elif warn_count > 0:
+            status_emoji = "YELLOW"
+            status_text = f"{warn_count} warnings"
+        else:
+            status_emoji = "GREEN"
+            status_text = "All systems nominal"
+
+        # Time labels
+        labels = {
+            10: "10 AM — First Hour",
+            11: "11 AM — Mid-Morning",
+            12: "12 PM — Midday",
+            13: "1 PM — Early Afternoon",
+            14: "2 PM — Mid-Afternoon",
+            15: "3 PM — Power Hour",
+            16: "4 PM — Market Close",
+        }
+        time_label = labels.get(hour, f"{hour}:00")
+
+        subject = f"[{status_emoji}] {time_label} | P&L: ${pnl:+,.2f} | {open_positions} open"
+
+        body = (
+            f"PERIODIC STATUS UPDATE — {time_label}\n"
+            f"{'=' * 50}\n\n"
+            f"Status: {status_text}\n"
+            f"Time: {now.strftime('%Y-%m-%d %H:%M ET')}\n\n"
+            f"TRADING\n"
+            f"  Daily P&L:       ${pnl:+,.2f}\n"
+            f"  Open positions:  {open_positions}\n"
+            f"  Closed trades:   {closed_trades}\n\n"
+        )
+
+        if position_list:
+            body += "OPEN POSITIONS\n"
+            body += '\n'.join(position_list[:15])
+            body += "\n\n"
+
+        body += (
+            f"HEALTH\n"
+            f"  Checks:    {ok_count} OK, {warn_count} WARN, {crit_count} CRITICAL\n"
+            f"  Hotfixes:  {len(self.heals_applied)} applied\n"
+            f"  Crashes:   {sum(self._prev_crash_count.values())}\n\n"
+        )
+
+        # Component status
+        body += "COMPONENTS\n"
+        for r in results:
+            icon = {'OK': 'OK ', 'WARN': 'WRN', 'CRITICAL': 'CRT'}.get(r.status, '???')
+            body += f"  [{icon}] {r.name}: {r.message}\n"
+
+        if self.heals_applied:
+            body += f"\nAUTO-FIXES APPLIED\n"
+            for ts, action, result in self.heals_applied[-5:]:
+                body += f"  [{ts}] {action} -> {result}\n"
+
+        body += (
+            f"\n{'=' * 50}\n"
+            f"Next update: {hour + 1}:00 ET\n"
+            f"Watchdog checks: every {self.check_interval}s\n"
+        )
+
+        try:
+            from config import ALERT_EMAIL
+            from monitor.alerts import send_alert
+            if ALERT_EMAIL:
+                # Use direct SMTP for reliability (bypass async queue)
+                import smtplib
+                from email.mime.text import MIMEText
+                msg = MIMEText(body, 'plain')
+                msg['Subject'] = subject
+                msg['From'] = os.getenv('ALERT_EMAIL_FROM', '')
+                msg['To'] = ALERT_EMAIL
+                s = smtplib.SMTP(
+                    os.getenv('ALERT_EMAIL_SERVER', 'smtp.mail.yahoo.com'),
+                    int(os.getenv('ALERT_EMAIL_PORT', '587')),
+                    timeout=15,
+                )
+                s.starttls()
+                s.login(
+                    os.getenv('ALERT_EMAIL_USER', ''),
+                    os.getenv('ALERT_EMAIL_PASS', ''),
+                )
+                s.sendmail(msg['From'], [ALERT_EMAIL], msg.as_string())
+                s.quit()
+                log.info("[Update] Sent %s update: P&L=$%.2f, %d open",
+                         time_label, pnl, open_positions)
+        except Exception as e:
+            log.warning("[Update] Email send failed: %s", e)
 
     # ── Output & Alerts ───────────────────────────────────────────────────
 

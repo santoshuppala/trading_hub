@@ -1,6 +1,6 @@
 {
   "supervisor": {
-    "updated_at": "2026-04-17T16:00:52.322548-04:00",
+    "updated_at": "2026-04-20T16:00:56.705710-04:00",
     "mode": "process_isolation"
   },
   "processes": {
@@ -8,7 +8,7 @@
       "name": "core",
       "status": "stopped",
       "pid": null,
-      "started_at": "2026-04-17T15:57:17.271244-04:00",
+      "started_at": "2026-04-20T09:00:01.504472-04:00",
       "restart_count": 0,
       "last_error": "",
       "critical": true
@@ -17,7 +17,7 @@
       "name": "options",
       "status": "stopped",
       "pid": null,
-      "started_at": "2026-04-17T15:57:22.281865-04:00",
+      "started_at": "2026-04-20T09:00:06.577786-04:00",
       "restart_count": 0,
       "last_error": "",
       "critical": false
@@ -25,8 +25,17 @@
     "data_collector": {
       "name": "data_collector",
       "status": "stopped",
-      "pid": 45648,
-      "started_at": "2026-04-17T15:57:22.287740-04:00",
+      "pid": 59605,
+      "started_at": "2026-04-20T09:00:06.582687-04:00",
+      "restart_count": 0,
+      "last_error": "",
+      "critical": false
+    },
+    "watchdog": {
+      "name": "watchdog",
+      "status": "stopped",
+      "pid": null,
+      "started_at": "2026-04-20T09:00:06.587843-04:00",
       "restart_count": 0,
       "last_error": "",
       "critical": false

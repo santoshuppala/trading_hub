@@ -1095,6 +1095,7 @@ class RealTimeMonitor:
     def run(self):
         """Main monitoring loop. Runs in the background thread started by start()."""
         self.running = True
+        self._consecutive_loop_errors = 0
         try:
             self._run_loop()
         except Exception as e:
@@ -1104,179 +1105,180 @@ class RealTimeMonitor:
             _remove_lock()
 
     def _run_loop(self):
-        """Inner loop extracted so run() can wrap it in a single try/except."""
+        """Inner loop — resilient to individual cycle failures."""
         while self.running:
-            self._reset_daily_state()
+          try:
+            self._run_one_cycle()
+            self._consecutive_loop_errors = 0
+          except Exception as cycle_err:
+            self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+            log.error(
+                "[Monitor] Cycle error #%d: %s — retrying in 30s",
+                self._consecutive_loop_errors, cycle_err, exc_info=True,
+            )
+            if self._consecutive_loop_errors >= 10:
+                log.critical("[Monitor] 10 consecutive cycle errors — escalating")
+                send_alert(
+                    self._alert_email,
+                    f"Monitor stuck: {self._consecutive_loop_errors} consecutive errors. "
+                    f"Last: {cycle_err}",
+                    severity='CRITICAL',
+                )
+                self._consecutive_loop_errors = 0  # reset, keep trying
+            time.sleep(30)
 
-            # Refresh momentum screener every 30 minutes
+    def _run_one_cycle(self):
+        """Single fetch-analyze-emit cycle. Exceptions propagate to _run_loop."""
+        self._reset_daily_state()
+
+        # Refresh momentum screener every 30 minutes
+        try:
             self.tickers, self._last_momentum_refresh = self._screener.refresh(
                 self.base_tickers,
                 self.tickers,
                 self._last_momentum_refresh,
             )
-            self._heartbeat.set_n_tickers(len(self.tickers))
+        except Exception as e:
+            log.warning("[Monitor] Screener refresh failed: %s — using previous tickers", e)
+        self._heartbeat.set_n_tickers(len(self.tickers))
 
-            # Single batch API call
-            log.info(
-                f"[{datetime.now(ET).strftime('%H:%M:%S')}] "
-                f"Fetching bars for {len(self.tickers)} tickers …"
-            )
-            new_bars, new_rvol = self._data.fetch_batch_bars(self.tickers)
+        # Single batch API call
+        log.info(
+            f"[{datetime.now(ET).strftime('%H:%M:%S')}] "
+            f"Fetching bars for {len(self.tickers)} tickers …"
+        )
+        new_bars, new_rvol = self._data.fetch_batch_bars(self.tickers)
 
-            # V8: Merge new data into existing cache (don't replace).
-            # If API returns partial data (71/185), tickers from previous cycle
-            # keep their bars instead of disappearing. Evict entries >5 min old.
-            if not hasattr(self, '_bars_cache_times'):
-                self._bars_cache_times = {}
-            now_mono = time.monotonic()
-            self._bars_cache.update(new_bars)
-            self._rvol_cache.update(new_rvol)
-            self._bars_cache_times.update({t: now_mono for t in new_bars})
-            # Evict stale entries (>5 min since last refresh)
-            stale_tickers = [t for t, ts in self._bars_cache_times.items()
-                             if now_mono - ts > 300]
-            for t in stale_tickers:
-                self._bars_cache.pop(t, None)
-                self._bars_cache_times.pop(t, None)
+        # V8: Merge new data into existing cache (don't replace).
+        if not hasattr(self, '_bars_cache_times'):
+            self._bars_cache_times = {}
+        now_mono = time.monotonic()
+        self._bars_cache.update(new_bars)
+        self._rvol_cache.update(new_rvol)
+        self._bars_cache_times.update({t: now_mono for t in new_bars})
+        # Evict stale entries (>5 min since last refresh)
+        stale_tickers = [t for t, ts in self._bars_cache_times.items()
+                         if now_mono - ts > 300]
+        for t in stale_tickers:
+            self._bars_cache.pop(t, None)
+            self._bars_cache_times.pop(t, None)
 
-            # V8: Alert if data coverage drops below 90%
-            if self.tickers:
-                coverage = len(new_bars) / len(self.tickers)
-                if coverage < 0.90:
-                    log.warning(
-                        "[DataQuality] Only %.0f%% tickers fetched (%d/%d) — data incomplete",
-                        coverage * 100, len(new_bars), len(self.tickers))
+        # V8: Alert if data coverage drops below 90%
+        if self.tickers:
+            coverage = len(new_bars) / len(self.tickers)
+            if coverage < 0.90:
+                log.warning(
+                    "[DataQuality] Only %.0f%% tickers fetched (%d/%d) — data incomplete",
+                    coverage * 100, len(new_bars), len(self.tickers))
 
-            # V8: Tiered scanning — classify tickers before emit_batch
-            scan_tickers = self._ticker_scanner.classify(self.tickers, self._bars_cache)
+        # V8: Tiered scanning — classify tickers before emit_batch
+        scan_tickers = self._ticker_scanner.classify(self.tickers, self._bars_cache)
 
-            # Emit BAR events for all tickers.
-            # emit_batch() acquires each lock once for the whole batch (issue 4),
-            # vs emit() which would acquire locks N times.
-            now   = datetime.now(ET)
-            today = now.date()
-            bar_events = []
-            for ticker in scan_tickers:
-                ev = self._build_bar_event(ticker, today)
-                if ev is not None:
-                    bar_events.append(ev)
-            if bar_events:
+        # Emit BAR events for all tickers.
+        now   = datetime.now(ET)
+        today = now.date()
+        bar_events = []
+        for ticker in scan_tickers:
+            ev = self._build_bar_event(ticker, today)
+            if ev is not None:
+                bar_events.append(ev)
+        if bar_events:
+            try:
+                self._bus.emit_batch(bar_events)
+            except Exception as e:
+                log.error(f"emit_batch(BAR) failed: {e}")
+
+        # Tick heartbeat
+        self._heartbeat.tick()
+
+        # V8: Pop periodic scans + ticker conviction ranking + live reconciliation
+        if not hasattr(self, '_last_pop_scan'):
+            self._last_pop_scan = 0.0
+            self._last_headline_check = 0.0
+            self._last_ranking = 0.0
+            self._last_live_reconcile = 0.0
+        now_mono = time.monotonic()
+        if now_mono - self._last_pop_scan > 600:
+            self._last_pop_scan = now_mono
+            self._refresh_pop_tickers()
+        if now_mono - self._last_headline_check > 120:
+            self._last_headline_check = now_mono
+            self._quick_headline_check()
+        if now_mono - self._last_ranking > 600:
+            self._last_ranking = now_mono
+            self._rank_tickers()
+
+        # V8: Live position reconciliation every 10 min
+        if now_mono - self._last_live_reconcile > 600:
+            self._last_live_reconcile = now_mono
+            try:
+                self._live_reconcile()
+            except Exception as exc:
+                log.warning("[live-reconcile] failed: %s", exc)
+
+        # V9: Hourly equity tracking + P&L drift detection
+        if hasattr(self, '_equity_tracker') and self._equity_tracker:
+            if now_mono - getattr(self, '_last_equity_check', 0) > 3600:
+                self._last_equity_check = now_mono
                 try:
-                    self._bus.emit_batch(bar_events)
-                except Exception as e:
-                    log.error(f"emit_batch(BAR) failed: {e}")
-
-            # Tick heartbeat (emits at most once per 60 s)
-            self._heartbeat.tick()
-
-            # V8: Pop periodic scans + ticker conviction ranking + live reconciliation
-            if not hasattr(self, '_last_pop_scan'):
-                self._last_pop_scan = 0.0
-                self._last_headline_check = 0.0
-                self._last_ranking = 0.0
-                self._last_live_reconcile = 0.0
-            now_mono = time.monotonic()
-            # Full scan every 10 min (reads alt_data_cache.json)
-            if now_mono - self._last_pop_scan > 600:
-                self._last_pop_scan = now_mono
-                self._refresh_pop_tickers()
-            # Quick headline check every 2 min
-            if now_mono - self._last_headline_check > 120:
-                self._last_headline_check = now_mono
-                self._quick_headline_check()
-            # V8: Ticker conviction ranking every 10 min
-            # Ranks ALL tickers by institutional-grade signals, logs top picks
-            if now_mono - self._last_ranking > 600:
-                self._last_ranking = now_mono
-                self._rank_tickers()
-
-            # V8: Live position reconciliation every 10 min
-            # Detects drift between bot_state and broker reality:
-            #  - Phantom positions (in state but not at broker → remove)
-            #  - Orphaned positions (at broker but not in state → import)
-            #  - Qty mismatches (state qty != broker qty → fix)
-            if now_mono - self._last_live_reconcile > 600:
-                self._last_live_reconcile = now_mono
-                try:
-                    self._live_reconcile()
+                    self._equity_tracker.check_drift()
                 except Exception as exc:
-                    log.warning("[live-reconcile] failed: %s", exc)
+                    log.warning("[equity] drift check failed: %s", exc)
 
-            # V9: Hourly equity tracking + P&L drift detection
-            if hasattr(self, '_equity_tracker') and self._equity_tracker:
-                if now_mono - getattr(self, '_last_equity_check', 0) > 3600:
-                    self._last_equity_check = now_mono
-                    try:
-                        self._equity_tracker.check_drift()
-                    except Exception as exc:
-                        log.warning("[equity] drift check failed: %s", exc)
+        # V9 (R3): Stale order cleanup
+        if now_mono - getattr(self, '_last_order_cleanup', 0) > 300:
+            self._last_order_cleanup = now_mono
+            try:
+                self._cleanup_stale_open_orders()
+            except Exception as exc:
+                log.debug("[order-cleanup] failed: %s", exc)
 
-            # V9 (R3): Stale order cleanup — cancel orphaned orders >60s old
-            if now_mono - getattr(self, '_last_order_cleanup', 0) > 300:
-                self._last_order_cleanup = now_mono
-                try:
-                    self._cleanup_stale_open_orders()
-                except Exception as exc:
-                    log.debug("[order-cleanup] failed: %s", exc)
+        # Periodic state persist
+        if self.positions:
+            try:
+                from .state import save_state
+                pos_snapshot = dict(self.positions)
+                reclaimed_snapshot = set(self._reclaimed_today)
+                trade_snapshot = list(self.trade_log)
+                save_state(pos_snapshot, reclaimed_snapshot, trade_snapshot)
+            except Exception:
+                pass
 
-            # V7.2: Periodic state persist every loop cycle.
-            # PositionManager persists on every mutation, but if Core gets
-            # SIGKILL'd between mutations the state file goes stale. This
-            # ensures state is at most ~60s old when a force-kill hits.
-            # Snapshot the dict to avoid RuntimeError if PositionManager
-            # mutates it concurrently in an EventBus handler thread.
-            if self.positions:
-                try:
-                    from .state import save_state
-                    pos_snapshot = dict(self.positions)
-                    reclaimed_snapshot = set(self._reclaimed_today)
-                    trade_snapshot = list(self.trade_log)
-                    save_state(pos_snapshot, reclaimed_snapshot, trade_snapshot)
-                except Exception:
-                    pass  # best-effort; PositionManager is the primary writer
+        # Sleep until next cycle — V9: dual-frequency for HOT tickers
+        now = datetime.now(ET)
+        market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now < market_open_time:
+            wait = max(10, (market_open_time - now).total_seconds() - 30)
+            log.info(f"Pre-market: sleeping {wait / 60:.1f} min until near open.")
+            time.sleep(wait)
+        else:
+            _hot_interval = 12
+            _slow_remaining = 60
+            while _slow_remaining > 0 and self.running:
+                time.sleep(_hot_interval)
+                _slow_remaining -= _hot_interval
 
-            # Sleep until next cycle — V9: dual-frequency for HOT tickers
-            now = datetime.now(ET)
-            market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
-            if now < market_open_time:
-                wait = max(10, (market_open_time - now).total_seconds() - 30)
-                log.info(f"Pre-market: sleeping {wait / 60:.1f} min until near open.")
-                time.sleep(wait)
-            else:
-                # V9: Fast-poll HOT tickers (open positions) every 12s while
-                # counting down to the next full scan. If streaming is active,
-                # skip fast-poll (streaming handles exit monitoring faster).
-                _hot_interval = 12
-                _slow_remaining = 60
-                while _slow_remaining > 0 and self.running:
-                    time.sleep(_hot_interval)
-                    _slow_remaining -= _hot_interval
+                _stream_active = getattr(self, '_stream_active', False)
+                if not _stream_active:
+                    hot_tickers = list(self.positions.keys())
+                    if hot_tickers:
+                        try:
+                            hot_bars, hot_rvol = self._data.fetch_batch_bars(hot_tickers)
+                            self._bars_cache.update(hot_bars)
+                            self._rvol_cache.update(hot_rvol)
+                            today = datetime.now(ET).date()
+                            hot_events = [
+                                self._build_bar_event(t, today)
+                                for t in hot_tickers
+                            ]
+                            hot_events = [e for e in hot_events if e is not None]
+                            if hot_events:
+                                self._bus.emit_batch(hot_events)
+                                log.debug("[HOT_FETCH] %d tickers refreshed", len(hot_events))
+                        except Exception as exc:
+                            log.debug("[HOT_FETCH] failed: %s", exc)
 
-                    # Fast-poll only if no streaming AND positions are open
-                    _stream_active = getattr(self, '_stream_active', False)
-                    if not _stream_active:
-                        hot_tickers = list(self.positions.keys())
-                        if hot_tickers:
-                            try:
-                                hot_bars, hot_rvol = self._data.fetch_batch_bars(hot_tickers)
-                                self._bars_cache.update(hot_bars)
-                                self._rvol_cache.update(hot_rvol)
-                                today = datetime.now(ET).date()
-                                hot_events = [
-                                    self._build_bar_event(t, today)
-                                    for t in hot_tickers
-                                ]
-                                hot_events = [e for e in hot_events if e is not None]
-                                if hot_events:
-                                    self._bus.emit_batch(hot_events)
-                                    log.debug(
-                                        "[HOT_FETCH] %d tickers refreshed",
-                                        len(hot_events),
-                                    )
-                            except Exception as exc:
-                                log.debug("[HOT_FETCH] failed: %s", exc)
-
-                    self._heartbeat.tick()
+                self._heartbeat.tick()
 
     def _build_bar_event(self, ticker: str, today) -> Optional[Event]:
         """Slice today's bars from the cache and return a BAR Event (or None)."""

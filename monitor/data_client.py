@@ -103,8 +103,15 @@ class FailoverDataClient:
         client = self._secondary if self._using_secondary else self._primary
         try:
             bars, rvol = client.fetch_batch_bars(tickers)
-            if len(bars) < len(tickers) * 0.5:
-                raise ValueError(f"Low coverage: {len(bars)}/{len(tickers)}")
+            coverage = len(bars) / len(tickers) if tickers else 0
+            if coverage < 0.5:
+                # Pre-market or API issue — warn but don't crash
+                # Strategy engines handle empty bars gracefully (skip ticker)
+                log.warning(
+                    "[Failover] Low coverage: %d/%d tickers (%.0f%%) — "
+                    "returning partial data (pre-market or API degraded)",
+                    len(bars), len(tickers), coverage * 100,
+                )
             self._consecutive_failures = 0
             return bars, rvol
         except Exception as exc:

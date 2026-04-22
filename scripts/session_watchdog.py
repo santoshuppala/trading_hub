@@ -99,6 +99,15 @@ class HealthCheck:
         self.timestamp = datetime.now(ET)
 
 
+def _fix_path():
+    """Ensure system binaries are in PATH (supervisor may strip them)."""
+    for d in ['/bin', '/usr/bin', '/usr/local/bin', '/opt/homebrew/bin']:
+        if d not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = d + ':' + os.environ.get('PATH', '')
+
+_fix_path()
+
+
 class SessionWatchdog:
     """Autonomous trading session monitor."""
 
@@ -398,49 +407,79 @@ class SessionWatchdog:
             return HealthCheck('signal_rate', 'WARN', f'Check failed: {e}', 'WARNING')
 
     def _check_positions(self) -> HealthCheck:
-        """Check position state for anomalies."""
-        state_file = os.path.join(DATA_DIR, 'bot_state.json')
+        """Check position state for ALL engines (core + options)."""
+        core_positions = 0
+        core_trades = 0
+        core_pnl = 0.0
+        options_positions = 0
+        options_trades = 0
+        options_pnl = 0.0
+        issues = []
+
+        # ── Core state (bot_state.json) ──────────────────────────────
         try:
-            if not os.path.exists(state_file):
-                return HealthCheck('positions', 'WARN', 'No bot_state.json', 'WARNING')
+            state_file = os.path.join(DATA_DIR, 'bot_state.json')
+            if os.path.exists(state_file):
+                with open(state_file) as f:
+                    state = json.load(f)
+                positions = state.get('positions', {})
+                trade_log = state.get('trade_log', [])
+                core_positions = len(positions)
+                core_trades = len(trade_log)
+                core_pnl = sum(t.get('pnl', 0) for t in trade_log)
 
-            with open(state_file) as f:
-                state = json.load(f)
+                # Check for stuck positions
+                for ticker, pos in positions.items():
+                    opened_at = pos.get('opened_at', '')
+                    if opened_at:
+                        try:
+                            opened = datetime.fromisoformat(opened_at)
+                            age_hours = (datetime.now(ET) - opened).total_seconds() / 3600
+                            if age_hours > 3:
+                                issues.append(f'{ticker}: open {age_hours:.1f}h')
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
-            positions = state.get('positions', {})
-            trade_log = state.get('trade_log', [])
-            pos_count = len(positions)
+        # ── Options state (options_state.json) ───────────────────────
+        try:
+            opts_file = os.path.join(DATA_DIR, 'options_state.json')
+            if os.path.exists(opts_file):
+                with open(opts_file) as f:
+                    opts = json.load(f)
+                options_positions = len(opts.get('positions', {}))
+                options_trades = opts.get('daily_entries', 0)
+                options_pnl = opts.get('daily_pnl', 0.0)
+        except Exception:
+            pass
 
-            issues = []
+        # ── Kill switch check ────────────────────────────────────────
+        try:
+            ks_file = os.path.join(DATA_DIR, 'options_kill_switch.json')
+            if os.path.exists(ks_file):
+                with open(ks_file) as f:
+                    ks = json.load(f)
+                if ks.get('halted'):
+                    issues.append(f'OPTIONS HALTED (pnl=${ks.get("daily_pnl", 0):.0f})')
+        except Exception:
+            pass
 
-            # Too many positions
-            if pos_count > 20:
-                issues.append(f'HIGH position count: {pos_count}')
+        total_positions = core_positions + options_positions
+        total_pnl = core_pnl + options_pnl
 
-            # Check for stuck positions (no activity in 2+ hours)
-            for ticker, pos in positions.items():
-                opened_at = pos.get('opened_at', '')
-                if opened_at:
-                    try:
-                        opened = datetime.fromisoformat(opened_at)
-                        age_hours = (datetime.now(ET) - opened).total_seconds() / 3600
-                        if age_hours > 3:
-                            issues.append(f'{ticker}: open {age_hours:.1f}h')
-                    except Exception:
-                        pass
+        if total_positions > 20:
+            issues.append(f'HIGH position count: {total_positions}')
 
-            # Daily P&L from trade log
-            daily_pnl = sum(t.get('pnl', 0) for t in trade_log)
+        msg = (f'core: {core_positions}pos/{core_trades}trades/${core_pnl:+.2f} | '
+               f'options: {options_positions}pos/{options_trades}trades/${options_pnl:+.2f} | '
+               f'TOTAL: ${total_pnl:+.2f}')
 
-            if issues:
-                return HealthCheck('positions', 'WARN',
-                                   f'{pos_count} open, P&L=${daily_pnl:.2f} | ' + ' | '.join(issues[:3]),
-                                   'WARNING')
+        if issues:
+            return HealthCheck('positions', 'WARN', f'{msg} | {" | ".join(issues[:3])}', 'WARNING')
 
-            return HealthCheck('positions', 'OK',
-                               f'{pos_count} open, {len(trade_log)} closed, P&L=${daily_pnl:.2f}')
-        except Exception as e:
-            return HealthCheck('positions', 'WARN', f'Check failed: {e}', 'WARNING')
+        return HealthCheck('positions', 'OK', msg)
+
 
     def _check_kill_switch(self) -> HealthCheck:
         """Check if any kill switch has been triggered."""
@@ -1027,11 +1066,16 @@ class SessionWatchdog:
         warn_count = sum(1 for r in results if r.status == 'WARN')
         crit_count = sum(1 for r in results if r.status == 'CRITICAL')
 
-        # Read current P&L and positions
-        pnl = 0.0
-        open_positions = 0
-        closed_trades = 0
+        # Read current P&L and positions from ALL engines
+        core_pnl = 0.0
+        core_open = 0
+        core_trades = 0
+        options_pnl = 0.0
+        options_open = 0
+        options_trades = 0
         position_list = []
+
+        # Core (bot_state.json)
         try:
             state_file = os.path.join(DATA_DIR, 'bot_state.json')
             if os.path.exists(state_file):
@@ -1039,15 +1083,33 @@ class SessionWatchdog:
                     state = json.load(f)
                 positions = state.get('positions', {})
                 trade_log = state.get('trade_log', [])
-                pnl = sum(t.get('pnl', 0) for t in trade_log)
-                open_positions = len(positions)
-                closed_trades = len(trade_log)
+                core_pnl = sum(t.get('pnl', 0) for t in trade_log)
+                core_open = len(positions)
+                core_trades = len(trade_log)
                 for ticker, pos in positions.items():
                     entry = pos.get('entry_price', 0)
                     strategy = pos.get('strategy', '?')
-                    position_list.append(f"  {ticker}: ${entry:.2f} ({strategy})")
+                    position_list.append(f"  [CORE] {ticker}: ${entry:.2f} ({strategy})")
         except Exception:
             pass
+
+        # Options (options_state.json)
+        try:
+            opts_file = os.path.join(DATA_DIR, 'options_state.json')
+            if os.path.exists(opts_file):
+                with open(opts_file) as f:
+                    opts = json.load(f)
+                options_pnl = opts.get('daily_pnl', 0.0)
+                options_open = len(opts.get('positions', {}))
+                options_trades = opts.get('daily_entries', 0)
+                for ticker in opts.get('positions', {}):
+                    position_list.append(f"  [OPTS] {ticker}")
+        except Exception:
+            pass
+
+        pnl = core_pnl + options_pnl
+        open_positions = core_open + options_open
+        closed_trades = core_trades + options_trades
 
         # Overall status
         if crit_count > 0:
@@ -1079,10 +1141,12 @@ class SessionWatchdog:
             f"{'=' * 50}\n\n"
             f"Status: {status_text}\n"
             f"Time: {now.strftime('%Y-%m-%d %H:%M ET')}\n\n"
-            f"TRADING\n"
-            f"  Daily P&L:       ${pnl:+,.2f}\n"
+            f"TRADING SUMMARY\n"
+            f"  Total P&L:       ${pnl:+,.2f}\n"
             f"  Open positions:  {open_positions}\n"
             f"  Closed trades:   {closed_trades}\n\n"
+            f"  CORE:    {core_open} open, {core_trades} trades, P&L ${core_pnl:+,.2f}\n"
+            f"  OPTIONS: {options_open} open, {options_trades} trades, P&L ${options_pnl:+,.2f}\n\n"
         )
 
         if position_list:

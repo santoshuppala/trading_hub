@@ -150,7 +150,7 @@ class ButterflySpread(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=middle.expiry_date,
                 legs=legs,
-                net_debit=round(net_debit, 4),
+                net_debit=round(net_debit * 100, 2),  # V9: scale to per-contract $
                 max_risk=round(max_risk, 2),
                 max_reward=round(max_reward, 2),
                 reason=(

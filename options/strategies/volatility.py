@@ -110,7 +110,7 @@ class LongStraddle(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=atm_call.expiry_date,
                 legs=legs,
-                net_debit=net_debit,
+                net_debit=round(net_debit * 100, 2),  # V9: scale to per-contract $
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,
@@ -205,7 +205,7 @@ class LongStrangle(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=otm_call.expiry_date,
                 legs=legs,
-                net_debit=net_debit,
+                net_debit=round(net_debit * 100, 2),  # V9: scale to per-contract $
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-V8 Core process — VWAP + Pro strategies + Pop scanning + broker + position management.
+V9 Core process — VWAP + Pro strategies + Pop scanning + broker + position management.
 
-Pro and Pop merged into Core (V8). Options stays separate (different instruments).
+Pro and Pop merged into Core (V8→V9). Options stays separate (different instruments).
 Data Collector stays separate (independent pipeline).
 
 This is the primary process. It:
@@ -348,7 +348,7 @@ def main():
             trade_budget=float(PRO_TRADE_BUDGET),
             shared_positions=monitor.positions,  # V8: cross-engine sector counting
         )
-        log.info("V8 ProSetupEngine merged into Core | max_pos=%d budget=$%.0f",
+        log.info("V9 ProSetupEngine merged into Core | max_pos=%d budget=$%.0f",
                  PRO_MAX_POSITIONS, PRO_TRADE_BUDGET)
 
         # Seed RiskAdapter._positions from restored state
@@ -358,10 +358,10 @@ def main():
             if str(pos.get('strategy', '')).startswith('pro:'):
                 risk_adapter._positions.add(ticker)
         if risk_adapter._positions:
-            log.info("V8 RiskAdapter seeded with %d restored Pro positions: %s",
+            log.info("V9 RiskAdapter seeded with %d restored Pro positions: %s",
                      len(risk_adapter._positions), sorted(risk_adapter._positions))
     except Exception as exc:
-        log.error("V8 ProSetupEngine init failed: %s — Pro strategies disabled", exc)
+        log.error("V9 ProSetupEngine init failed: %s — Pro strategies disabled", exc)
 
     # ── IPC: Publish SIGNAL events to Redpanda for Options ────────────────
     def _on_signal_publish(event):
@@ -408,6 +408,27 @@ def main():
 
     # ── V8: Discovery ticker consumer (single, replaces Pro + Pop) ────────
     _ticker_set = set(monitor.tickers)
+
+    # V9: Restore discovered tickers from alt_data_cache (survive restart)
+    try:
+        import json as _json
+        _cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                   'data', 'alt_data_cache.json')
+        if os.path.exists(_cache_path):
+            with open(_cache_path) as _f:
+                _cached = _json.load(_f)
+            _restored = _cached.get('discovered_tickers', [])
+            _added = 0
+            for t in _restored:
+                if t and t not in _ticker_set:
+                    monitor.tickers.append(t)
+                    _ticker_set.add(t)
+                    _added += 1
+            if _added:
+                log.info("[Discovery] Restored %d discovered tickers from cache (%d total)",
+                         _added, len(monitor.tickers))
+    except Exception as exc:
+        log.warning("[Discovery] Cache restore failed (non-fatal): %s", exc)
 
     def _on_discovery(key, payload):
         ticker = payload.get('ticker', '')
@@ -458,19 +479,24 @@ def main():
     monitor.start()
 
     # ── V9 Component Status Banner ────────────────────────────────────────
+    # V9: Wait briefly for streaming WebSocket handshake before printing banner
+    if tradier_stream:
+        import time as _t
+        _t.sleep(1)
+
     _v9_status = {
         'FillLedger (shadow)':     'ON' if fill_ledger else 'OFF',
         'BrokerRegistry':          f'ON ({len(broker_registry)} brokers)' if broker_registry else 'OFF',
         'EquityTracker':           'ON' if getattr(monitor, '_equity_tracker', None) else 'OFF',
-        'Tradier Streaming':       'ON' if tradier_stream and tradier_stream.is_connected else 'OFF (REST fallback)',
+        'Tradier Streaming':       'ON' if tradier_stream and getattr(tradier_stream, 'is_connected', False) else 'OFF (REST fallback)',
         'Streaming → RiskEngine':  'ON' if getattr(getattr(monitor, '_risk', None), '_stream_client', None) else 'OFF',
         'Buying Power Background': 'ON' if getattr(portfolio_risk, '_bp_refresher', None) else 'OFF (inline)',
         'Data Failover':           'ON' if hasattr(monitor._data, '_secondary') else 'OFF',
-        'Detector Cascade (L4)':   'ON',  # always on (code change, not config)
-        'Bar Validation (R1)':     'ON',  # always on
-        'Kill Switch Persist':     'ON',  # always on
-        'Cache Format':            'JSON' if hasattr(cache_writer, '_path') and '.json' in cache_writer._path else 'Pickle',
-        'Dual-Freq Polling (L2)':  'STANDBY' if tradier_stream else 'ACTIVE (12s HOT)',
+        'Detector Cascade (L4)':   'ON',
+        'Bar Validation (R1)':     'ON',
+        'Kill Switch Persist':     'ON',
+        'Cache Format':            'ON (JSON)' if getattr(cache_writer, '_path', '').endswith('.json') else 'ON (Pickle)',
+        'Dual-Freq Polling (L2)':  'ON (STANDBY — streaming active)' if tradier_stream else 'ON (12s HOT polling)',
     }
 
     _version = 'V9' if any(v.startswith('ON') for v in _v9_status.values()) else 'V8 (legacy)'
@@ -520,7 +546,7 @@ def main():
         publisher.stop()
         if db_cleanup:
             db_cleanup()
-        log.info("V8 Core process stopped.")
+        log.info("V9 Core process stopped.")
 
 
 if __name__ == '__main__':

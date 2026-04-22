@@ -39,7 +39,9 @@ PROFIT_TARGET_DEBIT   = 0.80   # debit strategies: close at 80% of max reward (d
 PROFIT_TARGET_VOLAT   = 0.60   # volatility strategies: close at 60% of max reward
 
 # Stop losses (fraction of max_risk at which to cut)
-STOP_LOSS_FRACTION    = 0.50   # close if unrealised loss >= 50% of max_risk (was 80%, too late)
+# V9: Different thresholds for credit vs debit — credit spreads need room to breathe
+STOP_LOSS_CREDIT      = 1.00   # credit: close at 100% of max_risk (let theta work, cap at max loss)
+STOP_LOSS_DEBIT       = 0.50   # debit: close at 50% of max_risk (cut losses early)
 
 # DTE thresholds
 DTE_CLOSE_THRESHOLD   = 10    # close any position with <= 10 DTE (was 7, gamma risk)
@@ -480,11 +482,22 @@ class OptionsEngine:
 
         iv_estimate = self._estimate_iv(p.ticker, spot)
 
+        # V9: Block entries when IV is default (no real chain data yet).
+        # Default 0.25 + iv_rank 50 causes false iron butterfly selection.
+        if iv_estimate == 0.25:
+            return
+
         # Update IV tracker
         self._iv_tracker.update(p.ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(p.ticker)
 
         iv_days = self._iv_tracker.history_days(p.ticker)
+
+        # V9: Require minimum IV history before trading.
+        # With <5 days, iv_rank is heavily blended toward 50 (neutral)
+        # which falsely triggers "rich IV" strategies.
+        if iv_days < 5:
+            return
 
         strategy_type = self._selector.select_from_bar(
             atr_value=atr_value,
@@ -661,8 +674,9 @@ class OptionsEngine:
         if pos.current_pnl >= target_pnl:
             return f"profit_target (pnl=${pos.current_pnl:.2f} >= target=${target_pnl:.2f})"
 
-        # ── 4. Stop loss ──────────────────────────────────────────────
-        max_loss = pos.max_risk * STOP_LOSS_FRACTION
+        # ── 4. Stop loss (V9: credit strategies get wider stop) ─────
+        sl_fraction = STOP_LOSS_CREDIT if pos.is_credit else STOP_LOSS_DEBIT
+        max_loss = pos.max_risk * sl_fraction
         if pos.current_pnl <= -max_loss:
             return f"stop_loss (pnl=${pos.current_pnl:.2f} <= -${max_loss:.2f})"
 
@@ -852,6 +866,12 @@ class OptionsEngine:
             # Update daily stats
             self._daily_exits += 1
             self._daily_pnl += pos.current_pnl
+
+            # V9: Record win/loss for lockout tracking
+            if pos.current_pnl < 0:
+                self._risk.record_loss(ticker)
+            else:
+                self._risk.record_win(ticker)
 
             # Release from risk gate
             self._risk.release(ticker)

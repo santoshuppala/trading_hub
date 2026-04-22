@@ -816,13 +816,143 @@ class RealTimeMonitor:
             log.warning("[reconcile] Could not fetch Tradier positions: %s", e)
 
         # ── 3. Reverse reconciliation ─────────────────────────────────
-        # Remove local positions not at ANY broker
+        # Remove local positions not at ANY broker.
+        # V9: Record missing SELLs in trade_log + FillLedger so P&L is tracked.
+        # Queries ALL brokers for actual fill price — no P&L goes unrecorded.
         all_broker_tickers = alpaca_tickers | tradier_tickers
         stale = [t for t in list(self.positions.keys()) if t not in all_broker_tickers]
         for ticker in stale:
+            pos = self.positions[ticker]
+            entry_price = pos.get('entry_price', 0)
+            qty = pos.get('quantity', pos.get('qty', 0))
+            strategy = pos.get('strategy', 'unknown')
+            pos_broker = pos.get('broker', 'unknown')
+
+            # ── Get actual sell price from ALL brokers' order history ────
+            sell_price = 0
+            sell_source = 'unknown'
+
+            # Try Tradier order history
+            try:
+                import requests as _req
+                _t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '')
+                _t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+                if _t_token and _t_acct:
+                    _t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                    _t_base = 'https://sandbox.tradier.com' if _t_sandbox else 'https://api.tradier.com'
+                    _t_headers = {'Authorization': f'Bearer {_t_token}', 'Accept': 'application/json'}
+                    _resp = _req.get(f'{_t_base}/v1/accounts/{_t_acct}/orders',
+                                     headers=_t_headers, timeout=5)
+                    if _resp.status_code == 200:
+                        _orders = _resp.json().get('orders', {})
+                        if _orders and _orders != 'null':
+                            _order_list = _orders.get('order', [])
+                            if isinstance(_order_list, dict):
+                                _order_list = [_order_list]
+                            for _o in reversed(_order_list):
+                                if (_o.get('symbol') == ticker
+                                        and _o.get('side') == 'sell'
+                                        and _o.get('status') == 'filled'
+                                        and _o.get('avg_fill_price')):
+                                    sell_price = float(_o['avg_fill_price'])
+                                    sell_source = 'tradier_order_history'
+                                    break
+            except Exception as _e:
+                log.debug("[reconcile] Tradier order history check failed for %s: %s", ticker, _e)
+
+            # Try Alpaca order history
+            if sell_price == 0:
+                try:
+                    _alpaca = getattr(self, '_broker', None)
+                    if _alpaca and hasattr(_alpaca, '_client') and _alpaca._client:
+                        from alpaca.trading.requests import GetOrdersRequest
+                        from alpaca.trading.enums import QueryOrderStatus, OrderSide
+                        _orders = _alpaca._client.get_orders(
+                            filter=GetOrdersRequest(
+                                status=QueryOrderStatus.CLOSED,
+                                symbols=[ticker],
+                                limit=10,
+                            ))
+                        for _o in _orders:
+                            if (_o.side == OrderSide.SELL
+                                    and _o.filled_avg_price is not None
+                                    and float(_o.filled_qty or 0) > 0):
+                                sell_price = float(_o.filled_avg_price)
+                                sell_source = 'alpaca_order_history'
+                                break
+                except Exception as _e:
+                    log.debug("[reconcile] Alpaca order history check failed for %s: %s", ticker, _e)
+
+            # Fallback: current market price from cache
+            if sell_price == 0:
+                try:
+                    bars = self._bars_cache.get(ticker)
+                    if bars is not None and not bars.empty:
+                        sell_price = float(bars['close'].iloc[-1])
+                        sell_source = 'market_price_fallback'
+                except Exception:
+                    pass
+
+            # Last resort: entry price (break-even assumption)
+            if sell_price == 0:
+                sell_price = entry_price
+                sell_source = 'entry_price_fallback'
+
+            pnl = round((sell_price - entry_price) * qty, 2)
             log.warning(
-                "[reconcile] Removing stale position %s — not found at any broker "
-                "(may have been closed by bracket stop)", ticker)
+                "[reconcile] EXTERNAL CLOSE %s: entry=$%.2f exit=$%.2f qty=%s "
+                "pnl=$%+.2f source=%s broker=%s",
+                ticker, entry_price, sell_price, qty, pnl, sell_source, pos_broker)
+
+            # Record in trade_log
+            self.trade_log.append({
+                'ticker': ticker,
+                'entry_price': entry_price,
+                'exit_price': sell_price,
+                'quantity': qty,
+                'pnl': pnl,
+                'strategy': strategy,
+                'reason': f'external_close:{sell_source}',
+                'broker': pos_broker,
+            })
+
+            # Record SELL lot in FillLedger
+            if hasattr(self, '_fill_ledger') and self._fill_ledger:
+                try:
+                    from monitor.fill_lot import FillLot
+                    from datetime import datetime, timezone
+                    import uuid
+                    sell_lot = FillLot(
+                        lot_id=str(uuid.uuid4()),
+                        ticker=ticker,
+                        side='SELL',
+                        qty=float(qty),
+                        fill_price=sell_price,
+                        order_id=f'reconcile_{sell_source}',
+                        broker=pos_broker,
+                        strategy=strategy,
+                        reason=f'external_close:{sell_source}',
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    matches = self._fill_ledger.append(sell_lot)
+                    ledger_pnl = sum(m.realized_pnl for m in matches) if matches else 0
+                    log.info("[FillLedger] External SELL: %s %s@$%.2f → %d matches, pnl=$%.2f",
+                             ticker, qty, sell_price, len(matches), ledger_pnl)
+
+                    # Cross-check: FillLedger P&L vs trade_log P&L
+                    if abs(ledger_pnl - pnl) > 0.02:
+                        log.warning("[reconcile] P&L MISMATCH %s: trade_log=$%.2f vs ledger=$%.2f",
+                                    ticker, pnl, ledger_pnl)
+                except Exception as e:
+                    log.warning("[FillLedger] External SELL record failed for %s: %s", ticker, e)
+
+            # Alert
+            send_alert(self._alert_email,
+                       f"EXTERNAL CLOSE: {ticker} {qty} shares @ ${sell_price:.2f} "
+                       f"(entry ${entry_price:.2f}, PnL ${pnl:+.2f})\n"
+                       f"Source: {sell_source} | Broker: {pos_broker} | Strategy: {strategy}",
+                       severity='WARNING')
+
             del self.positions[ticker]
             reconciled += 1
 
@@ -1178,15 +1308,29 @@ class RealTimeMonitor:
         now   = datetime.now(ET)
         today = now.date()
         bar_events = []
+        _skipped_empty = 0
+        _skipped_nocache = 0
         for ticker in scan_tickers:
             ev = self._build_bar_event(ticker, today)
             if ev is not None:
                 bar_events.append(ev)
+            else:
+                if ticker not in self._bars_cache or self._bars_cache[ticker] is None:
+                    _skipped_nocache += 1
+                else:
+                    _skipped_empty += 1
         if bar_events:
             try:
                 self._bus.emit_batch(bar_events)
             except Exception as e:
                 log.error(f"emit_batch(BAR) failed: {e}")
+        if not bar_events and scan_tickers:
+            log.warning(
+                "[Monitor] 0 BAR events from %d scan tickers "
+                "(no_cache=%d empty_today=%d cache_size=%d)",
+                len(scan_tickers), _skipped_nocache, _skipped_empty,
+                len(self._bars_cache),
+            )
 
         # Tick heartbeat
         self._heartbeat.tick()

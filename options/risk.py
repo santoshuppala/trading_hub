@@ -52,6 +52,11 @@ class OptionsRiskGate:
         self._daily_trade_count: int            = 0
         # Track tickers with pending execution (prevent TOCTOU race)
         self._pending_tickers: set              = set()
+        # V9: Loss lockout — prevent re-entering losing tickers
+        self._loss_lockout:    Dict[str, float] = {}  # ticker → lockout_until (monotonic)
+        self._loss_count:      Dict[str, int]   = {}  # ticker → consecutive losses today
+        self._LOSS_LOCKOUT_SECONDS = 3600       # 60 min lockout after a loss
+        self._MAX_CONSECUTIVE_LOSSES = 2        # 2 losses → blocked for rest of session
 
     def check(
         self,
@@ -72,6 +77,15 @@ class OptionsRiskGate:
 
             if not skip_pending and ticker in self._pending_tickers:
                 return f"execution already pending for {ticker}"
+
+            # V9: Loss lockout — don't re-enter losing tickers
+            consec = self._loss_count.get(ticker, 0)
+            if consec >= self._MAX_CONSECUTIVE_LOSSES:
+                return f"loss lockout: {ticker} lost {consec}x consecutively — blocked for session"
+            lockout_until = self._loss_lockout.get(ticker, 0)
+            if time.monotonic() < lockout_until:
+                remaining = lockout_until - time.monotonic()
+                return f"loss lockout: {ticker} — {remaining/60:.0f}min remaining"
 
             if len(self._open_positions) >= self._max_positions:
                 return f"max positions ({self._max_positions}) reached"
@@ -145,6 +159,27 @@ class OptionsRiskGate:
                 ticker, risk_amount,
                 self._deployed_capital, self._total_budget,
             )
+
+    def record_loss(self, ticker: str) -> None:
+        """Record a losing trade — triggers lockout."""
+        with self._lock:
+            self._loss_count[ticker] = self._loss_count.get(ticker, 0) + 1
+            self._loss_lockout[ticker] = time.monotonic() + self._LOSS_LOCKOUT_SECONDS
+            consec = self._loss_count[ticker]
+            if consec >= self._MAX_CONSECUTIVE_LOSSES:
+                log.warning(
+                    "[OptionsRiskGate] %s BLOCKED for session (%d consecutive losses)",
+                    ticker, consec)
+            else:
+                log.info(
+                    "[OptionsRiskGate] %s loss lockout: %d consecutive, locked for %dmin",
+                    ticker, consec, self._LOSS_LOCKOUT_SECONDS // 60)
+
+    def record_win(self, ticker: str) -> None:
+        """Record a winning trade — resets consecutive loss counter."""
+        with self._lock:
+            self._loss_count.pop(ticker, None)
+            self._loss_lockout.pop(ticker, None)
 
     @property
     def available_capital(self) -> float:

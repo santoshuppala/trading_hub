@@ -115,7 +115,7 @@ class BullCallSpread(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=str(long_leg.expiry_date),
                 legs=legs,
-                net_debit=net_debit,
+                net_debit=round(net_debit * 100, 2),  # V9: scale to per-contract $
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,
@@ -203,7 +203,7 @@ class BearPutSpread(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=str(long_leg.expiry_date),
                 legs=legs,
-                net_debit=net_debit,
+                net_debit=round(net_debit * 100, 2),  # V9: scale to per-contract $
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,
@@ -294,7 +294,7 @@ class BullPutSpread(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=str(short_leg.expiry_date),
                 legs=legs,
-                net_debit=net_debit_value,
+                net_debit=round(net_debit_value * 100, 2),  # V9: scale to per-contract $
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,
@@ -384,7 +384,7 @@ class BearCallSpread(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=str(short_leg.expiry_date),
                 legs=legs,
-                net_debit=net_debit_value,
+                net_debit=round(net_debit_value * 100, 2),  # V9: scale to per-contract $
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,

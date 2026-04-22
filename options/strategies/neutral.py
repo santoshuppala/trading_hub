@@ -189,8 +189,9 @@ class IronCondor(BaseOptionsStrategy):
             call_spread_width = abs(long_call.strike - short_call.strike)
             max_spread_width = max(call_spread_width, put_spread_width)
 
-            max_reward = round(net_credit * 100, 2)
+            max_reward = round(net_credit * 100, 2)      # per-contract dollars
             max_risk = round(max_spread_width * 100 - max_reward, 2)
+            net_debit_scaled = round(-net_credit * 100, 2)  # V9: scale to match close_value
 
             if max_risk <= 0:
                 log.debug("IronCondor: non-positive max_risk for %s", ticker)
@@ -239,7 +240,7 @@ class IronCondor(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=short_put.expiry_date,
                 legs=legs,
-                net_debit=-net_credit,  # negative = credit received
+                net_debit=net_debit_scaled,  # V9: scaled by 100 to match close_value
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,
@@ -342,8 +343,9 @@ class IronButterfly(BaseOptionsStrategy):
             put_wing_width = abs(atm_put.strike - wing_put.strike)
             wing_width = max(call_wing_width, put_wing_width)
 
-            max_reward = round(net_credit * 100, 2)
+            max_reward = round(net_credit * 100, 2)   # per-contract dollars
             max_risk = round(wing_width * 100 - max_reward, 2)
+            net_debit_scaled = round(-net_credit * 100, 2)  # V9: scale to match close_value
 
             if max_risk <= 0:
                 log.debug("IronButterfly: non-positive max_risk for %s", ticker)
@@ -392,7 +394,7 @@ class IronButterfly(BaseOptionsStrategy):
                 ticker=ticker,
                 expiry_date=atm_call.expiry_date,
                 legs=legs,
-                net_debit=-net_credit,  # negative = credit received
+                net_debit=net_debit_scaled,  # V9: scaled by 100 to match close_value
                 max_risk=max_risk,
                 max_reward=max_reward,
                 reason=reason,

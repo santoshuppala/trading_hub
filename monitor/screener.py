@@ -107,17 +107,20 @@ class MomentumScreener:
 
         rs_passed = self._filter_by_relative_strength(candidates)
 
+        # V9: Merge, don't replace. Keep base + current (discovered) + new RS tickers.
+        # This preserves discovered tickers across screener refreshes.
+        existing_set = set(current_tickers)
         if rs_passed:
-            added = [s for s in rs_passed if s not in current_tickers]
-            new_tickers = list(base_tickers) + rs_passed
+            added = [s for s in rs_passed if s not in existing_set]
+            new_tickers = list(current_tickers) + added
             if added:
                 log.info(
                     f"[Momentum] Added {len(added)} RS-filtered tickers: "
-                    f"{', '.join(added)}"
+                    f"{', '.join(added[:20])}"
                 )
                 log.info(f"[Momentum] Total scan list: {len(new_tickers)} tickers")
         else:
-            new_tickers = list(base_tickers)
+            new_tickers = list(current_tickers)
 
         return new_tickers, now
 

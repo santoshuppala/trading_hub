@@ -14,6 +14,7 @@ env/
 
 # --- Data & Logs (all runtime, never commit) ---
 data/
+data/*
 logs/
 backtest_results/
 *.parquet

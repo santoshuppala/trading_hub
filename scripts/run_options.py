@@ -104,23 +104,33 @@ def main():
     )
 
     def _on_remote_signal(key, payload):
-        """Receive SIGNAL from core VWAP process → inject into local bus."""
+        """Receive SIGNAL from core (VWAP or Pro) → inject into local bus."""
         from monitor.events import SignalPayload, SignalAction
         try:
             action = payload.get('action', '')
+            price = float(payload.get('current_price', 0))
+            stop = float(payload.get('stop_price', 0))
+            target = float(payload.get('target_price', 0))
+            atr = float(payload.get('atr_value', 0))
             signal_payload = SignalPayload(
                 ticker=payload['ticker'],
                 action=SignalAction(action),
-                current_price=float(payload.get('current_price', 0)),
+                current_price=price,
+                ask_price=price,                     # required field
                 rsi_value=float(payload.get('rsi_value', 50)),
                 rvol=float(payload.get('rvol', 1.0)),
-                atr_value=float(payload.get('atr_value', 0)),
-                stop_price=float(payload.get('stop_price', 0)),
-                target_price=float(payload.get('target_price', 0)),
+                atr_value=atr,
+                vwap=price,                          # required field (approximate)
+                stop_price=stop,
+                target_price=target,
+                half_target=(price + target) / 2 if target > price else price,  # required
+                reclaim_candle_low=stop,              # required field (approximate)
             )
             bus.emit(Event(type=EventType.SIGNAL, payload=signal_payload))
+            log.info("[IPC] Remote SIGNAL received: %s %s @ $%.2f (source=%s)",
+                     payload['ticker'], action, price, payload.get('source', 'core'))
         except Exception as exc:
-            log.debug("[IPC] Failed to process remote SIGNAL: %s", exc)
+            log.warning("[IPC] Failed to process remote SIGNAL: %s", exc)
 
     # V7.1: Dedup POP_SIGNAL — Pop emits on local bus AND IPC, causing duplicates
     _pop_signal_seen = {}  # {(symbol, price): monotonic_time}
@@ -160,6 +170,10 @@ def main():
                 vwap_distance=float(payload.get('vwap_distance', 0)),
                 strategy_confidence=float(payload.get('strategy_confidence', 0)),
                 features_json=payload.get('features_json', '{}'),
+                # V10: Edge context (forwarded from core via IPC)
+                timeframe=payload.get('timeframe', '1min'),
+                regime_at_entry=payload.get('regime_at_entry', ''),
+                time_bucket=payload.get('time_bucket', ''),
             )
             bus.emit(Event(type=EventType.POP_SIGNAL, payload=pop_payload))
         except Exception as exc:

@@ -67,6 +67,14 @@ class FillLot:
     init_target:    float = 0.0
     init_atr:       Optional[float] = None
 
+    # ── Edge context (V10: captured at signal time for edge model) ────
+    timeframe:        str = '1min'           # '1min' or '5min'
+    regime_at_entry:  str = ''               # 'BULL_TREND', 'RANGE_BOUND', etc.
+    time_bucket:      str = ''               # '0930_0945', '0945_1030', etc.
+    confidence:       float = 0.0            # signal confidence [0, 1]
+    confluence_score: float = 0.0            # aggregate detector agreement [0, 1]
+    tier:             int = 0                # strategy tier (1|2|3, 0=unknown)
+
     def __post_init__(self):
         if self.qty <= QTY_EPSILON:
             raise ValueError(f"FillLot qty must be > 0, got {self.qty}")
@@ -226,6 +234,13 @@ def fill_lot_to_dict(lot: FillLot) -> dict:
         'init_stop':      lot.init_stop,
         'init_target':    lot.init_target,
         'init_atr':       lot.init_atr,
+        # V10: Edge context
+        'timeframe':        lot.timeframe,
+        'regime_at_entry':  lot.regime_at_entry,
+        'time_bucket':      lot.time_bucket,
+        'confidence':       lot.confidence,
+        'confluence_score': lot.confluence_score,
+        'tier':             lot.tier,
     }
 
 
@@ -253,4 +268,11 @@ def fill_lot_from_dict(d: dict) -> FillLot:
         init_stop=float(d.get('init_stop', 0)),
         init_target=float(d.get('init_target', 0)),
         init_atr=d.get('init_atr'),
+        # V10: Edge context (defaults allow loading old data without these fields)
+        timeframe=d.get('timeframe', '1min'),
+        regime_at_entry=d.get('regime_at_entry', ''),
+        time_bucket=d.get('time_bucket', ''),
+        confidence=float(d.get('confidence', 0)),
+        confluence_score=float(d.get('confluence_score', 0)),
+        tier=int(d.get('tier', 0)),
     )

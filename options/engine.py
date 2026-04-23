@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
 
+from monitor.edge_context import categorize_regime, compute_time_bucket
 from monitor.event_bus import Event, EventBus, EventType
 from monitor.events import OptionsSignalPayload, SignalAction
 from monitor.position_registry import registry
@@ -1114,6 +1115,15 @@ class OptionsEngine:
             }
             for l in trade_spec.legs
         ]
+        # V10: Capture edge context at signal time
+        _regime_str = ''
+        try:
+            from data_sources.market_regime import regime as _regime
+            from data_sources.alt_data_reader import alt_data as _alt
+            _regime_str = categorize_regime(_regime.score(), _alt.vix())
+        except Exception:
+            pass
+
         payload = OptionsSignalPayload(
             ticker=ticker,
             strategy_type=strategy_type,
@@ -1127,6 +1137,9 @@ class OptionsEngine:
             rsi_value=rsi_value,
             legs_json=json.dumps(legs_list),
             source=source,
+            timeframe='1min',
+            regime_at_entry=_regime_str,
+            time_bucket=compute_time_bucket(),
         )
         self._bus.emit(Event(EventType.OPTIONS_SIGNAL, payload), durable=True)
         log.info(

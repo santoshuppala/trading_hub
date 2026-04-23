@@ -60,15 +60,26 @@ class CacheWriter:
 
     def write(self, bars_cache: dict, rvol_cache: dict) -> None:
         """Atomically write bars and rvol data as JSON with exclusive lock + checksum."""
+        # Snapshot dict keys first to avoid RuntimeError: dictionary changed
+        # size during iteration. Bar-fetching threads may add/remove tickers
+        # concurrently while we iterate.
         bars_data = {}
-        for ticker, df in bars_cache.items():
-            if df is not None and not df.empty:
-                bars_data[ticker] = df.to_dict('list')
+        for ticker in list(bars_cache):
+            try:
+                df = bars_cache.get(ticker)
+                if df is not None and not df.empty:
+                    bars_data[ticker] = df.to_dict('list')
+            except (RuntimeError, KeyError):
+                continue  # ticker removed mid-iteration
 
         rvol_data = {}
-        for ticker, df in rvol_cache.items():
-            if df is not None and not df.empty:
-                rvol_data[ticker] = df.to_dict('list')
+        for ticker in list(rvol_cache):
+            try:
+                df = rvol_cache.get(ticker)
+                if df is not None and not df.empty:
+                    rvol_data[ticker] = df.to_dict('list')
+            except (RuntimeError, KeyError):
+                continue
 
         self._version += 1
         cache = {

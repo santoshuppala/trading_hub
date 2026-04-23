@@ -243,13 +243,16 @@ def main():
         log.warning("BrokerRegistry init failed (non-fatal): %s", exc)
 
     # ── V9: EquityTracker (hourly P&L drift detection) ───────────────────
+    # NOTE: Do NOT call set_baseline() here — Tradier broker hasn't been
+    # registered yet (happens at SmartRouter init below). Baseline is set
+    # lazily on first check_drift() call, which runs after all brokers
+    # are registered. This ensures both Alpaca AND Tradier equity are tracked.
     try:
-        if broker_registry and len(broker_registry) > 0:
+        if broker_registry:
             from monitor.equity_tracker import EquityTracker
             pnl_fn = lambda: sum(t.get('pnl', 0) for t in monitor.trade_log)
             equity_tracker = EquityTracker(broker_registry, pnl_fn=pnl_fn,
                                             alert_email=ALERT_EMAIL)
-            equity_tracker.set_baseline()
             monitor.set_equity_tracker(equity_tracker)
     except Exception as exc:
         log.warning("EquityTracker init failed (non-fatal): %s", exc)
@@ -396,6 +399,10 @@ def main():
                 'strategy_confidence': float(getattr(p, 'strategy_confidence', 0)),
                 'features_json': getattr(p, 'features_json', '{}'),
                 'source': 'core',
+                # V10: Edge context
+                'timeframe': getattr(p, 'timeframe', '1min'),
+                'regime_at_entry': getattr(p, 'regime_at_entry', ''),
+                'time_bucket': getattr(p, 'time_bucket', ''),
             })
         except Exception as exc:
             log.debug("[IPC] POP_SIGNAL publish failed: %s", exc)
@@ -405,6 +412,31 @@ def main():
         monitor._bus.subscribe(EventType.POP_SIGNAL, _on_pop_signal_publish, priority=10)
     except Exception:
         pass  # POP_SIGNAL event type may not exist
+
+    # V10: Forward PRO_STRATEGY_SIGNAL to Redpanda for Options.
+    # Previously only SIGNAL (VWAP) and POP_SIGNAL were forwarded —
+    # Options never received the 40+ daily pro signals.
+    def _on_pro_signal_publish(event):
+        try:
+            p = event.payload
+            publisher.publish(TOPIC_SIGNALS, p.ticker, {
+                'ticker': p.ticker,
+                'action': 'BUY',
+                'current_price': float(p.entry_price),
+                'rsi_value': float(p.rsi_value),
+                'rvol': float(p.rvol),
+                'atr_value': float(p.atr_value),
+                'stop_price': float(p.stop_price),
+                'target_price': float(p.target_2),
+                'source': f'pro:{p.strategy_name}',
+            })
+        except Exception as exc:
+            log.debug("[IPC] PRO_STRATEGY_SIGNAL publish failed: %s", exc)
+
+    try:
+        monitor._bus.subscribe(EventType.PRO_STRATEGY_SIGNAL, _on_pro_signal_publish, priority=10)
+    except Exception:
+        pass
 
     # ── V8: Discovery ticker consumer (single, replaces Pro + Pop) ────────
     _ticker_set = set(monitor.tickers)
@@ -528,7 +560,10 @@ def main():
 
             # Update shared cache (Options reads from this)
             if hasattr(monitor, '_bars_cache') and monitor._bars_cache:
-                cache_writer.write(monitor._bars_cache, monitor._rvol_cache or {})
+                try:
+                    cache_writer.write(monitor._bars_cache, monitor._rvol_cache or {})
+                except RuntimeError:
+                    pass  # dict changed size during iteration — retry next cycle
 
             time.sleep(10)
     except KeyboardInterrupt:

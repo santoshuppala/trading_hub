@@ -328,6 +328,11 @@ class EventSourcingSubscriber:
                 'event_id': _to_uuid(event.event_id),
                 'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
                 'ingested_at': _NOW(),
+                # V10: Edge context
+                'timeframe': getattr(p, 'timeframe', '1min'),
+                'regime_at_entry': getattr(p, 'regime_at_entry', ''),
+                'time_bucket': getattr(p, 'time_bucket', ''),
+                'confluence_score': _safe_float(getattr(p, 'confluence_score', 0)) or 0,
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_signal error: %s", exc)
@@ -638,6 +643,10 @@ class EventSourcingSubscriber:
                 'event_id':              _to_uuid(event.event_id),
                 'correlation_id':        _to_uuid(getattr(event, 'correlation_id', None)),
                 'ingested_at':           _NOW(),
+                # V10: Edge context
+                'timeframe':             getattr(p, 'timeframe', '1min'),
+                'regime_at_entry':       getattr(p, 'regime_at_entry', ''),
+                'time_bucket':           getattr(p, 'time_bucket', ''),
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_pop_signal error: %s", exc)
@@ -699,6 +708,11 @@ class EventSourcingSubscriber:
                 'event_id':          _to_uuid(event.event_id),
                 'correlation_id':    _to_uuid(getattr(event, 'correlation_id', None)),
                 'ingested_at':       _NOW(),
+                # V10: Edge context
+                'timeframe':         getattr(p, 'timeframe', '1min'),
+                'regime_at_entry':   getattr(p, 'regime_at_entry', ''),
+                'time_bucket':       getattr(p, 'time_bucket', ''),
+                'confluence_score':  _safe_float(getattr(p, 'confluence_score', 0)) or 0,
             })
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_pro_strategy_signal error: %s", exc)

@@ -75,10 +75,17 @@ class EquityTracker:
 
         current = self._registry.get_all_equity()
 
-        # Compute broker equity P&L (current - baseline)
+        # Refresh baseline if new brokers were registered after initial capture
+        for name in current:
+            if name not in self._baseline:
+                self._baseline[name] = current[name]
+                log.info("[EquityTracker] Late-registered broker '%s' added to baseline: $%s",
+                         name, f"{current[name]:,.2f}" if current[name] is not None else "N/A")
+
+        # Compute broker equity P&L (current - baseline) across ALL brokers
         broker_pnl = 0.0
         parts = []
-        for name in self._baseline:
+        for name in current:
             base_eq = self._baseline.get(name)
             curr_eq = current.get(name)
             if base_eq is not None and curr_eq is not None:

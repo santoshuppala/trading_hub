@@ -46,6 +46,7 @@ from typing import Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
 from .alerts import send_alert
+from .edge_context import SignalContextCache
 from .event_bus import Event, EventBus, EventType
 from .events import FillPayload, PositionPayload, PositionSnapshot
 from .fill_lot import FillLot, PositionMeta, QTY_EPSILON
@@ -86,9 +87,67 @@ class PositionManager:
         # appended to the ledger for parallel tracking and validation.
         self._ledger = fill_ledger
 
+        # V10: Cache edge context from signals for propagation to FillLot.
+        # SIGNAL/PRO_STRATEGY_SIGNAL carry regime, time_bucket, etc. that
+        # the broker doesn't know about. Cache by event_id so we can look
+        # up context when the FILL arrives (linked via correlation_id chain).
+        self._signal_ctx = SignalContextCache(max_size=1000)
+
         bus.subscribe(EventType.FILL, self._on_fill)
         # V8: Clean up phantom positions when SELL fails with "no position"
         bus.subscribe(EventType.ORDER_FAIL, self._on_order_fail, priority=0)
+        # V10: Cache edge context from signal events
+        bus.subscribe(EventType.SIGNAL, self._cache_signal_context, priority=99)
+        bus.subscribe(EventType.PRO_STRATEGY_SIGNAL, self._cache_pro_signal_context, priority=99)
+        # V10: Forward context through ORDER_REQ hop (SIGNAL→ORDER_REQ→FILL chain)
+        bus.subscribe(EventType.ORDER_REQ, self._forward_signal_context, priority=99)
+
+    # ── V10: Edge context caching ────────────────────────────────────────────
+
+    def _cache_signal_context(self, event: Event) -> None:
+        """Cache edge context from VWAP SIGNAL events."""
+        try:
+            p = event.payload
+            if str(getattr(p, 'action', '')).upper() not in ('BUY',):
+                return  # only cache BUY signals
+            self._signal_ctx.store(event.event_id, {
+                'timeframe':        getattr(p, 'timeframe', '1min'),
+                'regime_at_entry':  getattr(p, 'regime_at_entry', ''),
+                'time_bucket':      getattr(p, 'time_bucket', ''),
+                'confidence':       getattr(p, 'confidence', 0.0),
+                'confluence_score': getattr(p, 'confluence_score', 0.0),
+                'tier':             getattr(p, 'tier', 0),
+            })
+        except Exception:
+            pass
+
+    def _cache_pro_signal_context(self, event: Event) -> None:
+        """Cache edge context from PRO_STRATEGY_SIGNAL events."""
+        try:
+            p = event.payload
+            self._signal_ctx.store(event.event_id, {
+                'timeframe':        getattr(p, 'timeframe', '1min'),
+                'regime_at_entry':  getattr(p, 'regime_at_entry', ''),
+                'time_bucket':      getattr(p, 'time_bucket', ''),
+                'confidence':       getattr(p, 'confidence', 0.0),
+                'confluence_score': getattr(p, 'confluence_score', 0.0),
+                'tier':             getattr(p, 'tier', 0),
+            })
+        except Exception:
+            pass
+
+    def _forward_signal_context(self, event: Event) -> None:
+        """Forward cached edge context from SIGNAL→ORDER_REQ hop.
+
+        Chain: SIGNAL(eid=A) → ORDER_REQ(corr=A, eid=B) → FILL(corr=B)
+        We cached at A. Now also cache at B so FILL lookup works.
+        """
+        try:
+            ctx = self._signal_ctx.peek(event.correlation_id)
+            if ctx:
+                self._signal_ctx.store(event.event_id, ctx)
+        except Exception:
+            pass
 
     # ── Phantom cleanup ──────────────────────────────────────────────────────
 
@@ -317,6 +376,12 @@ class PositionManager:
         if self._ledger is not None:
             try:
                 import uuid as _uuid
+                # V10: Look up edge context cached from originating SIGNAL
+                _edge_ctx = self._signal_ctx.get(
+                    getattr(parent, 'correlation_id', None)
+                ) or self._signal_ctx.get(
+                    getattr(parent, 'event_id', None)
+                ) or {}
                 lot = FillLot(
                     lot_id=str(_uuid.uuid4()),
                     ticker=ticker,
@@ -334,6 +399,12 @@ class PositionManager:
                     init_stop=stop_price,
                     init_target=target_price,
                     init_atr=getattr(p, 'atr_value', None),
+                    timeframe=_edge_ctx.get('timeframe', '1min'),
+                    regime_at_entry=_edge_ctx.get('regime_at_entry', ''),
+                    time_bucket=_edge_ctx.get('time_bucket', ''),
+                    confidence=_edge_ctx.get('confidence', 0.0),
+                    confluence_score=_edge_ctx.get('confluence_score', 0.0),
+                    tier=_edge_ctx.get('tier', 0),
                 )
                 self._ledger.append(lot)
                 self._ledger.set_meta(ticker, PositionMeta(

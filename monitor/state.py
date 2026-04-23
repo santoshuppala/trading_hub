@@ -270,14 +270,25 @@ def _extract_if_valid(data: dict, source: str):
     _KNOWN_TEST_TICKERS = {
         'DUP_TEST', 'FAIL_TEST', 'SAT1', 'SAT2', 'SAT3',
         'OVER_SELL', 'DEDUP1', 'TEST_TICKER',
+        'CRASH1', 'CRASH2', 'CRASH3', 'TEST', 'TEST2',
     }
+    # Also catch any ticker with TEST/CRASH prefix that's clearly not a real symbol
     test_tickers = set(positions.keys()) & _KNOWN_TEST_TICKERS
+    for t in list(positions.keys()):
+        if t.startswith('CRASH') or t.startswith('TEST_') or t.startswith('FAKE'):
+            test_tickers.add(t)
     if test_tickers:
         log.warning(
             "Removing %d test position(s) from state: %s",
             len(test_tickers), test_tickers)
         for t in test_tickers:
             del positions[t]
+        # Also purge test trades from trade_log to prevent phantom P&L
+        before = len(trade_log)
+        trade_log = [t for t in trade_log if t.get('ticker', '') not in test_tickers]
+        removed = before - len(trade_log)
+        if removed:
+            log.warning("Removed %d test trade(s) from trade_log (phantom P&L)", removed)
 
     if saved_date == today:
         # Today's state — use it

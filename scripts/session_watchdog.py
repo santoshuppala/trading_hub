@@ -68,6 +68,8 @@ except ImportError:
 ET = ZoneInfo('America/New_York')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+# bot_state.json lives at PROJECT_ROOT (not data/) — monitor/state.py writes there
+_BOT_STATE_FILE = os.path.join(PROJECT_ROOT, 'bot_state.json')
 
 # Logging
 log_dir = os.path.join(PROJECT_ROOT, 'logs', datetime.now().strftime('%Y%m%d'))
@@ -79,7 +81,8 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s [watchdog] %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler(),
+        # StreamHandler removed: supervisor already redirects stdout to watchdog.log,
+        # so StreamHandler caused every line to appear twice in the log file.
     ],
 )
 log = logging.getLogger(__name__)
@@ -236,7 +239,7 @@ class SessionWatchdog:
         # Fallback
         try:
             result = subprocess.run(
-                ['pgrep', '-fl', 'python'], capture_output=True, text=True, timeout=5,
+                ['/usr/bin/pgrep', '-fl', 'python'], capture_output=True, text=True, timeout=5,
             )
             return result.stdout
         except Exception:
@@ -382,7 +385,7 @@ class SessionWatchdog:
                 return HealthCheck('signal_rate', 'OK', 'No log to check')
 
             result = subprocess.run(
-                ['grep', '-c', 'SIGNAL.*strategy=', core_log],
+                ['/usr/bin/grep', '-c', 'SIGNAL.*strategy=', core_log],
                 capture_output=True, text=True, timeout=10,
             )
             count = int(result.stdout.strip()) if result.returncode == 0 else 0
@@ -418,7 +421,7 @@ class SessionWatchdog:
 
         # ── Core state (bot_state.json) ──────────────────────────────
         try:
-            state_file = os.path.join(DATA_DIR, 'bot_state.json')
+            state_file = _BOT_STATE_FILE
             if os.path.exists(state_file):
                 with open(state_file) as f:
                     state = json.load(f)
@@ -481,17 +484,24 @@ class SessionWatchdog:
         return HealthCheck('positions', 'OK', msg)
 
 
+    # Known production engine prefixes for kill switch files.
+    # Prevents stale test files (test_kill_switch.json) from triggering
+    # false CRITICAL alerts in watchdog and email reports.
+    _KNOWN_KILL_SWITCH_ENGINES = {'vwap', 'pro', 'pop', 'options', 'core'}
+
     def _check_kill_switch(self) -> HealthCheck:
         """Check if any kill switch has been triggered."""
         try:
             triggered = []
             for fname in os.listdir(DATA_DIR):
                 if fname.endswith('_kill_switch.json'):
+                    engine = fname.replace('_kill_switch.json', '')
+                    if engine not in self._KNOWN_KILL_SWITCH_ENGINES:
+                        continue  # skip test/unknown kill switch files
                     fpath = os.path.join(DATA_DIR, fname)
                     with open(fpath) as f:
                         ks = json.load(f)
                     if ks.get('halted', False):
-                        engine = fname.replace('_kill_switch.json', '')
                         triggered.append(f'{engine} (since {ks.get("halted_at", "?")})')
 
             if triggered:
@@ -506,7 +516,7 @@ class SessionWatchdog:
     def _check_fill_ledger(self) -> HealthCheck:
         """Check FillLedger for P&L drift vs trade_log."""
         ledger_file = os.path.join(DATA_DIR, 'fill_ledger.json')
-        state_file = os.path.join(DATA_DIR, 'bot_state.json')
+        state_file = _BOT_STATE_FILE
 
         try:
             if not os.path.exists(ledger_file):
@@ -574,7 +584,7 @@ class SessionWatchdog:
         """Check memory usage of trading processes."""
         try:
             result = subprocess.run(
-                ['ps', 'aux'], capture_output=True, text=True, timeout=5,
+                ['/bin/ps', 'aux'], capture_output=True, text=True, timeout=5,
             )
             total_mb = 0
             for line in result.stdout.splitlines():
@@ -603,7 +613,7 @@ class SessionWatchdog:
                 return HealthCheck('gap_and_go', 'OK', 'No log to check')
 
             result = subprocess.run(
-                ['grep', '-c', 'gap_and_go', core_log],
+                ['/usr/bin/grep', '-c', 'gap_and_go', core_log],
                 capture_output=True, text=True, timeout=10,
             )
             count = int(result.stdout.strip()) if result.returncode == 0 else 0
@@ -660,7 +670,7 @@ class SessionWatchdog:
         try:
             # Check if it really died vs we just can't see it
             result = subprocess.run(
-                ['pgrep', '-f', 'supervisor.py'],
+                ['/usr/bin/pgrep', '-f', 'supervisor.py'],
                 capture_output=True, text=True, timeout=5,
             )
             if result.stdout.strip():
@@ -679,7 +689,7 @@ class SessionWatchdog:
 
             # Verify it started
             result = subprocess.run(
-                ['pgrep', '-f', 'supervisor.py'],
+                ['/usr/bin/pgrep', '-f', 'supervisor.py'],
                 capture_output=True, text=True, timeout=5,
             )
             if result.stdout.strip():
@@ -697,7 +707,7 @@ class SessionWatchdog:
         script_name = self._MANAGED_PROCESSES.get(engine, {}).get('script', f'run_{engine}.py')
         try:
             result = subprocess.run(
-                ['pgrep', '-f', script_name],
+                ['/usr/bin/pgrep', '-f', script_name],
                 capture_output=True, text=True, timeout=5,
             )
             pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
@@ -743,7 +753,7 @@ class SessionWatchdog:
         try:
             # Read last 100 lines for traceback
             result = subprocess.run(
-                ['tail', '-100', log_path],
+                ['/usr/bin/tail', '-100', log_path],
                 capture_output=True, text=True, timeout=5,
             )
             tail = result.stdout
@@ -861,7 +871,7 @@ class SessionWatchdog:
 
             try:
                 result = subprocess.run(
-                    ['tail', '-50', log_path],
+                    ['/usr/bin/tail', '-50', log_path],
                     capture_output=True, text=True, timeout=5,
                 )
                 recent = result.stdout
@@ -1066,34 +1076,92 @@ class SessionWatchdog:
         warn_count = sum(1 for r in results if r.status == 'WARN')
         crit_count = sum(1 for r in results if r.status == 'CRITICAL')
 
-        # Read current P&L and positions from ALL engines
+        # Read P&L, positions, and trades from FillLedger (source of truth)
+        # and options_state.json for options engine.
         core_pnl = 0.0
         core_open = 0
-        core_trades = 0
+        core_closed = 0
+        core_buys = 0
         options_pnl = 0.0
         options_open = 0
         options_trades = 0
-        position_list = []
+        position_lines = []
+        closed_trade_lines = []
 
-        # Core (bot_state.json)
+        # ── Core P&L: bot_state.json trade_log (same source as heartbeat) ──
+        # This is the authoritative P&L source — populated by PositionManager
+        # on every CLOSED/PARTIAL_EXIT, includes prior-day position closes.
         try:
-            state_file = os.path.join(DATA_DIR, 'bot_state.json')
+            state_file = _BOT_STATE_FILE
             if os.path.exists(state_file):
                 with open(state_file) as f:
                     state = json.load(f)
-                positions = state.get('positions', {})
                 trade_log = state.get('trade_log', [])
                 core_pnl = sum(t.get('pnl', 0) for t in trade_log)
-                core_open = len(positions)
-                core_trades = len(trade_log)
-                for ticker, pos in positions.items():
-                    entry = pos.get('entry_price', 0)
-                    strategy = pos.get('strategy', '?')
-                    position_list.append(f"  [CORE] {ticker}: ${entry:.2f} ({strategy})")
+                core_closed = len(trade_log)
         except Exception:
             pass
 
-        # Options (options_state.json)
+        # ── Core positions + trades: FillLedger (detailed view) ──────
+        try:
+            ledger_file = os.path.join(DATA_DIR, 'fill_ledger.json')
+            if os.path.exists(ledger_file):
+                with open(ledger_file) as f:
+                    ledger = json.load(f)
+                lots = ledger.get('lots', [])
+                lot_states = ledger.get('lot_states', {})
+                pos_meta = ledger.get('position_meta', {})
+
+                buy_lots = [l for l in lots if l['side'] == 'BUY']
+                sell_lots = [l for l in lots if l['side'] == 'SELL']
+                core_buys = len(buy_lots)
+
+                # Open positions: BUY lots with remaining_qty > 0
+                open_by_ticker = {}
+                for l in buy_lots:
+                    lid = l['lot_id']
+                    st = lot_states.get(lid, {})
+                    remaining = st.get('remaining_qty', l['qty'])
+                    if remaining > 0.001:
+                        t = l['ticker']
+                        if t not in open_by_ticker:
+                            open_by_ticker[t] = {'qty': 0, 'cost': 0, 'strategy': l.get('strategy', '?')}
+                        open_by_ticker[t]['qty'] += remaining
+                        open_by_ticker[t]['cost'] += remaining * l['fill_price']
+
+                core_open = len(open_by_ticker)
+                for t, info in open_by_ticker.items():
+                    avg = info['cost'] / info['qty'] if info['qty'] > 0 else 0
+                    meta = pos_meta.get(t, {})
+                    stop = meta.get('stop_price', 0)
+                    target = meta.get('target_price', 0)
+                    position_lines.append(
+                        f"  {t:6s}  {info['qty']:>6.0f} shares @ ${avg:>8.2f}  "
+                        f"stop=${stop:>8.2f}  target=${target:>8.2f}  {info['strategy']}"
+                    )
+
+                # Trade details (all buys and sells for the day)
+                for sl in sell_lots:
+                    t = sl['ticker']
+                    reason = sl.get('reason', '?')
+                    price = sl.get('fill_price', 0)
+                    qty = sl.get('qty', 0)
+                    closed_trade_lines.append(
+                        f"  {t:6s}  SELL {qty:>6.0f} @ ${price:>8.2f}  reason={reason}"
+                    )
+                for bl in buy_lots:
+                    t = bl['ticker']
+                    strategy = bl.get('strategy', '?')
+                    price = bl.get('fill_price', 0)
+                    qty = bl.get('qty', 0)
+                    closed_trade_lines.append(
+                        f"  {t:6s}  BUY  {qty:>6.0f} @ ${price:>8.2f}  {strategy}"
+                    )
+                closed_trade_lines.sort()
+        except Exception:
+            pass
+
+        # ── Options: options_state.json ──────────────────────────────
         try:
             opts_file = os.path.join(DATA_DIR, 'options_state.json')
             if os.path.exists(opts_file):
@@ -1102,14 +1170,15 @@ class SessionWatchdog:
                 options_pnl = opts.get('daily_pnl', 0.0)
                 options_open = len(opts.get('positions', {}))
                 options_trades = opts.get('daily_entries', 0)
-                for ticker in opts.get('positions', {}):
-                    position_list.append(f"  [OPTS] {ticker}")
+                for ticker, pos_data in opts.get('positions', {}).items():
+                    strategy = pos_data.get('strategy_type', '?') if isinstance(pos_data, dict) else '?'
+                    position_lines.append(f"  {ticker:6s}  [OPTIONS] {strategy}")
         except Exception:
             pass
 
         pnl = core_pnl + options_pnl
         open_positions = core_open + options_open
-        closed_trades = core_trades + options_trades
+        total_trades = core_buys + core_closed + options_trades
 
         # Overall status
         if crit_count > 0:
@@ -1134,7 +1203,7 @@ class SessionWatchdog:
         }
         time_label = labels.get(hour, f"{hour}:00")
 
-        subject = f"[{status_emoji}] {time_label} | P&L: ${pnl:+,.2f} | {open_positions} open"
+        subject = f"[{status_emoji}] {time_label} | P&L: ${pnl:+,.2f} | {open_positions} open | {total_trades} trades"
 
         body = (
             f"PERIODIC STATUS UPDATE — {time_label}\n"
@@ -1142,17 +1211,26 @@ class SessionWatchdog:
             f"Status: {status_text}\n"
             f"Time: {now.strftime('%Y-%m-%d %H:%M ET')}\n\n"
             f"TRADING SUMMARY\n"
-            f"  Total P&L:       ${pnl:+,.2f}\n"
+            f"  Realized P&L:    ${pnl:+,.2f}\n"
             f"  Open positions:  {open_positions}\n"
-            f"  Closed trades:   {closed_trades}\n\n"
-            f"  CORE:    {core_open} open, {core_trades} trades, P&L ${core_pnl:+,.2f}\n"
-            f"  OPTIONS: {options_open} open, {options_trades} trades, P&L ${options_pnl:+,.2f}\n\n"
+            f"  Entries today:   {core_buys}\n"
+            f"  Exits today:     {core_closed}\n\n"
+            f"  CORE:    {core_open} open, {core_buys} entries, {core_closed} exits, "
+            f"P&L ${core_pnl:+,.2f}\n"
+            f"  OPTIONS: {options_open} open, {options_trades} trades, "
+            f"P&L ${options_pnl:+,.2f}\n\n"
         )
 
-        if position_list:
-            body += "OPEN POSITIONS\n"
-            body += '\n'.join(position_list[:15])
+        if position_lines:
+            body += f"OPEN POSITIONS ({len(position_lines)})\n"
+            body += '\n'.join(position_lines[:20])
             body += "\n\n"
+
+        if closed_trade_lines:
+            body += f"TRADES TODAY ({len(closed_trade_lines)})\n"
+            body += '\n'.join(closed_trade_lines[:30])
+            body += "\n\n"
+
 
         body += (
             f"HEALTH\n"
@@ -1194,7 +1272,9 @@ class SessionWatchdog:
                     int(os.getenv('ALERT_EMAIL_PORT', '587')),
                     timeout=15,
                 )
+                s.ehlo()
                 s.starttls()
+                s.ehlo()
                 s.login(
                     os.getenv('ALERT_EMAIL_USER', ''),
                     os.getenv('ALERT_EMAIL_PASS', ''),
@@ -1294,7 +1374,7 @@ class SessionWatchdog:
 
         # Read final P&L
         try:
-            state_file = os.path.join(DATA_DIR, 'bot_state.json')
+            state_file = _BOT_STATE_FILE
             if os.path.exists(state_file):
                 with open(state_file) as f:
                     state = json.load(f)

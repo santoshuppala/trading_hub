@@ -21,7 +21,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-SPREAD_FACTOR = 0.0002  # 2 basis points slippage on entry
+# Slippage model — applied to entry and exit fills
+# Entry: market order at open + spread
+# Stop exit: stop orders get worse fill in fast markets
+# Target/EOD exit: limit/market at close, mild slippage
+SPREAD_FACTOR       = 0.0010  # 10 bps entry slippage (was 2 bps — unrealistic)
+STOP_SLIPPAGE       = 0.0005  # 5 bps additional slippage on stop exits
+TARGET_SLIPPAGE     = 0.0002  # 2 bps slippage on limit target exits
 
 
 class PositionSide(Enum):
@@ -42,7 +48,9 @@ class OpenPosition:
     target_1: float
     target_2: float
     qty: int
+    original_qty: int = 0  # original qty at entry (for partial exit tracking)
     fill_pending: bool = True  # True = fill on next bar's open
+    filled_this_bar: bool = False  # True = just filled, skip stop check this bar
     partial_exited: bool = False  # True = target_1 hit, 50% exited
     exit_price: Optional[float] = None  # set on close
     exit_reason: Optional[str] = None  # 'open', 'stop', 'target_1', 'target_2', 'eod'
@@ -213,6 +221,13 @@ class FillSimulator:
         Process one bar for a ticker.
         Bar object has: open, high, low, close, volume (attrs or dict access).
         is_eod: True if this is the last bar of the trading session.
+
+        Execution order (fixes look-ahead bias):
+          1. Clear filled_this_bar flag from previous bar
+          2. Fill pending entries at bar's open (mark filled_this_bar=True)
+          3. Check stops/targets for existing positions (skip filled_this_bar)
+          4. Process options positions
+          5. EOD force close
         """
         # Extract OHLC
         try:
@@ -224,12 +239,18 @@ class FillSimulator:
             log.warning(f"[FillSim] Could not extract OHLC from bar for {ticker}: {e}")
             return
 
-        # 1. Fill pending entries at next bar's open
+        # ── 0. Clear filled_this_bar from previous bar ───────────────────
+        for layer_name in ['pro', 'pop']:
+            for pos in self.open_positions[layer_name]:
+                if pos.ticker == ticker and pos.filled_this_bar:
+                    pos.filled_this_bar = False
+
+        # ── 1. Fill pending entries at bar's open ────────────────────────
         for layer_name, pending_list in [('pro', self.pending_pro), ('pop', self.pending_pop)]:
             new_pending = []
             for payload, qty in pending_list:
                 if payload.ticker == ticker:
-                    # Determine side: support both 'signal' (sync_bus) and 'direction' (live payload)
+                    # Determine side
                     is_long = True
                     if hasattr(payload, 'signal'):
                         is_long = payload.signal == 'BUY'
@@ -243,17 +264,18 @@ class FillSimulator:
                         layer=layer_name,
                         strategy_name=payload.strategy_name if hasattr(payload, 'strategy_name') else 'unknown',
                         side=PositionSide.LONG if is_long else PositionSide.SHORT,
-                        entry_bar_ts=None,  # will be set by BacktestEngine
+                        entry_bar_ts=None,
                         entry_price=fill_price,
                         stop_price=payload.stop_price,
                         target_1=payload.target_1,
                         target_2=payload.target_2,
                         qty=qty,
+                        original_qty=qty,
                         fill_pending=False,
+                        filled_this_bar=True,  # Bug 1 fix: skip stop check this bar
                     )
                     self.open_positions[layer_name].append(pos)
                     log.debug(f"[FillSim] Filled {layer_name} entry: {ticker} @ {fill_price:.2f}")
-                    # Call entry callbacks
                     for cb in self._entry_callbacks.get(layer_name, []):
                         cb(ticker)
                 else:
@@ -263,7 +285,7 @@ class FillSimulator:
             else:
                 self.pending_pop = new_pending
 
-        # 2. Fill pending options entries
+        # ── 2. Fill pending options entries ───────────────────────────────
         new_pending_options = []
         for payload in self.pending_options:
             if payload.ticker == ticker:
@@ -284,7 +306,7 @@ class FillSimulator:
                     max_risk=payload.max_risk,
                     max_reward=payload.max_reward,
                     entry_ts=None,
-                    entry_spot=c,  # underlying price at entry
+                    entry_spot=c,
                     entry_payload=payload,
                     total_dte=dte,
                 )
@@ -297,7 +319,13 @@ class FillSimulator:
                 new_pending_options.append(payload)
         self.pending_options = new_pending_options
 
-        # 3. Check stops and targets for equity positions
+        # ── 3. Check stops and targets for equity positions ──────────────
+        #
+        # Bug 1 fix: Skip positions filled this bar (no intrabar look-ahead).
+        # Bug 2 fix: Partial exit actually closes 50% and records P&L.
+        # Bug 3 fix: When stop AND target both trigger on same bar, use
+        #            price proximity to open to determine which hit first.
+        #            (closer to open = more likely to have been hit first)
         for layer_name in ['pro', 'pop']:
             positions = self.open_positions[layer_name]
             remaining = []
@@ -306,31 +334,68 @@ class FillSimulator:
                     remaining.append(pos)
                     continue
                 if pos.fill_pending or pos.exit_reason is not None:
-                    # Still pending fill or already exited
                     remaining.append(pos)
                     continue
 
-                # Check stop
-                if (pos.side == PositionSide.LONG and l <= pos.stop_price) or \
-                   (pos.side == PositionSide.SHORT and h >= pos.stop_price):
-                    # Stop hit
-                    exit_price = pos.stop_price
+                # Bug 1: Don't check stops on the bar where we just filled
+                if pos.filled_this_bar:
+                    remaining.append(pos)
+                    continue
+
+                # Determine if stop and target are hit this bar
+                if pos.side == PositionSide.LONG:
+                    stop_hit = l <= pos.stop_price
+                    t1_hit = not pos.partial_exited and h >= pos.target_1
+                    t2_hit = h >= pos.target_2
+                else:
+                    stop_hit = h >= pos.stop_price
+                    t1_hit = not pos.partial_exited and l <= pos.target_1
+                    t2_hit = l <= pos.target_2
+
+                # Bug 3: Both stop and target hit on same bar — resolve ambiguity
+                # Use distance from open: whichever level is closer to bar open
+                # was more likely reached first.
+                if stop_hit and (t1_hit or t2_hit):
+                    dist_to_stop = abs(o - pos.stop_price)
+                    dist_to_target = abs(o - (pos.target_2 if t2_hit else pos.target_1))
+                    if dist_to_stop <= dist_to_target:
+                        # Stop was closer to open — stop wins
+                        t1_hit = False
+                        t2_hit = False
+                    else:
+                        # Target was closer to open — target wins
+                        stop_hit = False
+
+                # Process stop
+                if stop_hit:
+                    # Bug 5: Stop slippage — stops get worse fills in fast markets
+                    if pos.side == PositionSide.LONG:
+                        exit_price = pos.stop_price * (1.0 - STOP_SLIPPAGE)
+                    else:
+                        exit_price = pos.stop_price * (1.0 + STOP_SLIPPAGE)
                     self._close_position(pos, exit_price, 'stop', layer_name)
                     continue
 
-                # Check target_1 (partial exit at 50%)
-                if not pos.partial_exited:
-                    if (pos.side == PositionSide.LONG and c >= pos.target_1) or \
-                       (pos.side == PositionSide.SHORT and c <= pos.target_1):
-                        # Partial exit
-                        pos.partial_exited = True
-                        log.debug(f"[FillSim] Partial exit (target_1) for {ticker}: {pos.qty//2} @ {pos.target_1}")
+                # Bug 2 fix: Partial exit ACTUALLY sells 50% and records P&L
+                if t1_hit:
+                    partial_qty = pos.qty // 2
+                    if partial_qty >= 1:
+                        if pos.side == PositionSide.LONG:
+                            exit_price = pos.target_1 * (1.0 - TARGET_SLIPPAGE)
+                        else:
+                            exit_price = pos.target_1 * (1.0 + TARGET_SLIPPAGE)
+                        # Record partial close as a trade
+                        self._close_partial(pos, partial_qty, exit_price, 'target_1', layer_name)
+                        # Move stop to breakeven after partial
+                        pos.stop_price = pos.entry_price
+                    pos.partial_exited = True
 
-                # Check target_2 (full exit)
-                if (pos.side == PositionSide.LONG and c >= pos.target_2) or \
-                   (pos.side == PositionSide.SHORT and c <= pos.target_2):
-                    # Full exit
-                    exit_price = pos.target_2
+                # Process target_2 (full exit of remaining qty)
+                if t2_hit:
+                    if pos.side == PositionSide.LONG:
+                        exit_price = pos.target_2 * (1.0 - TARGET_SLIPPAGE)
+                    else:
+                        exit_price = pos.target_2 * (1.0 + TARGET_SLIPPAGE)
                     self._close_position(pos, exit_price, 'target_2', layer_name)
                     continue
 
@@ -338,7 +403,7 @@ class FillSimulator:
 
             self.open_positions[layer_name] = remaining
 
-        # 4. Check options exits with realistic P&L model
+        # ── 4. Check options exits ───────────────────────────────────────
         options_remaining = []
         for opt_pos in self.open_positions.get('options', []):
             if opt_pos.ticker != ticker or opt_pos.exit_reason is not None:
@@ -346,26 +411,23 @@ class FillSimulator:
                 continue
 
             opt_pos.bars_held += 1
-
-            # Estimate current P&L based on underlying move + time decay
             current_pnl = self._estimate_options_pnl(opt_pos, c)
 
-            # Check profit target
+            # Profit target
             target = opt_pos.max_reward * opt_pos.profit_target_pct
             if current_pnl >= target:
                 opt_pos.pnl = current_pnl
                 self._close_options_position(opt_pos, 'profit_target')
                 continue
 
-            # Check stop loss
+            # Stop loss
             max_loss = opt_pos.max_risk * opt_pos.stop_loss_pct
             if current_pnl <= -max_loss:
                 opt_pos.pnl = current_pnl
                 self._close_options_position(opt_pos, 'stop_loss')
                 continue
 
-            # Check DTE (close at 10 DTE equivalent in bars: ~10*6.5hrs*60min = 3900 bars)
-            # Simplified: close after holding 75% of total_dte in bars (390 bars/day)
+            # DTE close
             bars_per_day = 390
             dte_remaining = opt_pos.total_dte - (opt_pos.bars_held / bars_per_day)
             if dte_remaining <= 10:
@@ -373,35 +435,78 @@ class FillSimulator:
                 self._close_options_position(opt_pos, 'dte_close')
                 continue
 
-            # EOD close on last bar (for intraday backtest)
-            if is_eod:
-                # Don't force close — options span multiple days
-                # Only close if this is the last session day
-                pass
-
             options_remaining.append(opt_pos)
         self.open_positions['options'] = options_remaining
 
-        # 5. EOD close
+        # ── 5. EOD close (Bug 4 fix: uses current qty, not original) ────
         if is_eod:
             for layer_name in ['pro', 'pop']:
                 positions = self.open_positions[layer_name]
                 remaining = []
                 for pos in positions:
                     if pos.ticker == ticker and pos.exit_reason is None:
-                        # EOD close at close price
-                        self._close_position(pos, c, 'eod', layer_name)
+                        # EOD close at bar close with mild slippage
+                        if pos.side == PositionSide.LONG:
+                            exit_price = c * (1.0 - TARGET_SLIPPAGE)
+                        else:
+                            exit_price = c * (1.0 + TARGET_SLIPPAGE)
+                        # Bug 4: _close_position uses pos.qty which is already
+                        # reduced by _close_partial — correct remaining size
+                        self._close_position(pos, exit_price, 'eod', layer_name)
                     else:
                         remaining.append(pos)
                 self.open_positions[layer_name] = remaining
 
+    def _close_partial(self, pos: OpenPosition, close_qty: int,
+                       exit_price: float, reason: str, layer: str) -> None:
+        """Close part of a position (e.g., 50% at target_1).
+
+        Records a ClosedTrade for the partial qty, reduces pos.qty for remainder.
+        Bug 2 fix: partial exits now actually record P&L and reduce position size.
+        """
+        if close_qty <= 0 or close_qty > pos.qty:
+            return
+
+        pnl = (exit_price - pos.entry_price) * close_qty if pos.side == PositionSide.LONG \
+              else (pos.entry_price - exit_price) * close_qty
+        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price if pos.side == PositionSide.LONG \
+                  else (pos.entry_price - exit_price) / pos.entry_price
+
+        trade = ClosedTrade(
+            ticker=pos.ticker,
+            layer=layer,
+            strategy_name=pos.strategy_name,
+            entry_ts=pos.entry_bar_ts,
+            exit_ts=None,
+            side=pos.side,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            qty=close_qty,
+            exit_reason=reason,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+        )
+        self.closed_trades.append(trade)
+        self.cumulative_pnl += pnl
+        self.current_equity += pnl
+        self.cash += pnl
+
+        # Reduce remaining position size
+        pos.qty -= close_qty
+
+        log.debug("[FillSim] Partial %s %s: %s %d/%d @ %.2f, pnl=$%.2f",
+                  layer, pos.ticker, reason, close_qty, pos.original_qty,
+                  exit_price, pnl)
+
     def _close_position(self, pos: OpenPosition, exit_price: float, reason: str, layer: str) -> None:
-        """Close an equity position and record the trade."""
+        """Close remaining equity position and record the trade.
+
+        Bug 4 fix: uses pos.qty (current remaining after partials), not original.
+        """
         pnl = (exit_price - pos.entry_price) * pos.qty if pos.side == PositionSide.LONG \
               else (pos.entry_price - exit_price) * pos.qty
         pnl_pct = (exit_price - pos.entry_price) / pos.entry_price if pos.side == PositionSide.LONG \
                   else (pos.entry_price - exit_price) / pos.entry_price
-        commission = 0.0  # Simplified: no commission
 
         pos.exit_price = exit_price
         pos.exit_reason = reason
@@ -411,7 +516,7 @@ class FillSimulator:
             layer=layer,
             strategy_name=pos.strategy_name,
             entry_ts=pos.entry_bar_ts,
-            exit_ts=None,  # set by BacktestEngine
+            exit_ts=None,
             side=pos.side,
             entry_price=pos.entry_price,
             exit_price=exit_price,
@@ -419,7 +524,6 @@ class FillSimulator:
             exit_reason=reason,
             pnl=pnl,
             pnl_pct=pnl_pct,
-            commission=commission,
         )
         self.closed_trades.append(trade)
         self.cumulative_pnl += pnl
@@ -428,7 +532,6 @@ class FillSimulator:
 
         log.debug(f"[FillSim] Closed {layer} {pos.ticker}: {reason} @ {exit_price:.2f}, pnl=${pnl:.2f}")
 
-        # Call close callbacks
         for cb in self._close_callbacks.get(layer, []):
             cb(pos.ticker)
 

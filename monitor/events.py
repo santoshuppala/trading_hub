@@ -327,6 +327,14 @@ class SignalPayload:
     half_target:        float
     reclaim_candle_low: float
     needs_ask_refresh:  bool = False
+    # ── Edge context (V10: captured at signal time for edge model) ─────
+    strategy:           str = 'vwap_reclaim'   # explicit strategy name
+    tier:               int = 1                # strategy tier (1=highest conviction)
+    confidence:         float = 0.0            # signal confidence [0, 1]
+    timeframe:          str = '1min'           # '1min' or '5min'
+    regime_at_entry:    str = ''               # 'BULL_TREND', 'RANGE_BOUND', etc.
+    time_bucket:        str = ''               # '0930_0945', '0945_1030', etc.
+    confluence_score:   float = 0.0            # aggregate detector agreement [0, 1]
 
     def __post_init__(self):
         _require_ticker(self.ticker)
@@ -619,6 +627,10 @@ class PopSignalPayload:
     vwap_distance:        float
     strategy_confidence:  float  # [0, 1]
     features_json:        str = '{}'   # JSON snapshot — empty dict default
+    # ── Edge context (V10: captured at signal time for edge model) ─────
+    timeframe:            str = '1min'
+    regime_at_entry:      str = ''
+    time_bucket:          str = ''
 
     def __post_init__(self):
         _require_ticker(self.symbol)
@@ -706,6 +718,11 @@ class ProStrategySignalPayload:
     vwap:             float
     confidence:       float
     detector_signals: str = '{}'   # JSON snapshot
+    # ── Edge context (V10: captured at signal time for edge model) ─────
+    timeframe:        str = '1min'           # '1min' or '5min'
+    regime_at_entry:  str = ''               # 'BULL_TREND', 'RANGE_BOUND', etc.
+    time_bucket:      str = ''               # '0930_0945', '0945_1030', etc.
+    confluence_score: float = 0.0            # aggregate detector agreement [0, 1]
 
     def __post_init__(self):
         _require_ticker(self.ticker)
@@ -808,6 +825,10 @@ class OptionsSignalPayload:
     rsi_value:        float
     legs_json:        str    # JSON list of leg dicts
     source:           str    # 'signal' | 'bar_scan'
+    # ── Edge context (V10: captured at signal time for edge model) ─────
+    timeframe:        str = '1min'           # '1min' or '5min'
+    regime_at_entry:  str = ''               # 'BULL_TREND', 'RANGE_BOUND', etc.
+    time_bucket:      str = ''               # '0930_0945', '0945_1030', etc.
 
     def __post_init__(self):
         _require_ticker(self.ticker)

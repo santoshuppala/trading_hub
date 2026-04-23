@@ -39,6 +39,9 @@ from typing import Dict, Optional
 
 import pandas as pd
 
+from monitor.edge_context import (
+    categorize_regime, compute_time_bucket, compute_confluence_score,
+)
 from monitor.event_bus import EventBus, EventType, Event
 from monitor.events import ProStrategySignalPayload
 
@@ -313,6 +316,24 @@ class ProSetupEngine:
         det_json = json.dumps(det_snap)
 
         # ── Step 8: emit PRO_STRATEGY_SIGNAL ─────────────────────────────
+        # V10: Capture edge context at signal time
+        _regime_str = ''
+        try:
+            from data_sources.market_regime import regime as _regime
+            from data_sources.alt_data_reader import alt_data as _alt
+            _regime_str = categorize_regime(_regime.score(), _alt.vix())
+        except Exception:
+            pass
+        _time_bucket = compute_time_bucket()
+        _confluence  = compute_confluence_score(det_json)
+
+        # Strategies whose primary detector uses 5-min bars
+        _5MIN_STRATEGIES = {
+            'sr_flip', 'inside_bar', 'flag_pennant', 'fib_confluence',
+            'trend_pullback',
+        }
+        _timeframe = '5min' if strategy_name in _5MIN_STRATEGIES else '1min'
+
         try:
             pro_payload = ProStrategySignalPayload(
                 ticker           = ticker,
@@ -329,6 +350,10 @@ class ProSetupEngine:
                 vwap             = round(max(vwap, 0.0001), 4),
                 confidence       = round(confidence,   4),
                 detector_signals = det_json,
+                timeframe        = _timeframe,
+                regime_at_entry  = _regime_str,
+                time_bucket      = _time_bucket,
+                confluence_score = round(_confluence, 4),
             )
         except (ValueError, TypeError) as exc:
             log.warning("[ProSetupEngine][%s][%s] payload validation failed: %s", ticker, strategy_name, exc)

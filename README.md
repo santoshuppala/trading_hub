@@ -274,6 +274,7 @@ bash start_monitor.sh
 - `docs/V9_Trading_Hub/09_WATCHDOG_AND_SELF_HEALING.md` — session watchdog, self-healing, HotfixManager
 - `docs/V9_Trading_Hub/10_BACKTESTING.md` — backtest engine, data pipeline, strategies, results
 - `docs/V9_Trading_Hub/11_EVOLUTION_AND_ROADMAP.md` — V1-V9 timeline, system metrics, future roadmap
+- `docs/V9_Trading_Hub/12_FUTURE_ENHANCEMENTS.md` — complete roadmap: profitability filter, ranking wiring, data upgrades, sector rotation, hedging
 
 ### Previous versions
 - `docs/V8_trading_hub/` — V8 architecture (reference)
@@ -307,13 +308,26 @@ V9 includes a full backtesting framework with a Tradier + DB data pipeline.
 
 ## Session Watchdog
 
-`scripts/session_watchdog.py` provides self-healing monitoring for all 4 processes (Supervisor, Core, Options, DataCollector).
+`scripts/session_watchdog.py` provides self-healing monitoring for 3 child processes under Supervisor (Core, Options, DataCollector).
 
 - **Health checks**: Process alive, zombie detection (log staleness), log error scanning, signal rate monitoring, position tracking, kill switch state, fill ledger integrity, data freshness, memory usage, gap_and_go detection.
 - **Self-healing**: Corrupt JSON restore from `.prev` backups, stale `.lock` file removal, `__pycache__` clearing, supervisor restart, zombie process kill.
 - **HotfixManager**: Auto-applies fixes for common runtime errors (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError, ZeroDivisionError) during paper trading. Creates `.bak` backups, syntax-checks before write, max 5 fixes per session, protected files list.
 - **Email updates**: 7 hourly status reports during market hours (9:30 AM - 4:00 PM ET).
 - **Resilient loop**: `_run_one_cycle()` with cycle-level try/except. Escalates after 10 consecutive errors.
+
+---
+
+## Emergency Rollback
+
+`emergency_rollback.sh` reverts the entire codebase to the V9 baseline (`v9-baseline` tag, commit `b838c04`) — the last tested, stable production run.
+
+```bash
+./emergency_rollback.sh            # Stop all processes, revert code, clear pycache
+./emergency_rollback.sh --dry-run  # Preview without changes
+```
+
+Stops all trading processes, stashes uncommitted work, checks out baseline code, clears `__pycache__`, and verifies key files. Does NOT auto-restart — run `start_monitor.sh` manually after verifying.
 
 ---
 

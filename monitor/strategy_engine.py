@@ -62,6 +62,7 @@ from zoneinfo import ZoneInfo
 
 from config import TRADE_START_TIME, FORCE_CLOSE_TIME, MIN_BARS_REQUIRED
 
+from .edge_context import categorize_regime, compute_time_bucket
 from .event_bus import Event, EventBus, EventType
 from .events import BarPayload, SignalPayload, QuotePayload
 from .signals import SignalAnalyzer
@@ -397,6 +398,16 @@ class StrategyEngine:
             f"target=${target_price:.2f} rsi={rsi_value:.1f} rvol={rvol:.1f}x"
         )
 
+        # V10: Capture edge context at signal time
+        _regime_str = ''
+        try:
+            from data_sources.market_regime import regime as _regime
+            from data_sources.alt_data_reader import alt_data as _alt
+            _regime_str = categorize_regime(_regime.score(), _alt.vix())
+        except Exception:
+            pass
+        _time_bucket = compute_time_bucket()
+
         self._bus.emit(Event(
             type=EventType.SIGNAL,
             payload=SignalPayload(
@@ -413,6 +424,11 @@ class StrategyEngine:
                 half_target=half_target,
                 reclaim_candle_low=reclaim_candle_low,
                 needs_ask_refresh=(self._data is not None),
+                strategy='vwap_reclaim',
+                tier=1,
+                timeframe='1min',
+                regime_at_entry=_regime_str,
+                time_bucket=_time_bucket,
             ),
             correlation_id=parent.event_id,
         ))

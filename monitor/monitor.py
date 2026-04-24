@@ -314,6 +314,9 @@ class RealTimeMonitor:
         # Wire into PositionManager
         if hasattr(self, '_pos_manager'):
             self._pos_manager._ledger = ledger
+        # V10: Wire into StateEngine as P&L authority
+        if hasattr(self, '_state_engine'):
+            self._state_engine.set_fill_ledger(ledger)
         log.info("[Monitor] FillLedger attached (shadow mode)")
 
     def set_broker_registry(self, registry) -> None:
@@ -367,7 +370,7 @@ class RealTimeMonitor:
                         except Exception:
                             pass
         except Exception as exc:
-            log.debug("[order-cleanup] Alpaca cleanup failed: %s", exc)
+            log.warning("[order-cleanup] Alpaca cleanup failed: %s", exc)
 
         # Tradier: cancel stale orders
         try:
@@ -399,7 +402,7 @@ class RealTimeMonitor:
                                         log.info("[order-cleanup] Cancelled stale Tradier order: %s",
                                                  oid)
         except Exception as exc:
-            log.debug("[order-cleanup] Tradier cleanup failed: %s", exc)
+            log.warning("[order-cleanup] Tradier cleanup failed: %s", exc)
 
         if cancelled:
             log.info("[order-cleanup] Cancelled %d stale orders", cancelled)
@@ -557,7 +560,7 @@ class RealTimeMonitor:
             finally:
                 conn.close()
         except Exception as exc:
-            log.debug("[reconcile] ATR lookup failed for %s: %s", ticker, exc)
+            log.warning("[reconcile] ATR lookup failed for %s: %s", ticker, exc)
             return None
 
     # ── Startup reconciliation ───────────────────────────────────────────────
@@ -754,7 +757,7 @@ class RealTimeMonitor:
                         atr_value=atr_value,
                     ))
                 except Exception as le:
-                    log.debug("[reconcile] Shadow ledger import failed for %s: %s",
+                    log.warning("[reconcile] Shadow ledger import failed for %s: %s",
                               ticker, le)
 
         # ── 1. Alpaca positions ───────────────────────────────────────
@@ -858,7 +861,7 @@ class RealTimeMonitor:
                                     sell_source = 'tradier_order_history'
                                     break
             except Exception as _e:
-                log.debug("[reconcile] Tradier order history check failed for %s: %s", ticker, _e)
+                log.warning("[reconcile] Tradier order history check failed for %s: %s", ticker, _e)
 
             # Try Alpaca order history
             if sell_price == 0:
@@ -881,7 +884,7 @@ class RealTimeMonitor:
                                 sell_source = 'alpaca_order_history'
                                 break
                 except Exception as _e:
-                    log.debug("[reconcile] Alpaca order history check failed for %s: %s", ticker, _e)
+                    log.warning("[reconcile] Alpaca order history check failed for %s: %s", ticker, _e)
 
             # Fallback: current market price from cache
             if sell_price == 0:
@@ -1145,9 +1148,62 @@ class RealTimeMonitor:
         # 1. Phantoms — in state but not at any broker
         for ticker in list(self.positions.keys()):
             if ticker not in broker_positions:
-                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. Removing.",
-                            ticker)
+                pos = self.positions[ticker]
+                entry_price = pos.get('entry_price', 0)
+                qty = pos.get('quantity', 0)
+                strategy = pos.get('strategy', 'unknown')
+                pos_broker = pos.get('_broker', 'unknown')
+
+                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
+                            "Closing (entry=$%.2f qty=%d strategy=%s)",
+                            ticker, entry_price, qty, strategy)
+
+                # V10: Record SELL lot in FillLedger (close the stale open lots)
+                if hasattr(self, '_fill_ledger') and self._fill_ledger:
+                    try:
+                        from monitor.fill_lot import FillLot
+                        import uuid
+                        sell_lot = FillLot(
+                            lot_id=str(uuid.uuid4()),
+                            ticker=ticker,
+                            side='SELL',
+                            qty=float(qty),
+                            fill_price=entry_price,  # break-even (no exit price known)
+                            timestamp=datetime.now(ET),
+                            order_id=f'live_reconcile_phantom',
+                            broker=pos_broker,
+                            strategy=strategy,
+                            reason='phantom_live_reconcile',
+                        )
+                        matches = self._fill_ledger.append(sell_lot)
+                        ledger_pnl = sum(m.realized_pnl for m in matches) if matches else 0
+                        log.info("[live-reconcile] FillLedger SELL: %s %s@$%.2f → %d matches, pnl=$%.2f",
+                                 ticker, qty, entry_price, len(matches) if matches else 0, ledger_pnl)
+                    except Exception as e:
+                        log.warning("[live-reconcile] FillLedger phantom SELL failed for %s: %s", ticker, e)
+
                 del self.positions[ticker]
+
+                # V10: Emit POSITION CLOSED so StateEngine + HeartbeatEmitter update
+                try:
+                    from .events import PositionPayload
+                    self._bus.emit(Event(
+                        type=EventType.POSITION,
+                        payload=PositionPayload(
+                            ticker=ticker,
+                            action='CLOSED',
+                            position=None,
+                            pnl=0.0,
+                            close_detail={
+                                'strategy': strategy,
+                                'broker': pos_broker,
+                                'reason': 'phantom_live_reconcile',
+                            },
+                        ),
+                    ))
+                except Exception:
+                    pass
+
                 fixes += 1
 
         # 2. Orphans — at broker but not in state
@@ -1214,6 +1270,21 @@ class RealTimeMonitor:
                 from .state import save_state
                 save_state(dict(self.positions), set(self._reclaimed_today),
                            list(self.trade_log))
+            except Exception:
+                pass
+            # V10: Alert on reconciliation fixes (phantom/orphan = potential P&L issue)
+            try:
+                from .alerts import send_alert
+                from config import ALERT_EMAIL
+                if ALERT_EMAIL:
+                    send_alert(
+                        ALERT_EMAIL,
+                        f"RECONCILIATION: {fixes} position fix(es) applied.\n"
+                        f"Local positions: {len(self.positions)}\n"
+                        f"Broker positions: {len(broker_positions)}\n"
+                        f"Check logs for details.",
+                        severity='WARNING',
+                    )
             except Exception:
                 pass
         else:
@@ -1352,17 +1423,19 @@ class RealTimeMonitor:
             self._last_ranking = now_mono
             self._rank_tickers()
 
-        # V8: Live position reconciliation every 10 min
-        if now_mono - self._last_live_reconcile > 600:
+        # V10: Live position reconciliation every 5 min (was 10 min)
+        # Reduced from 10→5 after April 22 $50 P&L drift across restarts.
+        if now_mono - self._last_live_reconcile > 300:
             self._last_live_reconcile = now_mono
             try:
                 self._live_reconcile()
             except Exception as exc:
                 log.warning("[live-reconcile] failed: %s", exc)
 
-        # V9: Hourly equity tracking + P&L drift detection
+        # V10: Equity drift check every 5 min (was 60 min)
+        # Catches P&L divergence between local tracking and broker reality.
         if hasattr(self, '_equity_tracker') and self._equity_tracker:
-            if now_mono - getattr(self, '_last_equity_check', 0) > 3600:
+            if now_mono - getattr(self, '_last_equity_check', 0) > 300:
                 self._last_equity_check = now_mono
                 try:
                     self._equity_tracker.check_drift()
@@ -1375,7 +1448,7 @@ class RealTimeMonitor:
             try:
                 self._cleanup_stale_open_orders()
             except Exception as exc:
-                log.debug("[order-cleanup] failed: %s", exc)
+                log.warning("[order-cleanup] failed: %s", exc)
 
         # Periodic state persist
         if self.positions:

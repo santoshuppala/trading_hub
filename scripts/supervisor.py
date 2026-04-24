@@ -43,7 +43,7 @@ if os.path.exists(_env_path):
             if '=' in _line:
                 _k, _v = _line.split('=', 1)
                 _v = _v.strip().strip('"').strip("'")
-                if _k.strip() and _k.strip() not in os.environ:
+                if _k.strip():  # always use project .env
                     os.environ[_k.strip()] = _v
 PYTHON = sys.executable
 SCRIPTS_DIR = os.path.join(PROJECT_ROOT, 'scripts')
@@ -143,7 +143,8 @@ def _load_engine_config() -> dict:
 
 PROCESSES = _load_engine_config()
 
-STATUS_FILE = os.path.join(PROJECT_ROOT, 'data', 'supervisor_status.json')
+from config import SUPERVISOR_STATUS_PATH
+STATUS_FILE = SUPERVISOR_STATUS_PATH
 
 
 class ProcessManager:
@@ -530,9 +531,9 @@ def _startup_cleanup():
                     pass
 
         # Validate JSON state files
-        for name in ['bot_state.json', 'position_registry.json',
-                     'position_broker_map.json', 'options_state.json']:
-            path = os.path.join(data_dir, name)
+        from config import BOT_STATE_PATH, BROKER_MAP_PATH, OPTIONS_STATE_PATH
+        for path in [BOT_STATE_PATH, BROKER_MAP_PATH, OPTIONS_STATE_PATH,
+                     os.path.join(data_dir, 'position_registry.json')]:
             if os.path.exists(path):
                 try:
                     import json as _json
@@ -541,10 +542,10 @@ def _startup_cleanup():
                     file_date = data.get('_date', '')
                     if file_date and file_date != today_str:
                         log.info("[startup] %s is from %s (not today) — "
-                                 "reconciliation will update", name, file_date)
+                                 "reconciliation will update", path, file_date)
                 except (_json.JSONDecodeError, Exception) as exc:
                     log.error("[startup] %s is CORRUPT (%s) — "
-                              "removing (will recover from backup)", name, exc)
+                              "removing (will recover from backup)", path, exc)
                     try:
                         os.unlink(path)
                     except Exception:
@@ -565,6 +566,31 @@ def _startup_cleanup():
 
 
 def main():
+    # ── V10: Exclusive lock — only one supervisor at a time ──────────
+    # Prevents duplicate supervisors from spawning duplicate child processes.
+    # Uses fcntl.flock (OS-enforced, auto-releases on crash/exit).
+    import fcntl
+    _lock_path = os.path.join(PROJECT_ROOT, '.supervisor.lock')
+    try:
+        _lock_fd = open(_lock_path, 'w')
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(str(os.getpid()))
+        _lock_fd.flush()
+    except BlockingIOError:
+        # Another supervisor holds the lock
+        try:
+            with open(_lock_path) as f:
+                existing_pid = f.read().strip()
+        except Exception:
+            existing_pid = '?'
+        log.error(
+            "Another supervisor is already running (PID %s). "
+            "Kill it first or remove %s. Exiting.", existing_pid, _lock_path)
+        sys.exit(1)
+    except Exception as exc:
+        log.warning("Supervisor lock failed (non-fatal): %s", exc)
+    # _lock_fd stays open for process lifetime — lock auto-releases on exit
+
     # Tell child processes they're running under supervisor (skip lock file)
     os.environ['SUPERVISED_MODE'] = '1'
 
@@ -574,6 +600,25 @@ def main():
 
     # V9: Clean caches and validate state before starting anything
     _startup_cleanup()
+
+    # V10: Preflight gate — verify system health before trading
+    if os.getenv('SKIP_PREFLIGHT', '').strip() == '1':
+        log.warning("PREFLIGHT SKIPPED (SKIP_PREFLIGHT=1) — emergency mode")
+    else:
+        try:
+            from scripts.preflight import run_preflight
+            pf_errors, pf_warnings = run_preflight()
+            if pf_errors:
+                log.error("PREFLIGHT FAILED — %d critical errors. NOT starting engines.", len(pf_errors))
+                send_alert(
+                    "PREFLIGHT FAILED — Trading Blocked",
+                    "Critical errors:\n" + "\n".join(f"  ✗ {e}" for e in pf_errors)
+                    + ("\n\nWarnings:\n" + "\n".join(f"  ! {w}" for w in pf_warnings) if pf_warnings else "")
+                    + "\n\nOverride: SKIP_PREFLIGHT=1 ./start_monitor.sh"
+                )
+                sys.exit(1)
+        except Exception as exc:
+            log.warning("Preflight check failed to run (non-fatal): %s", exc)
 
     log.info("Processes: %s", ', '.join(PROCESSES.keys()))
 

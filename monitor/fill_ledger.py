@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import date, datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -43,7 +44,10 @@ ET = ZoneInfo('America/New_York')
 class FillLedger:
     """Append-only fill lot ledger with FIFO matching and persistence."""
 
-    def __init__(self, state_file: str = 'data/fill_ledger.json'):
+    def __init__(self, state_file: str = None):
+        if state_file is None:
+            from config import FILL_LEDGER_PATH
+            state_file = FILL_LEDGER_PATH
         self._lots: list[FillLot] = []
         self._lot_states: dict[str, LotState] = {}          # lot_id → state
         self._matches: list[LotMatch] = []                   # accumulated matches
@@ -154,6 +158,46 @@ class FillLedger:
     # ═══════════════════════════════════════════════════════════════════
     # QUERY API
     # ═══════════════════════════════════════════════════════════════════
+
+    def close_stale_lots(self, active_tickers: set) -> int:
+        """Close open lots for tickers NOT in active_tickers.
+
+        Called after startup reconciliation to clean up lots whose positions
+        were closed at the broker while we were down (bracket stops, etc.).
+
+        Args:
+            active_tickers: set of tickers that actually have open positions
+                           (from bot_state.json, which is reconciled with broker)
+
+        Returns:
+            Number of lots closed.
+        """
+        closed = 0
+        with self._lock:
+            open_tickers = self._open_tickers_cache or self.open_tickers()
+            stale_tickers = open_tickers - active_tickers
+
+            for ticker in stale_tickers:
+                stale_lots = self._open_lots_unsafe(ticker)
+                for lot, state in stale_lots:
+                    # Close by setting remaining_qty to 0
+                    state.remaining_qty = 0
+                    closed += 1
+                    log.warning(
+                        "[FillLedger] Closed stale lot %s: %s %s@$%.2f "
+                        "(position closed at broker, lot was orphaned)",
+                        lot.lot_id[:8], ticker, lot.qty, lot.fill_price)
+
+            if closed:
+                self._open_tickers_cache = None  # invalidate cache
+                # Replay FIFO matching to recompute _matches without stale lots
+                self._matches = LotMatcher.replay_matches(self._lots, self._lot_states)
+                self._persist()
+                log.info("[FillLedger] Closed %d stale lots across %d tickers | "
+                         "daily_pnl=$%.2f after re-match",
+                         closed, len(stale_tickers), self.daily_realized_pnl())
+
+        return closed
 
     def open_lots(self, ticker: str) -> list[tuple[FillLot, LotState]]:
         """Open BUY lots with remaining_qty > 0, in FIFO (append) order."""
@@ -364,9 +408,39 @@ class FillLedger:
             if is_today or is_open_buy:
                 lots_to_persist.append(lot)
 
+        # V10: Compute daily P&L and open position summary for warm-path readers
+        # (watchdog, email). Pre-computed here so consumers don't need FIFO logic.
+        _daily_pnl = sum(m.realized_pnl for m in self._matches
+                         if m.matched_at.date() == today)
+        _open_tickers = self._open_tickers_cache or self.open_tickers()
+        _open_summary = {}
+        for ticker in _open_tickers:
+            lots = self._open_lots_unsafe(ticker)
+            total_qty = sum(s.remaining_qty for _, s in lots)
+            if total_qty > QTY_EPSILON:
+                cost = sum(lot.fill_price * s.remaining_qty for lot, s in lots)
+                avg_entry = cost / total_qty
+                strategy = lots[0][0].strategy if lots else ''
+                meta = self._position_meta.get(ticker)
+                _open_summary[ticker] = {
+                    'qty': round(total_qty, 4),
+                    'avg_entry': round(avg_entry, 4),
+                    'strategy': strategy,
+                    'stop_price': round(meta.stop_price, 4) if meta else 0,
+                    'target_price': round(meta.target_price, 4) if meta else 0,
+                }
+
         state = {
-            '_format': 'fill_ledger_v1',
+            '_format': 'fill_ledger_v2',
             '_date': today.isoformat(),
+            '_version': int(time.time()),
+            '_timestamp': datetime.now(ET).isoformat(),
+            # V10: Pre-computed for warm-path readers (watchdog, email)
+            'daily_pnl': round(_daily_pnl, 2),
+            'open_positions': _open_summary,
+            'trade_count': sum(1 for m in self._matches if m.matched_at.date() == today),
+            'total_matches': len(self._matches),
+            # Raw data for FIFO replay on restart
             'lots': [fill_lot_to_dict(l) for l in lots_to_persist],
             'lot_states': {
                 k: v.to_dict()
@@ -375,7 +449,7 @@ class FillLedger:
             'position_meta': {
                 k: v.to_dict()
                 for k, v in self._position_meta.items()
-                if k in (self._open_tickers_cache or self.open_tickers())
+                if k in _open_tickers
             },
         }
 
@@ -405,7 +479,7 @@ class FillLedger:
             return
 
         fmt = data.get('_format', '')
-        if fmt != 'fill_ledger_v1':
+        if fmt not in ('fill_ledger_v1', 'fill_ledger_v2'):
             log.warning("[FillLedger] Unknown format %r — starting empty", fmt)
             return
 

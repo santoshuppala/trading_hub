@@ -59,8 +59,13 @@ class StateEngine:
         self._lock      = threading.RLock()
         self._positions: Dict[str, dict] = {}
         self._trade_log: List[dict]      = []
+        self._fill_ledger = None  # V10: set via set_fill_ledger()
 
         bus.subscribe(EventType.POSITION, self._on_position)
+
+    def set_fill_ledger(self, ledger) -> None:
+        """V10: Attach FillLedger as P&L authority for snapshot()."""
+        self._fill_ledger = ledger
 
     def seed(self, positions: dict, trade_log: list) -> None:
         """
@@ -114,14 +119,34 @@ class StateEngine:
         """
         Return an immutable-by-convention snapshot of current portfolio state.
         Caller should treat the returned dicts/lists as read-only.
+
+        V10: P&L from FillLedger (FIFO-matched, survives restarts) when available.
+        Fallback: sum of trade_log P&L (in-memory, lost on restart).
         """
         with self._lock:
             positions    = copy.deepcopy(self._positions)
             trade_log    = copy.deepcopy(self._trade_log)
 
-        total_pnl = sum(t.get('pnl', 0.0) or 0.0 for t in trade_log)
-        n_trades  = len(trade_log)
-        n_wins    = sum(1 for t in trade_log if (t.get('pnl') or 0.0) >= 0)
+        # V10: FillLedger is P&L authority
+        if self._fill_ledger:
+            try:
+                total_pnl = self._fill_ledger.daily_realized_pnl()
+                # Use FillLedger's match count for today's trades
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+                today = datetime.now(ZoneInfo('America/New_York')).date()
+                n_trades = sum(1 for m in self._fill_ledger._matches
+                               if m.matched_at.date() == today)
+                n_wins = sum(1 for m in self._fill_ledger._matches
+                             if m.matched_at.date() == today and m.realized_pnl >= 0)
+            except Exception:
+                total_pnl = sum(t.get('pnl', 0.0) or 0.0 for t in trade_log)
+                n_trades = len(trade_log)
+                n_wins = sum(1 for t in trade_log if (t.get('pnl') or 0.0) >= 0)
+        else:
+            total_pnl = sum(t.get('pnl', 0.0) or 0.0 for t in trade_log)
+            n_trades  = len(trade_log)
+            n_wins    = sum(1 for t in trade_log if (t.get('pnl') or 0.0) >= 0)
 
         return {
             'positions':    positions,

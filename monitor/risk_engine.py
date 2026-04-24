@@ -58,6 +58,7 @@ from typing import Optional, Set, Dict
 
 from .alerts import send_alert
 from .event_bus import Event, EventBus, EventType
+from .order_wal import wal
 from .events import (
     OrderRequestPayload,
     RiskBlockPayload,
@@ -292,7 +293,12 @@ class RiskEngine:
                 f"rvol={p.rvol:.1f}x rsi={p.rsi_value:.1f} spread={spread_pct:.3%}"
             )
 
-            self._bus.emit(Event(
+            # V10: WAL INTENT — record intent before submitting order
+            _wal_cid = wal.new_client_id()
+            wal.intent(_wal_cid, ticker=ticker, side='BUY', qty=qty,
+                       price=effective_entry, reason='VWAP reclaim')
+
+            _order_event = Event(
                 type=EventType.ORDER_REQ,
                 payload=OrderRequestPayload(
                     ticker=ticker,
@@ -308,7 +314,9 @@ class RiskEngine:
                     layer='vwap',  # V7: RegistryGate acquires
                 ),
                 correlation_id=event.event_id,
-            ))
+            )
+            _order_event._wal_client_id = _wal_cid  # carry WAL ID downstream
+            self._bus.emit(_order_event)
             _approved = True
         finally:
             pass  # V7: RegistryGate handles acquire/release
@@ -340,7 +348,13 @@ class RiskEngine:
             sell_qty = qty
 
         log.info(f"[RiskEngine] SELL pass-through: {ticker} qty={sell_qty} reason={p.action}")
-        self._bus.emit(Event(
+
+        # V10: WAL INTENT for sells
+        _wal_cid = wal.new_client_id()
+        wal.intent(_wal_cid, ticker=ticker, side='SELL', qty=sell_qty,
+                   price=p.current_price, reason=str(p.action))
+
+        _order_event = Event(
             type=EventType.ORDER_REQ,
             payload=OrderRequestPayload(
                 ticker=ticker,
@@ -349,7 +363,9 @@ class RiskEngine:
                 price=p.current_price,
                 reason=p.action,
             ),
-        ))
+        )
+        _order_event._wal_client_id = _wal_cid
+        self._bus.emit(_order_event)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

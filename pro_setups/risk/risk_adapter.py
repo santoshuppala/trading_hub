@@ -29,6 +29,7 @@ from typing import Dict, Optional, Set
 
 from monitor.event_bus import EventBus, EventType, Event
 from monitor.events import OrderRequestPayload, Side, PositionAction
+from monitor.order_wal import wal
 from monitor.sector_map import get_sector, count_sector_positions
 
 log = logging.getLogger(__name__)
@@ -305,14 +306,19 @@ class RiskAdapter:
         self._last_order[ticker] = now
         self._positions.add(ticker)
 
-        self._bus.emit(
-            Event(
-                type           = EventType.ORDER_REQ,
-                payload        = payload,
-                correlation_id = source_event.event_id,
-            ),
-            durable=True,
+        # V10: WAL INTENT — record before submitting order
+        _wal_cid = wal.new_client_id()
+        wal.intent(_wal_cid, ticker=ticker, side=str(payload.side.value),
+                   qty=qty, price=entry_price,
+                   reason=f'pro:{strategy_name}:{tag}')
+
+        _order_event = Event(
+            type           = EventType.ORDER_REQ,
+            payload        = payload,
+            correlation_id = source_event.event_id,
         )
+        _order_event._wal_client_id = _wal_cid
+        self._bus.emit(_order_event, durable=True)
 
     # ── Event handlers ────────────────────────────────────────────────────────
 

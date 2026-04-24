@@ -31,8 +31,9 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
+from config import LIVE_CACHE_PATH
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_PATH = os.path.join(PROJECT_ROOT, 'data', 'live_cache.json')
+CACHE_PATH = LIVE_CACHE_PATH
 CACHE_DIR = os.path.dirname(CACHE_PATH)
 CHECKSUM_PATH = CACHE_PATH + '.sha256'
 LOCK_PATH = CACHE_PATH + '.flock'

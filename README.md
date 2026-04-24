@@ -275,6 +275,7 @@ bash start_monitor.sh
 - `docs/V9_Trading_Hub/10_BACKTESTING.md` — backtest engine, data pipeline, strategies, results
 - `docs/V9_Trading_Hub/11_EVOLUTION_AND_ROADMAP.md` — V1-V9 timeline, system metrics, future roadmap
 - `docs/V9_Trading_Hub/12_FUTURE_ENHANCEMENTS.md` — complete roadmap: profitability filter, ranking wiring, data upgrades, sector rotation, hedging
+- `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md` — 9 reliability fixes: Order WAL, continuous reconciliation, FillLedger authority, startup preflight, test isolation
 
 ### Previous versions
 - `docs/V8_trading_hub/` — V8 architecture (reference)
@@ -328,6 +329,26 @@ V9 includes a full backtesting framework with a Tradier + DB data pipeline.
 ```
 
 Stops all trading processes, stashes uncommitted work, checks out baseline code, clears `__pycache__`, and verifies key files. Does NOT auto-restart — run `start_monitor.sh` manually after verifying.
+
+---
+
+## V10 Foundation Hardening (April 22, 2026)
+
+The April 22 session exposed 20 systemic issues including $50 P&L drift, options engine blind all day, and 3 concurrent supervisors. All 9 foundation fixes implemented same-day:
+
+| Fix | What |
+|---|---|
+| **Order WAL** | Write-ahead log tracks every order INTENT→SUBMITTED→FILLED→RECORDED. Covers core + options. 0.04ms overhead. |
+| **Continuous Reconciliation** | Broker vs local comparison every 5 min (was 10/30/60). Alert on divergence. |
+| **FillLedger P&L Authority** | `daily_pnl` + `open_positions` persisted in fill_ledger.json v2. Single P&L source. |
+| **State Path Constants** | 6 paths in config.py. Zero hardcoded paths in production code. |
+| **Test Isolation** | `conftest.py` autouse fixture. Tests write to tmp_path, never production. |
+| **Supervisor Lock** | `fcntl.flock` prevents duplicate supervisors. |
+| **Startup Preflight** | 10 checks (SMTP, brokers, state, IPC, DB) before trading starts. |
+| **Error Escalation** | 19 critical `log.debug` → `log.warning`. No more silent failures. |
+| **Race Condition** | `list(dict)` snapshot prevents `dict changed size during iteration` crash. |
+
+Also fixed: 5 backtest simulator bugs, edge context data capture (4 signal paths + DB), IPC signal forwarding, email P&L/trades, watchdog health checks. See `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md`.
 
 ---
 

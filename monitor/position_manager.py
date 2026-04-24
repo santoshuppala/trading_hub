@@ -217,10 +217,10 @@ class PositionManager:
                                 )
                                 self._ledger.append(phantom_lot)
                         except Exception as le:
-                            log.debug("[PositionManager] Shadow phantom SELL failed: %s", le)
+                            log.warning("[PositionManager] Shadow phantom SELL failed: %s", le)
 
         except Exception as exc:
-            log.debug("[PositionManager] _on_order_fail error: %s", exc)
+            log.warning("[PositionManager] _on_order_fail error: %s", exc)
 
     # ── Fill Handler ─────────────────────────────────────────────────────────
 
@@ -414,6 +414,11 @@ class PositionManager:
                     atr_value=getattr(p, 'atr_value', None),
                     partial_done=False,
                 ))
+                # V10: WAL RECORDED — fill persisted to FillLedger
+                _wal_cid = getattr(parent, '_wal_client_id', '')
+                if _wal_cid:
+                    from .order_wal import wal as _wal
+                    _wal.recorded(_wal_cid, lot_id=lot.lot_id)
             except Exception as exc:
                 log.warning("[PositionManager] Shadow ledger BUY failed: %s", exc)
 
@@ -630,6 +635,15 @@ class PositionManager:
                 order_mode=getattr(p, 'order_mode', 'qty'),
             )
             matches = self._ledger.append(sell_lot)
+
+            # V10: WAL RECORDED for sell
+            _wal_cid = getattr(parent, '_wal_client_id', '')
+            if _wal_cid:
+                try:
+                    from .order_wal import wal as _wal
+                    _wal.recorded(_wal_cid, lot_id=sell_lot.lot_id)
+                except Exception:
+                    pass
 
             # Shadow validation: compare ledger P&L vs computed P&L
             if matches:

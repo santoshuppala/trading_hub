@@ -62,9 +62,22 @@ class BaseBroker(ABC):
         linking FILL back to the ORDER_REQ that triggered it.
         Enables end-to-end tracing: SIGNAL → ORDER_REQ → FILL → POSITION.
         """
+        # V10: WAL FILLED — record fill before emitting FILL event
+        _wal_cid = getattr(self, '_current_wal_cid', '')
+        if _wal_cid:
+            try:
+                from .order_wal import wal
+                wal.filled(_wal_cid,
+                           fill_price=fill_payload.fill_price,
+                           fill_qty=fill_payload.qty,
+                           broker_order_id=fill_payload.order_id)
+            except Exception:
+                pass
+
         cid = correlation_id or getattr(self, '_current_causation_id', None)
         evt = Event(EventType.FILL, fill_payload, correlation_id=cid)
         evt._routed_broker = self._broker_name
+        evt._wal_client_id = _wal_cid  # carry WAL ID to PositionManager
         self._bus.emit(evt)
 
     def _on_order_request(self, event: Event) -> None:
@@ -78,11 +91,14 @@ class BaseBroker(ABC):
         # V7 P2-2: Store ORDER_REQ event_id for causation chain.
         # _emit_fill() reads this to set correlation_id on FILL events.
         self._current_causation_id = event.event_id
+        # V10: Carry WAL client_id from ORDER_REQ event to broker
+        self._current_wal_cid = getattr(event, '_wal_client_id', '')
         if p.side == 'BUY':
             self._execute_buy(p)
         else:
             self._execute_sell(p)
         self._current_causation_id = None
+        self._current_wal_cid = ''
 
     @abstractmethod
     def _execute_buy(self, p: OrderRequestPayload) -> None: ...
@@ -219,8 +235,24 @@ class AlpacaBroker(BaseBroker):
                     f"[attempt {attempt}] BUY {order_type} {p.qty} {p.ticker} "
                     f"@ ${limit_price:.2f}{stop_info}{target_info} (order {order_id})"
                 )
+                # V10: WAL SUBMITTED — broker accepted the order
+                if self._current_wal_cid:
+                    try:
+                        from .order_wal import wal as _wal
+                        _wal.submitted(self._current_wal_cid, broker=self._broker_name,
+                                       broker_order_id=order_id, client_order_id=client_oid,
+                                       attempt=attempt)
+                    except Exception:
+                        pass
             except Exception as e:
                 send_alert(self._alert_email, f"BUY submit failed: {p.qty} {p.ticker} — {e}")
+                # V10: WAL FAILED
+                if self._current_wal_cid:
+                    try:
+                        from .order_wal import wal as _wal
+                        _wal.failed(self._current_wal_cid, reason=f'submit_failed: {e}')
+                    except Exception:
+                        pass
                 self._fail(p)
                 return
 
@@ -517,6 +549,15 @@ class AlpacaBroker(BaseBroker):
             order = self._client.submit_order(req)
             order_id = str(order.id)
 
+            # V10: WAL SUBMITTED for sell
+            if self._current_wal_cid:
+                try:
+                    from .order_wal import wal as _wal
+                    _wal.submitted(self._current_wal_cid, broker=self._broker_name,
+                                   broker_order_id=order_id, client_order_id=client_order_id)
+                except Exception:
+                    pass
+
             # Poll for ACTUAL fill — do NOT emit FILL until confirmed
             filled = False
             fill_price = p.price
@@ -638,6 +679,14 @@ class AlpacaBroker(BaseBroker):
             self._fail(p)
 
     def _fail(self, p: OrderRequestPayload) -> None:
+        # V10: WAL FAILED
+        _wal_cid = getattr(self, '_current_wal_cid', '')
+        if _wal_cid:
+            try:
+                from .order_wal import wal as _wal
+                _wal.failed(_wal_cid, reason=f'order_fail:{p.ticker}:{p.reason}')
+            except Exception:
+                pass
         self._bus.emit(Event(EventType.ORDER_FAIL, OrderFailPayload(
             ticker=p.ticker, side=p.side, qty=p.qty, price=p.price, reason=p.reason,
         )))
@@ -791,7 +840,7 @@ class AlpacaFillStream:
                     self._results[order_id] = data
                     self._pending[order_id].set()
         except Exception as exc:
-            log.debug("[AlpacaFillStream] Callback error: %s", exc)
+            log.warning("[AlpacaFillStream] Callback error: %s", exc)
 
     def wait_for_fill(self, order_id: str, timeout: float = 5.0) -> object:
         """Block until fill event arrives via WebSocket.

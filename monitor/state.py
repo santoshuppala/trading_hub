@@ -29,7 +29,8 @@ from lifecycle.safe_state import SafeStateFile
 log = logging.getLogger(__name__)
 ET = ZoneInfo('America/New_York')
 
-_STATE_FILE = os.path.join(os.path.dirname(__file__), '..', 'bot_state.json')
+from config import BOT_STATE_PATH
+_STATE_FILE = BOT_STATE_PATH
 _safe = SafeStateFile(_STATE_FILE, max_age_seconds=120.0)
 
 

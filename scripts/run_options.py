@@ -177,12 +177,54 @@ def main():
             )
             bus.emit(Event(type=EventType.POP_SIGNAL, payload=pop_payload))
         except Exception as exc:
-            log.debug("[IPC] Failed to process remote POP_SIGNAL: %s", exc)
+            log.warning("[IPC] Failed to process remote POP_SIGNAL: %s", exc)
 
     consumer.on(TOPIC_SIGNALS, _on_remote_signal)
     consumer.on(TOPIC_POP, _on_remote_pop_signal)
     consumer.start()
     log.info("IPC consumer started (SIGNAL + POP_SIGNAL)")
+
+    # ── V10: WAL Recovery for options ────────────────────────────────────
+    try:
+        from monitor.order_wal import wal as order_wal
+        incomplete = order_wal.get_incomplete_orders()
+        options_incomplete = [o for o in incomplete if 'options' in o.get('reason', '')]
+        if options_incomplete:
+            log.warning("[WAL] Found %d incomplete OPTIONS orders from prior session", len(options_incomplete))
+            for order in options_incomplete:
+                cid = order.get('client_id', '')
+                state = order.get('state', '')
+                ticker = order.get('ticker', '?')
+
+                if state == 'INTENT':
+                    log.info("[WAL] Options %s INTENT only — marking cancelled", ticker)
+                    order_wal.cancelled(cid, reason='options_never_submitted')
+                elif state in ('SUBMITTED', 'ACKED'):
+                    broker_oid = order.get('broker_order_id', '')
+                    if broker_oid and options_engine and options_engine._broker:
+                        try:
+                            status = options_engine._broker.get_order_status(broker_oid)
+                            if status.get('status', '').lower() == 'filled':
+                                log.warning("[WAL] Options %s FILLED at broker — recording", ticker)
+                                order_wal.recorded(cid, lot_id=f'options_recovery:{ticker}:{broker_oid}')
+                            elif status.get('status', '').lower() in ('cancelled', 'expired', 'rejected'):
+                                order_wal.cancelled(cid, reason=f'broker_{status["status"]}')
+                            else:
+                                log.warning("[WAL] Options %s still open — cancelling stale", ticker)
+                                options_engine._broker.cancel_order(broker_oid)
+                                order_wal.cancelled(cid, reason='stale_on_recovery')
+                        except Exception as exc:
+                            log.warning("[WAL] Options recovery for %s failed: %s", ticker, exc)
+                            order_wal.failed(cid, reason=f'recovery_error:{exc}')
+                    else:
+                        order_wal.failed(cid, reason='no_broker_for_recovery')
+                elif state == 'FILLED':
+                    log.warning("[WAL] Options %s FILLED but not RECORDED — recording", ticker)
+                    order_wal.recorded(cid, lot_id=f'options_recovery:{ticker}')
+        else:
+            log.info("[WAL] No incomplete options orders from prior session")
+    except Exception as exc:
+        log.warning("[WAL] Options recovery failed (non-fatal): %s", exc)
 
     log.info("Options process running.")
     _kill_switch_exit = False

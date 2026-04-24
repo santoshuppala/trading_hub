@@ -102,11 +102,9 @@ class SmartRouter:
         self._order_counter = 0  # for round-robin routing
         # Track which broker opened each position (ticker → broker_name)
         # V7: Uses SafeStateFile for fcntl locking, checksums, backups
+        from config import BROKER_MAP_PATH
         self._position_broker: Dict[str, str] = {}
-        self._broker_map_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'data', 'position_broker_map.json',
-        )
+        self._broker_map_file = BROKER_MAP_PATH
         self._broker_map_sf = SafeStateFile(self._broker_map_file,
                                             max_age_seconds=300.0)
         self._load_broker_map()

@@ -1133,23 +1133,45 @@ class SessionWatchdog:
 
                 # P&L from pre-computed field (FIFO-matched, always correct)
                 core_pnl = ledger.get('daily_pnl', 0.0)
-                core_closed = ledger.get('trade_count', 0)
 
-                # Open positions from pre-computed summary
-                open_pos = ledger.get('open_positions', {})
-                core_open = len(open_pos)
-                for t, info in open_pos.items():
-                    position_lines.append(
-                        f"  {t:6s}  {info.get('qty',0):>6.0f} shares @ ${info.get('avg_entry',0):>8.2f}  "
-                        f"stop=${info.get('stop_price',0):>8.2f}  target=${info.get('target_price',0):>8.2f}  "
-                        f"{info.get('strategy','')}"
-                    )
+                # Open positions from bot_state (authoritative, reconciled with broker)
+                # fill_ledger's open_positions can be stale after sells
+                try:
+                    with open(_BOT_STATE_FILE) as _bf:
+                        _bs = json.load(_bf)
+                    _live_pos = _bs.get('positions', {})
+                    core_open = len(_live_pos)
+                    for t, info in _live_pos.items():
+                        entry = info.get('entry_price', 0)
+                        stop = info.get('stop_price', 0)
+                        target = info.get('target_price', 0)
+                        strategy = info.get('strategy', '')
+                        qty = info.get('quantity', info.get('qty', 0))
+                        position_lines.append(
+                            f"  {t:6s}  {qty:>6.0f} shares @ ${entry:>8.2f}  "
+                            f"stop=${stop:>8.2f}  target=${target:>8.2f}  "
+                            f"{strategy}"
+                        )
+                except Exception:
+                    # Fallback to fill_ledger if bot_state unavailable
+                    open_pos = ledger.get('open_positions', {})
+                    core_open = len(open_pos)
+                    for t, info in open_pos.items():
+                        position_lines.append(
+                            f"  {t:6s}  {info.get('qty',0):>6.0f} shares @ ${info.get('avg_entry',0):>8.2f}  "
+                            f"stop=${info.get('stop_price',0):>8.2f}  target=${info.get('target_price',0):>8.2f}  "
+                            f"{info.get('strategy','')}"
+                        )
 
-                # Trade details from raw lots
+                # Trade details from raw lots (today only — not all-time)
                 lots = ledger.get('lots', [])
-                buy_lots = [l for l in lots if l['side'] == 'BUY']
-                sell_lots = [l for l in lots if l['side'] == 'SELL']
+                _today_str = datetime.now(ET).strftime('%Y-%m-%d')
+                buy_lots = [l for l in lots if l['side'] == 'BUY'
+                            and l.get('timestamp', '').startswith(_today_str)]
+                sell_lots = [l for l in lots if l['side'] == 'SELL'
+                             and l.get('timestamp', '').startswith(_today_str)]
                 core_buys = len(buy_lots)
+                core_closed = len(sell_lots)
 
                 for sl in sell_lots:
                     t = sl['ticker']
@@ -1197,7 +1219,7 @@ class SessionWatchdog:
 
         pnl = core_pnl + options_pnl
         open_positions = core_open + options_open
-        total_trades = core_buys + core_closed + options_trades
+        total_trades = core_closed + options_trades  # closed trades only (not buys+sells)
 
         # Overall status
         if crit_count > 0:

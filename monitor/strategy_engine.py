@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from datetime import datetime
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
@@ -105,6 +106,7 @@ class StrategyEngine:
         # V10: Per-position lifecycle managers (Phase 0-4 exit engine)
         self._lifecycles: Dict[str, PositionLifecycle] = {}
         self._bar_counter: Dict[str, int] = {}  # monotonic bar counter per ticker
+        self._start_time: float = time.monotonic()  # for post-restart grace period
 
         bus.subscribe(EventType.BAR, self._on_bar)
         # V10: Listen for POSITION CLOSED to clean up lifecycles
@@ -221,7 +223,19 @@ class StrategyEngine:
                     "bid=$%.2f unrealized=%.1fR",
                     ticker, decision.reason, decision.phase, bid, decision.unrealized_r,
                 )
-                self._emit_quote_exit(ticker, bid, decision.reason, pos, event)
+                # Map lifecycle reason to valid SignalAction
+                _qr = decision.reason.upper()
+                if 'STOP' in _qr or 'PHASE0' in _qr:
+                    _qa = 'SELL_STOP'
+                elif 'VWAP' in _qr:
+                    _qa = 'SELL_VWAP'
+                elif 'RSI' in _qr:
+                    _qa = 'SELL_RSI'
+                elif 'TARGET' in _qr or 'MAX_HOLD' in _qr or 'DEAD_TRADE' in _qr:
+                    _qa = 'SELL_TARGET'
+                else:
+                    _qa = 'SELL_STOP'
+                self._emit_quote_exit(ticker, bid, _qa, pos, event)
                 return
 
             elif decision.action == 'PARTIAL':
@@ -248,6 +262,23 @@ class StrategyEngine:
             return
 
         # ── Fallback: no lifecycle (legacy positions) ────────────────
+        # After restart, positions exist but lifecycle hasn't been created yet
+        # (created on first BAR). Grace period prevents premature legacy exits
+        # before the lifecycle takes over. Only the hard stop (2x ATR below entry)
+        # fires during grace period — protects against crashes but not noise.
+        _grace = 60  # seconds after startup before legacy exits activate
+        _uptime = time.monotonic() - getattr(self, '_start_time', time.monotonic())
+        if _uptime < _grace:
+            # During grace period: only exit on catastrophic stop (well below entry)
+            entry = pos.get('entry_price', 0)
+            atr = pos.get('atr_value', entry * 0.01) or entry * 0.01
+            catastrophic_stop = entry - atr * 2.0
+            if bid <= catastrophic_stop and catastrophic_stop > 0:
+                log.warning("[StrategyEngine] GRACE PERIOD catastrophic stop: %s bid=$%.2f << entry=$%.2f",
+                            ticker, bid, entry)
+                self._emit_quote_exit(ticker, bid, 'SELL_STOP', pos, event)
+            return
+
         stop_price = pos.get('stop_price', 0)
         target_price = pos.get('target_price', 0)
 
@@ -593,20 +624,38 @@ class StrategyEngine:
                 atr=atr,
             )
 
-            # V10: Recovery — if position already has profit or partial done,
-            # fast-forward lifecycle to appropriate phase (prevents re-taking partials)
-            if pos.get('partial_done'):
-                lc.phase = 3  # already took partial → Phase 3
-                lc.partial_done = True
-                lc.trail_stop = max(stop_price, entry_price)
-                log.info("[Lifecycle] %s recovered at Phase 3 (partial_done)", ticker)
-            elif current_price > entry_price + atr:
-                lc.phase = 2  # in profit → Phase 2
-                lc.trail_stop = entry_price
-                log.info("[Lifecycle] %s recovered at Phase 2 (in profit)", ticker)
-            else:
-                lc.phase = 1  # skip Phase 0 for existing positions (already validated)
-                log.info("[Lifecycle] %s recovered at Phase 1 (existing position)", ticker)
+            # V10: Restore lifecycle state from persisted position data.
+            # _lifecycle_state is saved to bot_state.json every bar cycle.
+            # On restart, this restores exact phase, trail stop, partial status
+            # so no information is lost and no duplicate partials are taken.
+            _lc_state = pos.get('_lifecycle_state')
+            if _lc_state and isinstance(_lc_state, dict):
+                lc.phase = _lc_state.get('phase', 0)
+                lc.bars_held = _lc_state.get('bars_held', 0)
+                lc.partial_done = _lc_state.get('partial_done', False)
+                lc.trail_stop = _lc_state.get('trail_stop', lc.trail_stop)
+                lc.running_high = _lc_state.get('running_high', lc.running_high)
+                lc.vwap_below_count = _lc_state.get('vwap_below_count', 0)
+                log.info("[Lifecycle] %s RESTORED from state | phase=%d bars=%d "
+                         "partial=%s trail=$%.2f running_high=$%.2f",
+                         ticker, lc.phase, lc.bars_held, lc.partial_done,
+                         lc.trail_stop, lc.running_high)
+            elif pos.get('strategy', '').endswith('_reconciled'):
+                # Fallback for reconciled positions with no lifecycle state
+                # (imported from broker, never had a lifecycle before)
+                if pos.get('partial_done'):
+                    lc.phase = 3
+                    lc.partial_done = True
+                    lc.trail_stop = max(stop_price, entry_price)
+                    log.info("[Lifecycle] %s recovered at Phase 3 (partial_done)", ticker)
+                elif current_price > entry_price + atr:
+                    lc.phase = 2
+                    lc.trail_stop = entry_price
+                    log.info("[Lifecycle] %s recovered at Phase 2 (in profit)", ticker)
+                else:
+                    lc.phase = 1
+                    log.info("[Lifecycle] %s recovered at Phase 1 (reconciled)", ticker)
+            # New positions (no _lifecycle_state, not reconciled): start at Phase 0
 
             self._lifecycles[ticker] = lc
 
@@ -634,6 +683,18 @@ class StrategyEngine:
                 )
             else:
                 return  # hold — stop not hit, wait for next bar
+
+        # ── Persist lifecycle state for crash/restart recovery ────────
+        # Stored on the position dict → saved to bot_state.json every cycle.
+        # On restart, lifecycle is recreated from this state instead of Phase 0.
+        pos['_lifecycle_state'] = {
+            'phase': lifecycle.phase,
+            'bars_held': lifecycle.bars_held,
+            'partial_done': lifecycle.partial_done,
+            'trail_stop': lifecycle.trail_stop,
+            'running_high': lifecycle.running_high,
+            'vwap_below_count': lifecycle.vwap_below_count,
+        }
 
         # ── Act on lifecycle decision ────────────────────────────────
         if decision.action == 'HOLD':
@@ -670,11 +731,24 @@ class StrategyEngine:
 
         if decision.action == 'EXIT':
             self._lifecycles.pop(ticker, None)  # cleanup
-            action = decision.reason
+            # Map lifecycle exit reasons to valid SignalAction enum values.
+            # Lifecycle reasons are detailed (VWAP_BREAKDOWN_thesis, STOP_LOSS_phase2, etc.)
+            # but SignalPayload requires: SELL_STOP, SELL_VWAP, SELL_RSI, SELL_TARGET.
+            _reason = decision.reason.upper()
+            if 'STOP' in _reason or 'PHASE0' in _reason:
+                action = 'SELL_STOP'
+            elif 'VWAP' in _reason:
+                action = 'SELL_VWAP'
+            elif 'RSI' in _reason:
+                action = 'SELL_RSI'
+            elif 'TARGET' in _reason or 'MAX_HOLD' in _reason or 'DEAD_TRADE' in _reason:
+                action = 'SELL_TARGET'
+            else:
+                action = 'SELL_STOP'  # safe default
             log.info(
-                "[StrategyEngine] LIFECYCLE EXIT: %s action=%s phase=%d "
+                "[StrategyEngine] LIFECYCLE EXIT: %s action=%s reason=%s phase=%d "
                 "price=$%.2f unrealized=%.1fR bars=%d",
-                ticker, action, decision.phase, current_price,
+                ticker, action, decision.reason, decision.phase, current_price,
                 decision.unrealized_r, lifecycle.bars_held if ticker in self._lifecycles else 0,
             )
         elif decision.action == 'PARTIAL':

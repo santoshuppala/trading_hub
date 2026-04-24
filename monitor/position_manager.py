@@ -573,7 +573,7 @@ class PositionManager:
         _broker = getattr(parent, '_routed_broker', 'unknown') if parent else 'unknown'
         _strategy = trade.get('strategy', pos_strategy) if 'strategy' in trade else pos_strategy
         _engine = _strategy.split(':')[0] if ':' in _strategy else 'core'
-        _win = 'WIN' if pnl >= 0 else 'LOSS'
+        _win = 'BREAKEVEN' if abs(pnl) < 0.01 else ('WIN' if pnl > 0 else 'LOSS')
 
         send_alert(
             self._alert_email,

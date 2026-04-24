@@ -1410,6 +1410,12 @@ class RealTimeMonitor:
                 except Exception as exc:
                     log.warning("[Monitor] BarBuilder seeding failed (non-fatal): %s", exc)
 
+        # V10: Update BarBuilder hot tickers (open positions only).
+        # Only these get sub-second BAR emission — prevents EventBus queue overflow
+        # from 225 tickers × 1 BAR/minute flooding the queue.
+        if _bb:
+            _bb.set_hot_tickers(set(self.positions.keys()))
+
         # Emit BAR events for tickers NOT covered by BarBuilder.
         # BarBuilder covers a ticker when: seeded + received WebSocket ticks
         # this minute + builder is active (flush thread alive).
@@ -1629,7 +1635,7 @@ class RealTimeMonitor:
                 self._bars_cache.update(new_bars)
                 self._rvol_cache.update(new_rvol)
                 log.info("[stream-sync] Fetched bars for %d new tickers: %s",
-                         len(new_tickers), sorted(new_tickers)[:10])
+                         len(new_tickers), sorted(new_tickers))
             except Exception as exc:
                 log.warning("[stream-sync] REST fetch for new tickers failed: %s", exc)
 

@@ -129,6 +129,11 @@ class BarBuilder:
         self._seeded: bool = False
         self._seeded_tickers: Set[str] = set()
 
+        # HOT tickers: only emit BAR events for these (open positions).
+        # Emitting for all 225 seeded tickers overwhelms EventBus queues.
+        # Updated by monitor every cycle via set_hot_tickers().
+        self._hot_tickers: Set[str] = set()
+
         # Per-ticker freshness: tracks which tickers received WebSocket
         # ticks in the LAST flush cycle. Tickers not in this set had no
         # trades → REST should emit BAR for them as fallback.
@@ -166,6 +171,15 @@ class BarBuilder:
     def set_rvol_baselines(self, baselines: Dict[str, pd.DataFrame]):
         """Set RVOL baseline data (from daily volume profiles)."""
         self._rvol_baselines = baselines
+
+    def set_hot_tickers(self, tickers: Set[str]):
+        """Set which tickers get sub-second BAR emission.
+
+        Only open positions need sub-second exits. The full universe
+        gets REST BARs (60s) for entry signals — fast enough since
+        entries are less time-critical than exits.
+        """
+        self._hot_tickers = set(tickers)
 
     # ── REST History Seeding ─────────────────────────────────────────
 
@@ -250,15 +264,18 @@ class BarBuilder:
         return self._seeded
 
     def covers_ticker(self, ticker: str) -> bool:
-        """True if this ticker is seeded AND received ticks in the last flush.
+        """True if BarBuilder will actually emit BAR events for this ticker.
 
-        Used by monitor to decide: emit REST BAR or let BarBuilder handle it?
-        - Seeded + has ticks → BarBuilder covers it (sub-second)
-        - Seeded + no ticks (illiquid) → REST should cover it
-        - Not seeded → REST should cover it
+        Must satisfy ALL three conditions:
+        - Seeded (has REST history for detectors)
+        - Received WebSocket ticks this flush cycle (not illiquid)
+        - In _hot_tickers (open position — BarBuilder only emits for these)
+
+        If any condition fails, REST should emit BAR for this ticker.
         """
         return (ticker in self._seeded_tickers
-                and ticker in self._tickers_with_ticks)
+                and ticker in self._tickers_with_ticks
+                and ticker in self._hot_tickers)
 
     def is_active(self) -> bool:
         """True if BarBuilder is running, seeded, and flushed recently.
@@ -348,10 +365,13 @@ class BarBuilder:
             if len(self._history[ticker]) > self._max_history:
                 self._history[ticker] = self._history[ticker][-self._max_history:]
 
-            # Emit BAR event if seeded with enough history for detectors
-            # MIN_BARS_REQUIRED=30 in config — only emit when history is sufficient
+            # Emit BAR event only for HOT tickers (open positions).
+            # Emitting for all 225 seeded tickers overwhelms EventBus queues.
+            # Entry signals for non-position tickers come from REST polling (60s).
+            # Exit signals for open positions get sub-second bars here.
             if (self._emit_bars and self._bus
                     and ticker in self._seeded_tickers
+                    and ticker in self._hot_tickers
                     and len(self._history[ticker]) >= 2):
                 try:
                     self._emit_bar_event(ticker, now_et)

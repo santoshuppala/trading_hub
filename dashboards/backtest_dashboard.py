@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Backtest Results",
+    page_title="V10 Backtest Results",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -517,6 +517,65 @@ def main():
         fig = plot_exit_reasons(filtered)
         st.pyplot(fig)
         plt.close(fig)
+
+    # ── V10: Lifecycle Phase Analysis ────────────────────────────────────
+    # Map exit reasons to lifecycle phases for V10 exit engine analysis
+    if 'exit_reason' in filtered.columns:
+        def _exit_to_phase(reason):
+            r = str(reason).upper()
+            if 'PHASE0' in r: return 'Phase 0 (Validation)'
+            if 'PHASE1' in r: return 'Phase 1 (Protection)'
+            if 'PHASE2' in r or 'BREAKEVEN' in r: return 'Phase 2 (Breakeven)'
+            if 'PHASE3' in r or 'PARTIAL' in r or 'HARVEST' in r: return 'Phase 3 (Harvest)'
+            if 'PHASE4' in r or 'RUNNER' in r: return 'Phase 4 (Runner)'
+            if 'STOP' in r: return 'Stop Loss'
+            if 'VWAP' in r: return 'VWAP Exit'
+            if 'RSI' in r: return 'RSI Exit'
+            if 'TARGET' in r: return 'Target Hit'
+            if 'EOD' in r: return 'End of Day'
+            return 'Other'
+
+        filtered['_phase'] = filtered['exit_reason'].apply(_exit_to_phase)
+        phase_counts = filtered['_phase'].value_counts()
+        if len(phase_counts) > 1:
+            st.subheader("Exit Phase Breakdown")
+            col_ph1, col_ph2 = st.columns(2)
+            with col_ph1:
+                phase_pnl = filtered.groupby('_phase')['pnl'].agg(['sum', 'count', 'mean'])
+                phase_pnl.columns = ['Total P&L', 'Trades', 'Avg P&L']
+                phase_pnl = phase_pnl.sort_values('Total P&L', ascending=False)
+                fig, ax = plt.subplots(figsize=(8, 4), facecolor='#1a1a2e')
+                ax.set_facecolor('#1a1a2e')
+                colors_ph = ['#00e676' if v > 0 else '#ff5252' for v in phase_pnl['Total P&L']]
+                ax.barh(phase_pnl.index, phase_pnl['Total P&L'], color=colors_ph, edgecolor='none')
+                for i, (idx, row) in enumerate(phase_pnl.iterrows()):
+                    ax.text(row['Total P&L'], i, f" {int(row['Trades'])}t ${row['Total P&L']:+.2f}",
+                            va='center', color='white', fontsize=9)
+                ax.set_title('P&L by Exit Phase', color='white', fontsize=13, fontweight='bold')
+                ax.tick_params(colors='#8892b0')
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['bottom'].set_color('#2a2a4a')
+                ax.spines['left'].set_color('#2a2a4a')
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close(fig)
+            with col_ph2:
+                fig2, ax2 = plt.subplots(figsize=(6, 4), facecolor='#1a1a2e')
+                ax2.set_facecolor('#1a1a2e')
+                phase_colors = {'Phase 0 (Validation)': '#ff5252', 'Phase 1 (Protection)': '#ffd740',
+                                'Phase 2 (Breakeven)': '#536dfe', 'Phase 3 (Harvest)': '#00e676',
+                                'Phase 4 (Runner)': '#00bfa5', 'Stop Loss': '#ff5252',
+                                'VWAP Exit': '#ffd740', 'RSI Exit': '#ce93d8',
+                                'Target Hit': '#00e676', 'End of Day': '#8892b0', 'Other': '#4a4a6a'}
+                pie_colors = [phase_colors.get(p, '#4a4a6a') for p in phase_counts.index]
+                ax2.pie(phase_counts.values, labels=phase_counts.index, colors=pie_colors,
+                        autopct='%1.0f%%', textprops={'color': 'white', 'fontsize': 9},
+                        pctdistance=0.8)
+                ax2.set_title('Exit Phase Distribution', color='white', fontsize=13, fontweight='bold')
+                plt.tight_layout()
+                st.pyplot(fig2)
+                plt.close(fig2)
 
     # ── Two more charts ──────────────────────────────────────────────────
     col_left2, col_right2 = st.columns(2)

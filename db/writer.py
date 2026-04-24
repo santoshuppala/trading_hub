@@ -33,9 +33,9 @@ from .connection import get_pool
 log = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
-_BATCH_MAX      = int(os.getenv("DB_BATCH_MAX",              "200"))
-_FLUSH_INTERVAL = float(os.getenv("DB_FLUSH_INTERVAL",       "0.5"))   # seconds
-_QUEUE_MAXSIZE  = int(os.getenv("DB_QUEUE_MAXSIZE",          "5000"))
+_BATCH_MAX      = int(os.getenv("DB_BATCH_MAX",              "1000"))
+_FLUSH_INTERVAL = float(os.getenv("DB_FLUSH_INTERVAL",       "0.25"))  # seconds
+_QUEUE_MAXSIZE  = int(os.getenv("DB_QUEUE_MAXSIZE",          "50000"))
 _CB_FAILURES    = int(os.getenv("DB_CIRCUIT_BREAKER_FAILURES", "5"))
 _CB_RESET       = int(os.getenv("DB_CIRCUIT_BREAKER_RESET",   "30"))   # seconds
 
@@ -97,11 +97,22 @@ class DBWriter:
 
         record = _WriteRecord(table=table, row=row)
         try:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, record)
-        except asyncio.QueueFull:
+            # Wrap put_nowait in a closure so QueueFull is caught inside
+            # the event loop callback — not raised as an unhandled exception.
+            # call_soon_threadsafe schedules the callback; the actual put_nowait
+            # runs later in the loop, so a bare reference would raise uncaught.
+            def _safe_put(r=record):
+                try:
+                    self._queue.put_nowait(r)
+                except asyncio.QueueFull:
+                    self.rows_dropped += 1
+                    if self.rows_dropped % 500 == 1:
+                        log.warning("DBWriter queue full — %d rows dropped so far",
+                                    self.rows_dropped)
+            self._loop.call_soon_threadsafe(_safe_put)
+        except RuntimeError:
+            # Event loop closed
             self.rows_dropped += 1
-            if self.rows_dropped % 500 == 1:
-                log.warning("DBWriter queue full — %d rows dropped so far", self.rows_dropped)
 
     async def start(self) -> None:
         """Start the background flush task."""

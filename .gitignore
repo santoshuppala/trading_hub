@@ -17,6 +17,7 @@ data/
 data/*
 logs/
 backtest_results/
+reports/
 *.parquet
 *.csv
 *.log

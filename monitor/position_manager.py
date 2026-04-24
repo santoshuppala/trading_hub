@@ -492,6 +492,11 @@ class PositionManager:
             'is_win':      pnl >= 0,
         }
 
+        # V10: Attach lifecycle data for ML/edge model
+        _lc = pos.get('_lifecycle_data')
+        if _lc:
+            trade['lifecycle'] = _lc
+
         # V8: Update per-broker qty tracking on any sell
         _sell_broker = getattr(parent, '_routed_broker', None) if parent else None
         if _sell_broker and '_broker_qty' in pos:
@@ -598,6 +603,8 @@ class PositionManager:
                     'reason': reason,
                     'strategy': pos.get('strategy', 'vwap_reclaim'),
                     'broker': broker,
+                    # V10: Lifecycle data for ML/edge model
+                    'lifecycle': pos.get('_lifecycle_data', {}),
                 },
             ),
             correlation_id=parent.event_id,

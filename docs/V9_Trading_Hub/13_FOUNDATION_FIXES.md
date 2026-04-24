@@ -415,37 +415,101 @@ Implemented April 22, 2026. Readiness score: **100/100**.
 
 ---
 
-## Post-Foundation: Edge Model Pipeline
+## Post-Foundation: V10 Alpha Engine
 
-All 9 fixes are in place. The system is ready for alpha improvements:
+### April 23: V10 Exit Engine (DONE)
 
-1. **Edge context data capture** — DONE (April 22). Collecting regime, time_bucket, timeframe, confluence from every signal across all 4 paths. DB migration applied.
-2. **EdgeStore + AdaptiveRanker** — self-calibrating signal scoring from trade outcomes. Needs 3+ months of edge context data.
-3. **SignalArbiter** — bar-cycle-aware signal arbitration (best signal wins, not first). Design complete, implementation pending.
-4. **Profitability filter** — edge-driven (not hardcoded filter stack). Replaces P1 from `12_FUTURE_ENHANCEMENTS.md`.
+**File:** `monitor/exit_engine.py` (NEW — ~600 lines)
 
-Prerequisite met: reliable P&L tracking (Fix A+B+C), correct state management (Fix D+F), test isolation (Fix E), startup validation (Fix G).
+Replaces panic-based exits (RSI > 70 → SELL ALL) with a structured 4-phase lifecycle that manages each position from entry to exit, with per-strategy behavior.
+
+**Architecture:**
+```
+Old (V9):  RSI > 70? SELL. VWAP breakdown? SELL. Stop hit? SELL.
+           (all exits equal, all fire independently, all sell 100%)
+
+New (V10): Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4
+           (structured, per-strategy, confluence-aware)
+```
+
+**Phases:**
+
+| Phase | Purpose | Active | Duration |
+|---|---|---|---|
+| 0: Validation | Thesis check — did entry setup hold? | Stop + per-strategy thesis check | 1-4 bars (ATR-adaptive) |
+| 1: Protection | Let entry establish | Stop only. No RSI/VWAP exits. | 2-4 bars or higher low or 0.5R |
+| 2: Breakeven | Protect capital | Move stop to BE (with cushion for structure). Mild RSI tighten. Dead trade check. | Until 1R |
+| 3: Harvest | Lock profit | Confluence-aware partials (33/50/66%). Structure trail 0.7R min. Normal RSI tighten. | Until 2R (or 1.5R for high confluence) |
+| 4: Runner | Capture big moves | 5-bar swing low + VWAP floor + R floor. No RSI for structure. | Until trail catches or EOD |
+
+**Per-Strategy Profiles (10 defined):**
+
+| Strategy | Stop | Phase 1 | Partial | Trail | RSI Tighten | VWAP |
+|---|---|---|---|---|---|---|
+| sr_flip | Structure 1.0 ATR | 3 bars | 50% at 1R | Structure 0.5R | Yes @72 | 2-bar tighten |
+| trend_pullback | Structure 0.8 ATR | 2 bars | 50% at 1R | Higher lows | No | 2-bar tighten |
+| momentum_ignition | ATR 2.0× | 3 bars | 33% at 2R | ATR 1.5× | No | None |
+| orb | Structure 1.5 ATR | 3 bars | 50% at 1R | Structure 0.5R | Yes @70 | 2-bar tighten |
+| bollinger_squeeze | ATR 2.0× | 4 bars | 50% at 1.5R | ATR 1.5× | Yes @75 | None |
+| liquidity_sweep | Structure 2.5 ATR | 3 bars | 50% at 1.5R | Structure 1.0R | No | None |
+
+**Confluence-Aware Behavior:**
+- 3+ detectors → 33% partial, entry+0.25R post-stop, Phase 4 at 1.5R, wider trail 0.8R
+- 2 detectors → 50% partial, entry+0.5R post-stop, Phase 4 at 2.0R
+- 1 detector → 66% partial, entry+0.5R post-stop, Phase 4 at 2.0R
+
+**Impulse vs Structure:**
+- Impulse (momentum, sweep, gap_and_go): true breakeven, 15-bar dead trade, RSI tightens Phase 4
+- Structure (sr_flip, orb, inside_bar, etc.): 0.1R cushion, 30-bar dead trade, RSI ignored Phase 4
+
+**Lifecycle Data Captured to DB:**
+- `position_events.close_detail.lifecycle` (JSONB): 15 fields including exit_phase, unrealized_r, bars_held, running_high, confluence_count, partial_pct, is_impulse
+- `position_events.close_detail.lifecycle.events[]`: full decision event log — every phase transition, RSI tighten, VWAP tighten, partial exit, breakeven move
+
+**Lifecycle Recovery on Restart:**
+- partial_done → starts at Phase 3
+- In profit (> 1 ATR above entry) → starts at Phase 2
+- Existing position → starts at Phase 1 (skip Phase 0)
+
+### April 23: Additional Fixes
+
+| Fix | What |
+|---|---|
+| Supervisor startup crash | `name` → `path` in state file validation loop |
+| SMTP stale password | Deleted `test/.env`, .env loaders always override (not setdefault) |
+| Streaming banner [OFF] | Check `_running` instead of `is_connected` (0 tickers = no data flow) |
+| FillLedger stale lots | `close_stale_lots()` on startup + FIFO re-match |
+| Watchdog fill_ledger count | Filter by today's date, label prior-day carry-overs |
+| Watchdog positions count | Positions from bot_state (reconciled), P&L from FillLedger |
+| Heartbeat P&L mismatch | StateEngine uses FillLedger.daily_realized_pnl() as authority |
+| Phantom POSITION CLOSED | `_live_reconcile` emits POSITION CLOSED so StateEngine updates |
+| EOD report not sent | SIGTERM handler generates report before watchdog exits |
+| EOD report enhanced | Broker BOD/EOD equity, open positions, P&L reconciliation, drift |
+| Heartbeat.json stale HUNG | Delete heartbeat file at EOD shutdown |
+| Trade analysis report | `reports/daily_analysis/trade_analysis_YYYYMMDD.csv` with 28 fields |
+| Trade analysis dashboard | `dashboards/trade_analysis_dashboard.py` (Streamlit, port 8503) |
+
+### Next Steps (Edge Model Pipeline)
+
+1. **Edge context data capture** — DONE (April 22). Collecting from every signal.
+2. **V10 Exit Engine** — DONE (April 23). Phase-based lifecycle, all data to DB.
+3. **EdgeStore + AdaptiveRanker** — self-calibrating signal scoring. Needs 2-4 weeks of lifecycle data.
+4. **Entry gate (EV model)** — expected value scoring before ORDER_REQ. Design complete.
+5. **SignalArbiter** — bar-cycle-aware arbitration. Design complete.
+
+### Future Enhancements Noted
+
+- Auto-generate daily trade analysis CSV in post_session_analytics.py
+- fill_lots table: add exit lifecycle data
+- Order WAL: migrate to DB for SQL queryability
+- RiskSizer beta pre-seed: cache to disk (35s → <1s startup)
+- WebSocket bar building: replace 12s REST polling
+- Detector key levels: each detector outputs key_level/invalidation/structure_trail
+- Short position support in lifecycle
 
 ---
 
-## Readiness Score: 100/100 (April 22, 2026)
-
-| Category | Score | Notes |
-|---|---|---|
-| Preflight checks | 10/10 | All pass (SMTP warning — Yahoo rate limit, clears overnight) |
-| State file cleanliness | 10/10 | No test data, no stale artifacts |
-| Foundation fixes | 10/10 | All 9/9 complete |
-| Test suite | 10/10 | 52 passed, 0 failed |
-| Process imports | 10/10 | All modules import clean |
-| Broker connectivity | 10/10 | Alpaca $1,005,434 + Tradier $100,204 |
-| Infrastructure | 10/10 | Redpanda + TimescaleDB online |
-| Emergency rollback | 10/10 | Script + git tag ready |
-| Edge context capture | 10/10 | Code + DB migration applied |
-| Backtest simulator | 10/10 | All 5 bugs fixed |
-
----
-
-## Design Principles (Lessons from April 22)
+## Design Principles (Lessons from April 22-23)
 
 1. **The broker is God.** Local state is a cache of broker reality. Always reconcile.
 2. **Append-only > mutable.** FillLedger (append lots) is correct. trade_log (in-memory list) drifts.
@@ -457,3 +521,6 @@ Prerequisite met: reliable P&L tracking (Fix A+B+C), correct state management (F
 8. **WAL writes are free.** 0.01ms append vs 200ms broker call. The log that saves you from $50 drift costs nothing.
 9. **Options parity with core.** Every fix to core MUST also be applied to options. Never leave options behind.
 10. **No hardcoded paths.** State file paths defined once in config.py. Override via env var for test isolation.
+11. **Exits should be phase-based, not trigger-based.** RSI/VWAP are trail tighteners, not kill switches.
+12. **Per-strategy exit profiles.** sr_flip and momentum_ignition have completely different edge profiles — exits should match the thesis.
+13. **Capture everything for ML.** Every phase transition, every decision, every trail tighten → DB. Can't optimize what you can't measure.

@@ -336,6 +336,16 @@ class RealTimeMonitor:
         self._stream_client = stream_client
         log.info("[Monitor] Stream client attached to RiskEngine")
 
+    def set_bar_builder(self, bar_builder) -> None:
+        """Attach BarBuilder for sub-second BAR delivery from WebSocket ticks.
+
+        Once seeded (after first REST cycle), BarBuilder emits BAR events
+        for tickers with active WebSocket ticks. REST BAR emission is skipped
+        for those tickers to avoid double evaluation.
+        """
+        self._bar_builder = bar_builder
+        log.info("[Monitor] BarBuilder attached — will seed after first REST fetch")
+
     # ── V9 (R3): Stale order cleanup ────────────────────────────────────────
 
     def _cleanup_stale_open_orders(self) -> None:
@@ -1375,13 +1385,48 @@ class RealTimeMonitor:
         # V8: Tiered scanning — classify tickers before emit_batch
         scan_tickers = self._ticker_scanner.classify(self.tickers, self._bars_cache)
 
-        # Emit BAR events for all tickers.
+        # V10: Seed BarBuilder from REST cache.
+        # First call seeds all tickers with 30+ bars.
+        # Subsequent calls (every 5 min) reseed to pick up:
+        #   - New tickers that now have enough bars (early session ramp-up)
+        #   - Updated RVOL baselines
+        #   - History gaps from WebSocket disconnects
+        _bb = getattr(self, '_bar_builder', None)
+        if _bb and self._bars_cache:
+            _reseed_interval = 300  # 5 minutes
+            _last_seed = getattr(self, '_last_bb_seed_time', 0)
+            _should_seed = (not _bb.is_seeded
+                            or (time.monotonic() - _last_seed) > _reseed_interval)
+            if _should_seed:
+                try:
+                    _seeded = _bb.seed_from_cache(
+                        self._bars_cache,
+                        rvol_cache=getattr(self, '_rvol_cache', None),
+                    )
+                    self._last_bb_seed_time = time.monotonic()
+                    if _seeded > 0:
+                        log.info("[Monitor] BarBuilder seeded with %d tickers from REST cache",
+                                 _seeded)
+                except Exception as exc:
+                    log.warning("[Monitor] BarBuilder seeding failed (non-fatal): %s", exc)
+
+        # Emit BAR events for tickers NOT covered by BarBuilder.
+        # BarBuilder covers a ticker when: seeded + received WebSocket ticks
+        # this minute + builder is active (flush thread alive).
+        # Tickers without WebSocket ticks (illiquid) or when streaming is
+        # down get REST BAR events as fallback — no ticker is ever left without data.
+        _bb_active = _bb and _bb.is_active()
         now   = datetime.now(ET)
         today = now.date()
         bar_events = []
         _skipped_empty = 0
         _skipped_nocache = 0
+        _skipped_bb = 0
         for ticker in scan_tickers:
+            # Skip if BarBuilder is actively covering this ticker
+            if _bb_active and _bb.covers_ticker(ticker):
+                _skipped_bb += 1
+                continue
             ev = self._build_bar_event(ticker, today)
             if ev is not None:
                 bar_events.append(ev)
@@ -1395,7 +1440,10 @@ class RealTimeMonitor:
                 self._bus.emit_batch(bar_events)
             except Exception as e:
                 log.error(f"emit_batch(BAR) failed: {e}")
-        if not bar_events and scan_tickers:
+        if _skipped_bb > 0:
+            log.debug("[Monitor] %d tickers covered by BarBuilder (sub-second), "
+                      "%d via REST", _skipped_bb, len(bar_events))
+        if not bar_events and not _skipped_bb and scan_tickers:
             log.warning(
                 "[Monitor] 0 BAR events from %d scan tickers "
                 "(no_cache=%d empty_today=%d cache_size=%d)",
@@ -1442,6 +1490,12 @@ class RealTimeMonitor:
                 except Exception as exc:
                     log.warning("[equity] drift check failed: %s", exc)
 
+        # V10: Sync streaming subscription with current ticker universe.
+        # Detects new tickers (momentum scanner, headlines, ranking, new positions)
+        # and immediately: (1) subscribes WebSocket, (2) fetches REST bars,
+        # (3) seeds BarBuilder — so every ticker on the radar has full data.
+        self._sync_stream_and_data()
+
         # V9 (R3): Stale order cleanup
         if now_mono - getattr(self, '_last_order_cleanup', 0) > 300:
             self._last_order_cleanup = now_mono
@@ -1475,8 +1529,12 @@ class RealTimeMonitor:
                 time.sleep(_hot_interval)
                 _slow_remaining -= _hot_interval
 
-                _stream_active = getattr(self, '_stream_active', False)
-                if not _stream_active:
+                # V10: Use live connection status, not just the one-time flag.
+                # If WebSocket disconnects, _stream_client.is_connected goes False
+                # → hot REST polling resumes automatically.
+                _sc = getattr(self, '_stream_client', None)
+                _stream_live = (_sc and _sc.is_connected) if _sc else False
+                if not _stream_live:
                     hot_tickers = list(self.positions.keys())
                     if hot_tickers:
                         try:
@@ -1532,6 +1590,68 @@ class RealTimeMonitor:
                 rvol_df=rvol_df,
             ),
         )
+
+    # ── V10: Stream + Data Sync ─────────────────────────────────────────────
+
+    def _sync_stream_and_data(self) -> None:
+        """Ensure every ticker on the radar has full data for trade decisions.
+
+        Detects tickers that entered the universe (momentum scanner, headlines,
+        ranking, new positions) since last sync and:
+          1. Subscribes WebSocket stream → ticks start flowing immediately
+          2. Fetches REST bars → bars_cache populated → detectors can fire
+          3. Seeds BarBuilder → sub-second BAR delivery for these tickers
+
+        Without this, newly-added tickers sit in the universe with no data
+        for up to 60s (next REST cycle) — missing actionable signals.
+        """
+        _sc = getattr(self, '_stream_client', None)
+        _bb = getattr(self, '_bar_builder', None)
+
+        all_tickers = set(self.tickers) | set(self.positions.keys())
+        prev_tickers = getattr(self, '_last_stream_tickers', set())
+
+        new_tickers = all_tickers - prev_tickers
+        if not new_tickers and all_tickers == prev_tickers:
+            return  # nothing changed
+
+        # 1. Update WebSocket subscription (includes new + existing)
+        if _sc and _sc.is_connected:
+            try:
+                _sc.update_tickers(all_tickers)
+            except Exception as exc:
+                log.debug("[stream-sync] subscription update failed: %s", exc)
+
+        # 2. Fetch REST bars immediately for new tickers (don't wait 60s)
+        if new_tickers:
+            try:
+                new_bars, new_rvol = self._data.fetch_batch_bars(list(new_tickers))
+                self._bars_cache.update(new_bars)
+                self._rvol_cache.update(new_rvol)
+                log.info("[stream-sync] Fetched bars for %d new tickers: %s",
+                         len(new_tickers), sorted(new_tickers)[:10])
+            except Exception as exc:
+                log.warning("[stream-sync] REST fetch for new tickers failed: %s", exc)
+
+            # 3. Seed BarBuilder for new tickers immediately
+            if _bb and _bb.is_seeded:
+                try:
+                    # Only seed the new tickers (not full cache)
+                    new_cache = {t: self._bars_cache[t]
+                                 for t in new_tickers
+                                 if t in self._bars_cache}
+                    new_rvol_cache = {t: self._rvol_cache.get(t)
+                                      for t in new_tickers
+                                      if t in self._rvol_cache}
+                    if new_cache:
+                        _seeded = _bb.seed_from_cache(new_cache, new_rvol_cache)
+                        if _seeded:
+                            log.info("[stream-sync] BarBuilder seeded %d new tickers",
+                                     _seeded)
+                except Exception as exc:
+                    log.debug("[stream-sync] BarBuilder seed for new tickers failed: %s", exc)
+
+        self._last_stream_tickers = all_tickers
 
     # ── V8: Pop periodic scanning ──────────────────────────────────────────
 

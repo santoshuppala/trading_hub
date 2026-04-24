@@ -100,6 +100,9 @@ class TradierStreamClient:
         self._prices: dict[str, dict] = {}
         self._prices_lock = threading.Lock()
 
+        # V10: BarBuilder for real-time bar aggregation (set via set_bar_builder)
+        self._bar_builder = None
+
         # V9: Cumulative volume cache — {ticker: cvol}
         # Used by RVOLEngine for instant real-time RVOL (no bar accumulation needed)
         self._cvol: dict[str, int] = {}
@@ -187,6 +190,11 @@ class TradierStreamClient:
             if age > max_age_seconds:
                 return None  # stale quote — force REST fallback
             return entry.copy()
+
+    def set_bar_builder(self, builder) -> None:
+        """V10: Attach BarBuilder for real-time bar aggregation from trade ticks."""
+        self._bar_builder = builder
+        log.info("[TradierStream] BarBuilder attached")
 
     def get_cvol(self, ticker: str) -> Optional[int]:
         """Get latest cumulative daily volume from streaming trades.
@@ -378,6 +386,10 @@ class TradierStreamClient:
             # V9: Capture cumulative volume for real-time RVOL
             if cvol > 0:
                 self._cvol[ticker] = cvol
+
+            # V10: Feed trade tick to BarBuilder for real-time bar aggregation
+            if self._bar_builder:
+                self._bar_builder.on_trade(ticker, price, size, cvol, time.time())
 
             with self._prices_lock:
                 existing = self._prices.get(ticker, {})

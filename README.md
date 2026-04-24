@@ -275,7 +275,7 @@ bash start_monitor.sh
 - `docs/V9_Trading_Hub/10_BACKTESTING.md` — backtest engine, data pipeline, strategies, results
 - `docs/V9_Trading_Hub/11_EVOLUTION_AND_ROADMAP.md` — V1-V9 timeline, system metrics, future roadmap
 - `docs/V9_Trading_Hub/12_FUTURE_ENHANCEMENTS.md` — complete roadmap: profitability filter, ranking wiring, data upgrades, sector rotation, hedging
-- `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md` — 9 reliability fixes: Order WAL, continuous reconciliation, FillLedger authority, startup preflight, test isolation
+- `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md` — 9 foundation fixes + V10 exit engine: Order WAL, reconciliation, FillLedger authority, phase-based exits, trade analysis
 
 ### Previous versions
 - `docs/V8_trading_hub/` — V8 architecture (reference)
@@ -349,6 +349,24 @@ The April 22 session exposed 20 systemic issues including $50 P&L drift, options
 | **Race Condition** | `list(dict)` snapshot prevents `dict changed size during iteration` crash. |
 
 Also fixed: 5 backtest simulator bugs, edge context data capture (4 signal paths + DB), IPC signal forwarding, email P&L/trades, watchdog health checks. See `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md`.
+
+## V10 Exit Engine (April 23, 2026)
+
+April 23 analysis revealed the system captured -8% of $984 available profit. Entries were valid — exits were destroying value (78 trades held <10 seconds, RSI/VWAP panic exits killed winners).
+
+Complete exit engine redesign: `monitor/exit_engine.py`
+
+| Phase | Purpose | Key Behavior |
+|---|---|---|
+| **Phase 0** | Entry validation | Per-strategy thesis check (SR held? ORB held? Volume confirming?) |
+| **Phase 1** | Protection | Stop only. No RSI/VWAP exits. Higher low detection. |
+| **Phase 2** | Breakeven | Stop to entry (cushion for structure). RSI tightens trail mildly. |
+| **Phase 3** | Profit harvest | Confluence-aware partials (33-66%). Structure trail. RSI tightens normally. |
+| **Phase 4** | Runner | 5-bar swing low + VWAP floor + R floor. Let winners run. |
+
+10 per-strategy exit profiles. Impulse vs structure classification. All lifecycle decisions captured to DB (`position_events.close_detail.lifecycle`).
+
+**Trade analysis:** `reports/daily_analysis/trade_analysis_YYYYMMDD.csv` + Streamlit dashboard at `dashboards/trade_analysis_dashboard.py` (port 8503).
 
 ---
 

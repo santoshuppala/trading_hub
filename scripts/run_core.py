@@ -217,7 +217,7 @@ def main():
     fill_ledger = None
     try:
         from monitor.fill_ledger import FillLedger
-        fill_ledger = FillLedger(state_file='data/fill_ledger.json')
+        fill_ledger = FillLedger()  # uses config.FILL_LEDGER_PATH
         fill_ledger.load()
         monitor.set_fill_ledger(fill_ledger)
         log.info("FillLedger attached (shadow mode) | lots=%d open=%d daily_pnl=$%.2f",
@@ -405,7 +405,7 @@ def main():
                 'time_bucket': getattr(p, 'time_bucket', ''),
             })
         except Exception as exc:
-            log.debug("[IPC] POP_SIGNAL publish failed: %s", exc)
+            log.warning("[IPC] POP_SIGNAL publish failed: %s", exc)
 
     monitor._bus.subscribe(EventType.SIGNAL, _on_signal_publish, priority=10)
     try:
@@ -431,7 +431,7 @@ def main():
                 'source': f'pro:{p.strategy_name}',
             })
         except Exception as exc:
-            log.debug("[IPC] PRO_STRATEGY_SIGNAL publish failed: %s", exc)
+            log.warning("[IPC] PRO_STRATEGY_SIGNAL publish failed: %s", exc)
 
     try:
         monitor._bus.subscribe(EventType.PRO_STRATEGY_SIGNAL, _on_pro_signal_publish, priority=10)
@@ -510,17 +510,35 @@ def main():
     # ── Start monitor ─────────────────────────────────────────────────────
     monitor.start()
 
+    # V10: Clean stale FillLedger lots after reconciliation.
+    # Reconciliation updated bot_state.positions to match broker reality.
+    # FillLedger may have open lots for positions that were closed at the
+    # broker while we were down. Close them now.
+    if fill_ledger:
+        try:
+            active = set(monitor.positions.keys())
+            closed = fill_ledger.close_stale_lots(active)
+            if closed:
+                log.info("[startup] Closed %d stale FillLedger lots (positions closed at broker)", closed)
+        except Exception as exc:
+            log.warning("[startup] FillLedger stale lot cleanup failed: %s", exc)
+
     # ── V9 Component Status Banner ────────────────────────────────────────
-    # V9: Wait briefly for streaming WebSocket handshake before printing banner
+    # V10: Wait up to 5s for streaming WebSocket handshake before printing banner.
+    # 1s was too short — caused [OFF] when streaming was actually connecting.
     if tradier_stream:
         import time as _t
-        _t.sleep(1)
+        for _ in range(10):
+            if getattr(tradier_stream, 'is_connected', False):
+                break
+            _t.sleep(0.5)
+
 
     _v9_status = {
         'FillLedger (shadow)':     'ON' if fill_ledger else 'OFF',
         'BrokerRegistry':          f'ON ({len(broker_registry)} brokers)' if broker_registry else 'OFF',
         'EquityTracker':           'ON' if getattr(monitor, '_equity_tracker', None) else 'OFF',
-        'Tradier Streaming':       'ON' if tradier_stream and getattr(tradier_stream, 'is_connected', False) else 'OFF (REST fallback)',
+        'Tradier Streaming':       'ON' if tradier_stream and getattr(tradier_stream, '_running', False) else 'OFF (REST fallback)',
         'Streaming → RiskEngine':  'ON' if getattr(getattr(monitor, '_risk', None), '_stream_client', None) else 'OFF',
         'Buying Power Background': 'ON' if getattr(portfolio_risk, '_bp_refresher', None) else 'OFF (inline)',
         'Data Failover':           'ON' if hasattr(monitor._data, '_secondary') else 'OFF',
@@ -549,6 +567,94 @@ def main():
     # Write initial cache (Options reads from this)
     if hasattr(monitor, '_bars_cache') and hasattr(monitor, '_rvol_cache'):
         cache_writer.write(monitor._bars_cache or {}, monitor._rvol_cache or {})
+
+    # ── V10: WAL Recovery — resolve incomplete orders from prior session ──
+    try:
+        from monitor.order_wal import wal as order_wal
+        incomplete = order_wal.get_incomplete_orders()
+        if incomplete:
+            log.warning("[WAL] Found %d incomplete orders from prior session", len(incomplete))
+            alpaca_broker = getattr(monitor, '_broker', None)
+            for order in incomplete:
+                cid = order.get('client_id', '')
+                state = order.get('state', '')
+                ticker = order.get('ticker', '?')
+                broker_oid = order.get('broker_order_id', '')
+                client_oid = order.get('client_order_id', '')
+
+                if state == 'INTENT':
+                    # Never submitted — safe to ignore
+                    log.info("[WAL] %s INTENT only (never submitted) — marking cancelled", ticker)
+                    order_wal.cancelled(cid, reason='never_submitted_recovery')
+                    continue
+
+                if state in ('SUBMITTED', 'ACKED', 'FILLED'):
+                    # Order may be live at broker — check
+                    log.warning("[WAL] %s was %s — checking broker", ticker, state)
+                    resolved = False
+
+                    # Try Alpaca first (has client_order_id lookup)
+                    if alpaca_broker and client_oid:
+                        try:
+                            broker_order = alpaca_broker._client.get_order_by_client_id(client_oid)
+                            b_status = str(getattr(broker_order, 'status', ''))
+                            if b_status == 'filled':
+                                fill_price = float(broker_order.filled_avg_price or 0)
+                                fill_qty = float(broker_order.filled_qty or 0)
+                                log.warning("[WAL] %s FILLED at Alpaca: %s qty @ $%.2f — "
+                                           "reconciliation will import", ticker, fill_qty, fill_price)
+                                order_wal.filled(cid, fill_price=fill_price, fill_qty=fill_qty,
+                                                broker_order_id=str(broker_order.id))
+                                # Don't create FillLot here — reconciliation handles it
+                                order_wal.recorded(cid, lot_id='reconciliation_pending')
+                                resolved = True
+                            elif b_status in ('cancelled', 'expired', 'rejected'):
+                                log.info("[WAL] %s %s at Alpaca — marking cancelled", ticker, b_status)
+                                order_wal.cancelled(cid, reason=f'broker_{b_status}')
+                                resolved = True
+                            elif b_status in ('new', 'accepted', 'pending_new'):
+                                log.warning("[WAL] %s still OPEN at Alpaca — cancelling stale order", ticker)
+                                try:
+                                    alpaca_broker._client.cancel_order_by_id(str(broker_order.id))
+                                except Exception:
+                                    pass
+                                order_wal.cancelled(cid, reason='stale_on_recovery')
+                                resolved = True
+                        except Exception as exc:
+                            log.warning("[WAL] Alpaca lookup for %s failed: %s", ticker, exc)
+
+                    if not resolved and broker_oid:
+                        # Try Tradier by order_id
+                        try:
+                            if broker_registry and 'tradier' in broker_registry:
+                                tradier = broker_registry.get('tradier')
+                                if tradier:
+                                    resp = tradier._session.get(
+                                        f"{tradier._base}/v1/accounts/{tradier._account}/orders/{broker_oid}",
+                                        headers={'Authorization': f'Bearer {tradier._token}',
+                                                 'Accept': 'application/json'},
+                                        timeout=5,
+                                    )
+                                    if resp.ok:
+                                        t_order = resp.json().get('order', {})
+                                        t_status = t_order.get('status', '')
+                                        if t_status == 'filled':
+                                            log.warning("[WAL] %s FILLED at Tradier — reconciliation will import", ticker)
+                                            order_wal.recorded(cid, lot_id='reconciliation_pending')
+                                            resolved = True
+                                        elif t_status in ('canceled', 'expired', 'rejected'):
+                                            order_wal.cancelled(cid, reason=f'tradier_{t_status}')
+                                            resolved = True
+                        except Exception as exc:
+                            log.warning("[WAL] Tradier lookup for %s failed: %s", ticker, exc)
+
+                    if not resolved:
+                        log.warning("[WAL] %s (%s) could not be resolved — marking failed", ticker, state)
+                        order_wal.failed(cid, reason='unresolved_on_recovery')
+        else:
+            log.info("[WAL] No incomplete orders from prior session")
+    except Exception as exc:
+        log.warning("[WAL] Recovery failed (non-fatal): %s", exc)
 
     # ── Main loop ─────────────────────────────────────────────────────────
     try:

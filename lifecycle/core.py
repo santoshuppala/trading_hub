@@ -154,8 +154,8 @@ class EngineLifecycle:
                 stats.get('open_positions', 0),
             )
 
-        # 4. Position reconciliation (at minute == 30, max once per hour)
-        if now.minute == 30 and (now_mono - self._last_reconcile) > 3500:
+        # 4. Position reconciliation every 5 min (V10: was 30 min)
+        if (now_mono - self._last_reconcile) > 300:
             self._last_reconcile = now_mono
             self._reconciler.sync_periodic()
 

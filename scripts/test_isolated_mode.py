@@ -213,7 +213,8 @@ def main():
         time.sleep(12)
 
         # Check status file
-        status_file = os.path.join(PROJECT_ROOT, 'data', 'supervisor_status.json')
+        from config import SUPERVISOR_STATUS_PATH
+        status_file = SUPERVISOR_STATUS_PATH
         if os.path.exists(status_file):
             with open(status_file) as f:
                 status = json.load(f)

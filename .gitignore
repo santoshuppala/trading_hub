@@ -29,6 +29,7 @@ position_registry.*
 position_broker_map.*
 *.heartbeat.json
 .monitor.lock
+.supervisor.lock
 *.bak
 *.pre_autofix
 

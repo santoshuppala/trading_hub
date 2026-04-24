@@ -67,8 +67,21 @@ class TradierBroker:
 
     def _emit_fill(self, fill_payload) -> None:
         """Emit a FILL event tagged with tradier broker name."""
+        # V10: WAL FILLED — record fill before emitting FILL event
+        _wal_cid = getattr(self, '_current_wal_cid', '')
+        if _wal_cid:
+            try:
+                from .order_wal import wal
+                wal.filled(_wal_cid,
+                           fill_price=fill_payload.fill_price,
+                           fill_qty=fill_payload.qty,
+                           broker_order_id=fill_payload.order_id)
+            except Exception:
+                pass
+
         evt = Event(EventType.FILL, fill_payload)
         evt._routed_broker = self._broker_name
+        evt._wal_client_id = _wal_cid  # carry WAL ID to PositionManager
         self._bus.emit(evt)
         log.info("[TradierBroker] FILL event emitted → will be persisted by EventSourcingSubscriber")
 
@@ -81,11 +94,14 @@ class TradierBroker:
             return
         p: OrderRequestPayload = event.payload
         side = str(getattr(p, "side", "")).upper()
+        # V10: Carry WAL client_id from ORDER_REQ event
+        self._current_wal_cid = getattr(event, '_wal_client_id', '')
 
         if side == "BUY":
             self._execute_buy(p, event)
         elif side == "SELL":
             self._execute_sell(p, event)
+        self._current_wal_cid = ''
 
     # ── Equity buy (limit) ───────────────────────────────────────────
 
@@ -135,6 +151,15 @@ class TradierBroker:
                         "[TradierBroker] BUY %s no order ID returned", ticker
                     )
                     continue
+
+                # V10: WAL SUBMITTED
+                if self._current_wal_cid:
+                    try:
+                        from .order_wal import wal as _wal
+                        _wal.submitted(self._current_wal_cid, broker=self._broker_name,
+                                       broker_order_id=order_id, attempt=attempt)
+                    except Exception:
+                        pass
 
                 # Poll for fill
                 filled, fill_price, filled_qty = self._poll_fill(
@@ -336,7 +361,7 @@ class TradierBroker:
                         price=p.price, reason=f'{p.reason} (no position at tradier)')))
                     return
         except Exception as exc:
-            log.debug("[TradierBroker] Position check failed for %s (proceeding with sell): %s",
+            log.warning("[TradierBroker] Position check failed for %s (proceeding with sell): %s",
                       ticker, exc)
 
         # Cancel bracket child orders before selling
@@ -384,6 +409,15 @@ class TradierBroker:
                             ticker, str(order_resp)[:500])
                 self._emit_order_fail(p, parent_event)
                 return
+
+            # V10: WAL SUBMITTED for sell
+            if self._current_wal_cid:
+                try:
+                    from .order_wal import wal as _wal
+                    _wal.submitted(self._current_wal_cid, broker=self._broker_name,
+                                   broker_order_id=order_id)
+                except Exception:
+                    pass
 
             filled, fill_price, filled_qty = self._poll_fill(
                 order_id, qty, float(p.price)
@@ -637,12 +671,20 @@ class TradierBroker:
                 timeout=5,
             )
         except Exception as exc:
-            log.debug("[TradierBroker] Cancel %s failed: %s", order_id, exc)
+            log.warning("[TradierBroker] Cancel failed: %s", order_id, exc)
 
     def _emit_order_fail(
         self, p: OrderRequestPayload, parent_event: Event
     ) -> None:
         """Emit an ORDER_FAIL event matching the OrderFailPayload dataclass."""
+        # V10: WAL FAILED
+        _wal_cid = getattr(self, '_current_wal_cid', '')
+        if _wal_cid:
+            try:
+                from .order_wal import wal as _wal
+                _wal.failed(_wal_cid, reason=f'order_fail:{p.ticker}:{p.reason}')
+            except Exception:
+                pass
         try:
             self._bus.emit(
                 Event(

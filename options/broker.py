@@ -8,6 +8,7 @@ import time
 from typing import Dict, List, Optional
 
 from monitor.event_bus import Event
+from monitor.order_wal import wal as order_wal
 
 log = logging.getLogger(__name__)
 
@@ -75,16 +76,33 @@ class AlpacaOptionsBroker:
             log.warning("[AlpacaOptionsBroker] client unavailable -- skipping execution")
             return False
 
+        # V10: WAL INTENT for options entry
+        wal_cid = order_wal.new_client_id()
+        order_wal.intent(wal_cid,
+                         ticker=trade_spec.ticker,
+                         side='BUY',
+                         qty=trade_spec.legs[0].qty,
+                         price=abs(trade_spec.net_debit),
+                         reason=f'options:{trade_spec.strategy_type}')
+        self._current_wal_cid = wal_cid
+
         try:
             if len(trade_spec.legs) == 1:
-                return self._execute_single_leg(trade_spec)
+                result = self._execute_single_leg(trade_spec)
             else:
-                return self._execute_multi_leg(trade_spec)
+                result = self._execute_multi_leg(trade_spec)
+
+            if not result and wal_cid:
+                order_wal.failed(wal_cid, reason=f'options_exec_failed:{trade_spec.ticker}')
+            self._current_wal_cid = ''
+            return result
         except Exception as e:
             log.error(
                 "[AlpacaOptionsBroker] execution error for %s (%s): %s",
                 trade_spec.ticker, trade_spec.strategy_type, e,
             )
+            order_wal.failed(wal_cid, reason=f'options_exception:{e}')
+            self._current_wal_cid = ''
             return False
 
     def get_order_status(self, order_id: str) -> Dict:
@@ -140,6 +158,13 @@ class AlpacaOptionsBroker:
             ticker, len(legs),
         )
 
+        # V10: WAL INTENT for options close
+        wal_cid = order_wal.new_client_id()
+        order_wal.intent(wal_cid, ticker=ticker, side='SELL',
+                         qty=legs[0].qty if legs else 0, price=0.0,
+                         reason=f'options_close:{ticker}')
+        self._current_wal_cid = wal_cid
+
         try:
             from .strategies.base import OptionLeg, OptionsTradeSpec
 
@@ -172,12 +197,17 @@ class AlpacaOptionsBroker:
 
             if result:
                 log.info("[AlpacaOptionsBroker] closed position %s successfully", ticker)
+                order_wal.recorded(wal_cid, lot_id=f'options_close:{ticker}')
             else:
                 log.error("[AlpacaOptionsBroker] failed to close position %s", ticker)
+                order_wal.failed(wal_cid, reason=f'close_failed:{ticker}')
+            self._current_wal_cid = ''
             return result
 
         except Exception as e:
             log.error("[AlpacaOptionsBroker] close_position(%s) error: %s", ticker, e)
+            order_wal.failed(wal_cid, reason=f'close_exception:{e}')
+            self._current_wal_cid = ''
             return False
 
     # ── Single-leg execution ──────────────────────────────────────────────────
@@ -222,6 +252,12 @@ class AlpacaOptionsBroker:
                     attempt + 1, MAX_RETRIES + 1,
                 )
 
+                # V10: WAL SUBMITTED
+                _wal_cid = getattr(self, '_current_wal_cid', '')
+                if _wal_cid:
+                    order_wal.submitted(_wal_cid, broker='alpaca_options',
+                                        broker_order_id=str(order_id), attempt=attempt)
+
                 # Poll for fill
                 filled = self._poll_for_fill(order_id)
                 if filled:
@@ -232,6 +268,13 @@ class AlpacaOptionsBroker:
                         fill_info["filled_qty"], fill_info["filled_avg_price"],
                         trade_spec.strategy_type,
                     )
+                    # V10: WAL FILLED + RECORDED
+                    if _wal_cid:
+                        order_wal.filled(_wal_cid,
+                                         fill_price=fill_info["filled_avg_price"],
+                                         fill_qty=fill_info["filled_qty"],
+                                         broker_order_id=str(order_id))
+                        order_wal.recorded(_wal_cid, lot_id=f'options:{trade_spec.ticker}:{order_id}')
                     return True
 
                 # Not filled -- cancel and retry at wider price
@@ -330,6 +373,12 @@ class AlpacaOptionsBroker:
                     attempt + 1, MAX_RETRIES + 1,
                 )
 
+                # V10: WAL SUBMITTED for multi-leg
+                _wal_cid = getattr(self, '_current_wal_cid', '')
+                if _wal_cid:
+                    order_wal.submitted(_wal_cid, broker='alpaca_options',
+                                        broker_order_id=str(order_id), attempt=attempt)
+
                 # Poll for fill — multi-leg gets longer timeout (thinner liquidity)
                 filled = self._poll_for_fill(str(order_id), timeout=MLEG_FILL_TIMEOUT_SEC)
                 if filled:
@@ -339,6 +388,14 @@ class AlpacaOptionsBroker:
                         trade_spec.strategy_type, trade_spec.ticker,
                         fill_info["filled_avg_price"], len(legs),
                     )
+                    # V10: WAL FILLED + RECORDED for multi-leg
+                    if _wal_cid:
+                        order_wal.filled(_wal_cid,
+                                         fill_price=fill_info["filled_avg_price"],
+                                         fill_qty=fill_info["filled_qty"],
+                                         broker_order_id=str(order_id))
+                        order_wal.recorded(_wal_cid,
+                                           lot_id=f'options_mleg:{trade_spec.ticker}:{order_id}')
                     return True
 
                 # Not filled -- check status once more, then cancel and retry
@@ -357,6 +414,14 @@ class AlpacaOptionsBroker:
                             trade_spec.strategy_type, trade_spec.ticker,
                             recheck["filled_avg_price"], len(legs),
                         )
+                        # V10: WAL FILLED + RECORDED for cancel-race fill
+                        if _wal_cid:
+                            order_wal.filled(_wal_cid,
+                                             fill_price=recheck["filled_avg_price"],
+                                             fill_qty=recheck["filled_qty"],
+                                             broker_order_id=str(order_id))
+                            order_wal.recorded(_wal_cid,
+                                               lot_id=f'options_mleg:{trade_spec.ticker}:{order_id}')
                         return True
                     # Cancel failed but not filled — don't retry (avoid duplicates)
                     log.warning(

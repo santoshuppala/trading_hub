@@ -58,7 +58,7 @@ class _BuyingPowerRefresher(threading.Thread):
                         self._last_refresh = time.monotonic()
                     log.debug("[BPRefresher] Updated: $%.2f", bp)
             except Exception as exc:
-                log.debug("[BPRefresher] Fetch failed: %s", exc)
+                log.warning("[BPRefresher] Fetch failed: %s", exc)
             time.sleep(self._REFRESH_INTERVAL)
 
     def get(self) -> tuple[Optional[float], bool]:

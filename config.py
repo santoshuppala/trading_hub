@@ -49,6 +49,23 @@ TICKERS = [
 # Deduplicate while preserving order
 TICKERS = list(dict.fromkeys(TICKERS))
 
+# ── Project paths ─────────────────────────────────────────────────────────────
+# All state files go through these constants. No hardcoded paths elsewhere.
+# Override STATE_DIR via env var for test isolation (conftest.py sets this).
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR    = os.getenv('STATE_DIR', PROJECT_ROOT)
+DATA_DIR     = os.path.join(PROJECT_ROOT, 'data')
+
+# State files at project root (process checkpoints)
+BOT_STATE_PATH          = os.path.join(STATE_DIR, 'bot_state.json')
+
+# State files in data/ (accounting, caches, engine state)
+FILL_LEDGER_PATH        = os.path.join(DATA_DIR, 'fill_ledger.json')
+OPTIONS_STATE_PATH      = os.path.join(DATA_DIR, 'options_state.json')
+BROKER_MAP_PATH         = os.path.join(DATA_DIR, 'position_broker_map.json')
+SUPERVISOR_STATUS_PATH  = os.path.join(DATA_DIR, 'supervisor_status.json')
+LIVE_CACHE_PATH         = os.path.join(DATA_DIR, 'live_cache.json')
+
 # ── Strategy ───────────────────────────────────────────────────────────────────
 STRATEGY       = 'vwap_reclaim'
 STRATEGY_PARAMS = {

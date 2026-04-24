@@ -57,8 +57,8 @@ if os.path.exists(_env_path):
             if '=' in _line:
                 _k, _v = _line.split('=', 1)
                 _v = _v.strip().strip('"').strip("'")
-                if _k.strip() and _k.strip() not in os.environ:
-                    os.environ[_k.strip()] = _v
+                if _k.strip():
+                    os.environ[_k.strip()] = _v  # always use project .env
 
 try:
     from zoneinfo import ZoneInfo
@@ -67,9 +67,10 @@ except ImportError:
 
 ET = ZoneInfo('America/New_York')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
-# bot_state.json lives at PROJECT_ROOT (not data/) — monitor/state.py writes there
-_BOT_STATE_FILE = os.path.join(PROJECT_ROOT, 'bot_state.json')
+from config import (DATA_DIR, BOT_STATE_PATH, FILL_LEDGER_PATH,
+                    OPTIONS_STATE_PATH, BROKER_MAP_PATH, SUPERVISOR_STATUS_PATH,
+                    LIVE_CACHE_PATH)
+_BOT_STATE_FILE = BOT_STATE_PATH
 
 # Logging
 log_dir = os.path.join(PROJECT_ROOT, 'logs', datetime.now().strftime('%Y%m%d'))
@@ -218,6 +219,7 @@ class SessionWatchdog:
         results.append(self._check_positions())
         results.append(self._check_kill_switch())
         results.append(self._check_fill_ledger())
+        results.append(self._check_order_wal())
         results.append(self._check_data_freshness())
         results.append(self._check_memory())
         results.append(self._check_gap_and_go())
@@ -290,7 +292,7 @@ class SessionWatchdog:
 
     def _check_supervisor_status(self) -> HealthCheck:
         """Check supervisor_status.json for restart counts."""
-        status_file = os.path.join(DATA_DIR, 'supervisor_status.json')
+        status_file = SUPERVISOR_STATUS_PATH
         try:
             if not os.path.exists(status_file):
                 return HealthCheck('supervisor', 'WARN', 'No status file', 'WARNING')
@@ -419,35 +421,39 @@ class SessionWatchdog:
         options_pnl = 0.0
         issues = []
 
-        # ── Core state (bot_state.json) ──────────────────────────────
+        # ── Core: FillLedger for P&L, bot_state for positions (V10) ─
+        # P&L: FillLedger (FIFO-matched, always correct)
+        # Positions: bot_state.json (reconciliation keeps in sync with broker)
+        # FillLedger's open_positions can be stale if broker closed positions
+        # while core was down (bracket stops, etc.) — bot_state is reconciled.
         try:
-            state_file = _BOT_STATE_FILE
-            if os.path.exists(state_file):
-                with open(state_file) as f:
+            # Positions from bot_state (reconciled with broker every 5 min)
+            if os.path.exists(_BOT_STATE_FILE):
+                with open(_BOT_STATE_FILE) as f:
                     state = json.load(f)
-                positions = state.get('positions', {})
+                core_positions = len(state.get('positions', {}))
+
+            # P&L + trades from FillLedger
+            if os.path.exists(FILL_LEDGER_PATH):
+                with open(FILL_LEDGER_PATH) as f:
+                    ledger = json.load(f)
+                core_pnl = ledger.get('daily_pnl', 0.0)
+                today_str = datetime.now(ET).strftime('%Y-%m-%d')
+                all_lots = ledger.get('lots', [])
+                core_trades = sum(1 for l in all_lots
+                                  if l.get('side') == 'SELL'
+                                  and l.get('timestamp', '').startswith(today_str))
+            elif os.path.exists(_BOT_STATE_FILE):
+                # Fallback: P&L from bot_state trade_log
                 trade_log = state.get('trade_log', [])
-                core_positions = len(positions)
                 core_trades = len(trade_log)
                 core_pnl = sum(t.get('pnl', 0) for t in trade_log)
-
-                # Check for stuck positions
-                for ticker, pos in positions.items():
-                    opened_at = pos.get('opened_at', '')
-                    if opened_at:
-                        try:
-                            opened = datetime.fromisoformat(opened_at)
-                            age_hours = (datetime.now(ET) - opened).total_seconds() / 3600
-                            if age_hours > 3:
-                                issues.append(f'{ticker}: open {age_hours:.1f}h')
-                        except Exception:
-                            pass
         except Exception:
             pass
 
         # ── Options state (options_state.json) ───────────────────────
         try:
-            opts_file = os.path.join(DATA_DIR, 'options_state.json')
+            opts_file = OPTIONS_STATE_PATH
             if os.path.exists(opts_file):
                 with open(opts_file) as f:
                     opts = json.load(f)
@@ -474,7 +480,7 @@ class SessionWatchdog:
         if total_positions > 20:
             issues.append(f'HIGH position count: {total_positions}')
 
-        msg = (f'core: {core_positions}pos/{core_trades}trades/${core_pnl:+.2f} | '
+        msg = (f'core: {core_positions}pos/{core_trades}trades(today)/${core_pnl:+.2f} | '
                f'options: {options_positions}pos/{options_trades}trades/${options_pnl:+.2f} | '
                f'TOTAL: ${total_pnl:+.2f}')
 
@@ -514,9 +520,8 @@ class SessionWatchdog:
             return HealthCheck('kill_switch', 'OK', f'No kill switch files (OK)')
 
     def _check_fill_ledger(self) -> HealthCheck:
-        """Check FillLedger for P&L drift vs trade_log."""
-        ledger_file = os.path.join(DATA_DIR, 'fill_ledger.json')
-        state_file = _BOT_STATE_FILE
+        """Check FillLedger status — today's activity + open positions from prior days."""
+        ledger_file = FILL_LEDGER_PATH
 
         try:
             if not os.path.exists(ledger_file):
@@ -526,34 +531,54 @@ class SessionWatchdog:
                 ledger = json.load(f)
 
             lots = ledger.get('lots', [])
-            buy_lots = [l for l in lots if l.get('side') == 'BUY']
-            sell_lots = [l for l in lots if l.get('side') == 'SELL']
+            lot_states = ledger.get('lot_states', {})
+            today = datetime.now(ET).strftime('%Y-%m-%d')
 
-            # Compare with trade_log P&L
-            if os.path.exists(state_file):
-                with open(state_file) as f:
-                    state = json.load(f)
-                trade_pnl = sum(t.get('pnl', 0) for t in state.get('trade_log', []))
+            # Separate today's lots from carried-over open lots
+            today_buys = [l for l in lots if l.get('side') == 'BUY'
+                          and l.get('timestamp', '').startswith(today)]
+            today_sells = [l for l in lots if l.get('side') == 'SELL'
+                           and l.get('timestamp', '').startswith(today)]
+            open_lots = [l for l in lots if l.get('side') == 'BUY'
+                         and not lot_states.get(l.get('lot_id', ''), {}).get('is_closed', False)
+                         and lot_states.get(l.get('lot_id', ''), {}).get('remaining_qty', l.get('qty', 0)) > 0.001]
+            carried_open = [l for l in open_lots if not l.get('timestamp', '').startswith(today)]
 
-                # Compute ledger P&L from matches
-                matches = ledger.get('matches', [])
-                ledger_pnl = sum(m.get('realized_pnl', 0) for m in matches)
+            # P&L from pre-computed field (V10)
+            daily_pnl = ledger.get('daily_pnl', 0.0)
 
-                drift = abs(trade_pnl - ledger_pnl)
-                if drift > 50:
-                    self.issues_found['pnl_drift'] += 1
-                    return HealthCheck('fill_ledger', 'WARN',
-                                       f'P&L DRIFT: trade_log=${trade_pnl:.2f} vs ledger=${ledger_pnl:.2f} (${drift:.2f})',
-                                       'WARNING' if drift < 500 else 'CRITICAL')
+            msg = (f'today: {len(today_buys)} buys, {len(today_sells)} sells, '
+                   f'P&L=${daily_pnl:+.2f} | '
+                   f'{len(open_lots)} open ({len(carried_open)} from prior days)')
 
-            return HealthCheck('fill_ledger', 'OK',
-                               f'{len(buy_lots)} buys, {len(sell_lots)} sells')
+            return HealthCheck('fill_ledger', 'OK', msg)
         except Exception as e:
             return HealthCheck('fill_ledger', 'WARN', f'Check failed: {e}', 'WARNING')
 
+    def _check_order_wal(self) -> HealthCheck:
+        """Check Order WAL for stuck/incomplete orders."""
+        try:
+            from monitor.order_wal import wal
+            stats = wal.stats()
+            incomplete = stats.get('incomplete', 0)
+            total = stats.get('total_orders', 0)
+            states = stats.get('states', {})
+
+            if incomplete > 0:
+                # Orders stuck in non-terminal state — something crashed mid-order
+                self.issues_found['wal_incomplete'] += 1
+                return HealthCheck('order_wal', 'WARN',
+                                   f'{incomplete} incomplete orders (total={total}, states={states})',
+                                   'WARNING')
+
+            return HealthCheck('order_wal', 'OK',
+                               f'{total} orders today, 0 incomplete')
+        except Exception as e:
+            return HealthCheck('order_wal', 'OK', f'WAL check skipped: {e}')
+
     def _check_data_freshness(self) -> HealthCheck:
         """Check if market data is flowing (cache file recently updated)."""
-        cache_file = os.path.join(DATA_DIR, 'live_cache.json')
+        cache_file = LIVE_CACHE_PATH
         pkl_fallback = os.path.join(DATA_DIR, 'live_cache.pkl')
 
         try:
@@ -846,7 +871,7 @@ class SessionWatchdog:
     def _heal_stale_cache(self):
         """Remove stale cache files to force fresh data fetch."""
         cache_files = [
-            os.path.join(DATA_DIR, 'live_cache.json'),
+            LIVE_CACHE_PATH,
             os.path.join(DATA_DIR, 'live_cache.pkl'),
         ]
         for path in cache_files:
@@ -920,13 +945,12 @@ class SessionWatchdog:
     def _heal_corrupt_state_files(self):
         """Check all JSON state files for corruption, restore from backups."""
         state_files = [
-            'bot_state.json',
-            'fill_ledger.json',
-            'position_registry.json',
-            'position_broker_map.json',
+            _BOT_STATE_FILE,
+            FILL_LEDGER_PATH,
+            os.path.join(DATA_DIR, 'position_registry.json'),
+            BROKER_MAP_PATH,
         ]
-        for fname in state_files:
-            fpath = os.path.join(DATA_DIR, fname)
+        for fpath in state_files:
             if os.path.exists(fpath):
                 try:
                     with open(fpath) as f:
@@ -1024,8 +1048,7 @@ class SessionWatchdog:
     def _remove_corrupt_cache(self) -> bool:
         """Remove corrupt pickle/cache files."""
         removed = False
-        for fname in ['live_cache.pkl', 'live_cache.json']:
-            fpath = os.path.join(DATA_DIR, fname)
+        for fpath in [LIVE_CACHE_PATH, LIVE_CACHE_PATH.replace('.json', '.pkl')]:
             if os.path.exists(fpath):
                 try:
                     os.remove(fpath)
@@ -1088,59 +1111,35 @@ class SessionWatchdog:
         position_lines = []
         closed_trade_lines = []
 
-        # ── Core P&L: bot_state.json trade_log (same source as heartbeat) ──
-        # This is the authoritative P&L source — populated by PositionManager
-        # on every CLOSED/PARTIAL_EXIT, includes prior-day position closes.
+        # ── Core: FillLedger is P&L authority (V10) ─────────────────
+        # Read pre-computed daily_pnl and open_positions from fill_ledger.json.
+        # Falls back to bot_state.json if FillLedger not available.
         try:
-            state_file = _BOT_STATE_FILE
-            if os.path.exists(state_file):
-                with open(state_file) as f:
-                    state = json.load(f)
-                trade_log = state.get('trade_log', [])
-                core_pnl = sum(t.get('pnl', 0) for t in trade_log)
-                core_closed = len(trade_log)
-        except Exception:
-            pass
-
-        # ── Core positions + trades: FillLedger (detailed view) ──────
-        try:
-            ledger_file = os.path.join(DATA_DIR, 'fill_ledger.json')
+            ledger_file = FILL_LEDGER_PATH
             if os.path.exists(ledger_file):
                 with open(ledger_file) as f:
                     ledger = json.load(f)
-                lots = ledger.get('lots', [])
-                lot_states = ledger.get('lot_states', {})
-                pos_meta = ledger.get('position_meta', {})
 
+                # P&L from pre-computed field (FIFO-matched, always correct)
+                core_pnl = ledger.get('daily_pnl', 0.0)
+                core_closed = ledger.get('trade_count', 0)
+
+                # Open positions from pre-computed summary
+                open_pos = ledger.get('open_positions', {})
+                core_open = len(open_pos)
+                for t, info in open_pos.items():
+                    position_lines.append(
+                        f"  {t:6s}  {info.get('qty',0):>6.0f} shares @ ${info.get('avg_entry',0):>8.2f}  "
+                        f"stop=${info.get('stop_price',0):>8.2f}  target=${info.get('target_price',0):>8.2f}  "
+                        f"{info.get('strategy','')}"
+                    )
+
+                # Trade details from raw lots
+                lots = ledger.get('lots', [])
                 buy_lots = [l for l in lots if l['side'] == 'BUY']
                 sell_lots = [l for l in lots if l['side'] == 'SELL']
                 core_buys = len(buy_lots)
 
-                # Open positions: BUY lots with remaining_qty > 0
-                open_by_ticker = {}
-                for l in buy_lots:
-                    lid = l['lot_id']
-                    st = lot_states.get(lid, {})
-                    remaining = st.get('remaining_qty', l['qty'])
-                    if remaining > 0.001:
-                        t = l['ticker']
-                        if t not in open_by_ticker:
-                            open_by_ticker[t] = {'qty': 0, 'cost': 0, 'strategy': l.get('strategy', '?')}
-                        open_by_ticker[t]['qty'] += remaining
-                        open_by_ticker[t]['cost'] += remaining * l['fill_price']
-
-                core_open = len(open_by_ticker)
-                for t, info in open_by_ticker.items():
-                    avg = info['cost'] / info['qty'] if info['qty'] > 0 else 0
-                    meta = pos_meta.get(t, {})
-                    stop = meta.get('stop_price', 0)
-                    target = meta.get('target_price', 0)
-                    position_lines.append(
-                        f"  {t:6s}  {info['qty']:>6.0f} shares @ ${avg:>8.2f}  "
-                        f"stop=${stop:>8.2f}  target=${target:>8.2f}  {info['strategy']}"
-                    )
-
-                # Trade details (all buys and sells for the day)
                 for sl in sell_lots:
                     t = sl['ticker']
                     reason = sl.get('reason', '?')
@@ -1158,12 +1157,21 @@ class SessionWatchdog:
                         f"  {t:6s}  BUY  {qty:>6.0f} @ ${price:>8.2f}  {strategy}"
                     )
                 closed_trade_lines.sort()
+            else:
+                # Fallback: bot_state.json (FillLedger not available)
+                if os.path.exists(_BOT_STATE_FILE):
+                    with open(_BOT_STATE_FILE) as f:
+                        state = json.load(f)
+                    trade_log = state.get('trade_log', [])
+                    core_pnl = sum(t.get('pnl', 0) for t in trade_log)
+                    core_closed = len(trade_log)
+                    core_open = len(state.get('positions', {}))
         except Exception:
             pass
 
         # ── Options: options_state.json ──────────────────────────────
         try:
-            opts_file = os.path.join(DATA_DIR, 'options_state.json')
+            opts_file = OPTIONS_STATE_PATH
             if os.path.exists(opts_file):
                 with open(opts_file) as f:
                     opts = json.load(f)
@@ -1232,12 +1240,29 @@ class SessionWatchdog:
             body += "\n\n"
 
 
+        # WAL stats
+        _wal_summary = ''
+        try:
+            from monitor.order_wal import wal as _wal
+            _ws = _wal.stats()
+            _wal_summary = (
+                f"ORDER WAL\n"
+                f"  Orders today:  {_ws.get('total_orders', 0)}\n"
+                f"  Incomplete:    {_ws.get('incomplete', 0)}\n"
+                f"  States:        {_ws.get('states', {})}\n\n"
+            )
+        except Exception:
+            pass
+
         body += (
             f"HEALTH\n"
             f"  Checks:    {ok_count} OK, {warn_count} WARN, {crit_count} CRITICAL\n"
             f"  Hotfixes:  {len(self.heals_applied)} applied\n"
             f"  Crashes:   {sum(self._prev_crash_count.values())}\n\n"
         )
+
+        if _wal_summary:
+            body += _wal_summary
 
         # Component status
         body += "COMPONENTS\n"

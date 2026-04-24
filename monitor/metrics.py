@@ -99,7 +99,7 @@ class MetricsWriter:
             os.replace(tmp, self._path)
 
         except Exception as exc:
-            log.debug("[Metrics] Write failed: %s", exc)
+            log.warning("[Metrics] Write failed: %s", exc)
 
     def read(self) -> dict | None:
         """Read latest metrics snapshot (for dashboards)."""

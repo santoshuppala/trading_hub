@@ -72,7 +72,7 @@ class PerStrategyKillSwitch:
                 except Exception:
                     pass
         except Exception as exc:
-            log.debug("[KillSwitch] _on_position error: %s", exc)
+            log.warning("[KillSwitch] _on_position error: %s", exc)
 
     def is_halted(self, strategy_prefix: str) -> bool:
         """Check if a strategy is halted. Called by RiskEngine/RiskAdapter."""

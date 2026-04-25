@@ -1,5 +1,5 @@
 """
-Trading Hub V8 — Streamlit Dashboard
+Trading Hub V10 — Streamlit Dashboard
 
 Launch: streamlit run dashboards/trading_dashboard.py
 DB-driven (reads from TimescaleDB event_store). No in-memory monitor.
@@ -17,7 +17,7 @@ if os.path.exists(_env_path):
             if '=' in _line:
                 _k, _v = _line.split('=', 1)
                 _v = _v.strip().strip('"').strip("'")
-                if _k.strip() and _k.strip() not in os.environ:
+                if _k.strip():
                     os.environ[_k.strip()] = _v
 
 import streamlit as st
@@ -30,7 +30,7 @@ import json
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Trading Hub V8",
+    page_title="Trading Hub V10",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -56,7 +56,7 @@ def run_query(query):
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
-st.sidebar.title("Trading Hub V8")
+st.sidebar.title("Trading Hub V10")
 st.sidebar.markdown("---")
 
 # Date filter
@@ -94,9 +94,16 @@ if selected_tickers and len(selected_tickers) < len(all_tickers):
 st.sidebar.markdown("---")
 auto_refresh = st.sidebar.checkbox("Auto-refresh (60s)", value=False)
 if auto_refresh:
-    import time
-    time.sleep(60)
-    st.rerun()
+    # Use st_autorefresh if available, otherwise JavaScript-based timer.
+    # Avoids time.sleep() which blocks rendering and causes the dim flash.
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=60000, key="auto_refresh")
+    except ImportError:
+        st.markdown(
+            '<meta http-equiv="refresh" content="60">',
+            unsafe_allow_html=True,
+        )
 
 # ── Live Status (from bot_state.json + supervisor_status.json) ───────────────
 st.sidebar.markdown("---")
@@ -148,8 +155,9 @@ trades_df = run_query(f"""
         COALESCE((o.event_payload->>'qty')::INT, 1) as qty,
         COALESCE((c.event_payload->>'pnl')::FLOAT, 0) as pnl,
         COALESCE(c.event_payload->>'exit_reason', c.event_payload->>'action', 'unknown') as exit_reason,
+        COALESCE(c.event_payload->>'reason', c.event_payload->>'exit_reason', 'unknown') as reason,
         COALESCE(o.event_payload->>'strategy', 'unknown') as strategy,
-        COALESCE(o.event_payload->>'broker', 'unknown') as broker,
+        COALESCE(c.event_payload->>'broker', o.event_payload->>'broker', 'unknown') as broker,
         EXTRACT(HOUR FROM o.event_time AT TIME ZONE 'America/New_York')::INT as entry_hour
     FROM event_store c
     JOIN LATERAL (
@@ -356,6 +364,61 @@ with col3:
     st.plotly_chart(fig, use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ROW 2b: Lifecycle Phase (V10 exit engine phase-based reasons)
+# ═══════════════════════════════════════════════════════════════════════════════
+st.subheader("Lifecycle Phase Exits")
+
+def _classify_phase(reason):
+    """Map V10 phase-based exit reasons to lifecycle groups."""
+    r = str(reason).upper()
+    if 'STOP_LOSS' in r or 'SELL_STOP' in r or 'TRAIL_STOP' in r:
+        return 'SELL_STOP'
+    elif 'VWAP' in r or 'SELL_VWAP' in r:
+        return 'SELL_VWAP'
+    elif 'RSI' in r or 'SELL_RSI' in r:
+        return 'SELL_RSI'
+    elif 'TARGET' in r or 'SELL_TARGET' in r:
+        return 'SELL_TARGET'
+    elif 'PARTIAL' in r or 'PARTIAL_SELL' in r:
+        return 'PARTIAL_SELL'
+    elif 'EOD' in r or 'MARKET_CLOSE' in r:
+        return 'EOD_EXIT'
+    else:
+        return str(reason)
+
+trades_df['lifecycle_phase'] = trades_df['reason'].apply(_classify_phase)
+
+lc1, lc2 = st.columns(2)
+with lc1:
+    phase_counts = trades_df.groupby('lifecycle_phase').agg(
+        count=('pnl', 'count'),
+        total_pnl=('pnl', 'sum'),
+    ).sort_values('count', ascending=False)
+    fig = go.Figure(go.Bar(
+        x=phase_counts.index,
+        y=phase_counts['count'],
+        marker_color=['#00CC96' if v > 0 else '#EF553B' for v in phase_counts['total_pnl']],
+        text=[f"${p:+.0f}" for p in phase_counts['total_pnl']],
+        textposition='outside',
+    ))
+    fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20),
+                      xaxis_title="Exit Phase", yaxis_title="Trade Count")
+    st.plotly_chart(fig, use_container_width=True)
+
+with lc2:
+    phase_pnl = trades_df.groupby('lifecycle_phase')['pnl'].sum().sort_values()
+    fig = go.Figure(go.Bar(
+        y=phase_pnl.index,
+        x=phase_pnl.values,
+        orientation='h',
+        marker_color=['#00CC96' if v > 0 else '#EF553B' for v in phase_pnl.values],
+        hovertemplate='%{y}: $%{x:.2f}<extra></extra>',
+    ))
+    fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20),
+                      xaxis_title="P&L ($)")
+    st.plotly_chart(fig, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ROW 3: Pro Strategy Tiers + P&L Distribution + Hold Time
 # ═══════════════════════════════════════════════════════════════════════════════
 col1, col2, col3 = st.columns(3)
@@ -461,8 +524,9 @@ with col2:
 # ADVANCED ANALYTICS TABS
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
-tab_perf, tab_risk, tab_engine, tab_log = st.tabs([
+tab_perf, tab_risk, tab_engine, tab_log, tab_completed = st.tabs([
     "Performance Metrics", "Risk Analytics", "Engine Deep Dive", "Trade Log",
+    "Completed Trades (DB)",
 ])
 
 # ── TAB 1: Performance Metrics ──────────────────────────────────────────────
@@ -620,3 +684,52 @@ with tab_log:
         use_container_width=True,
         height=500,
     )
+
+# ── TAB 5: Completed Trades (DB) ──────────────────────────────────────────
+with tab_completed:
+    st.subheader("Completed Trades (from completed_trades table)")
+    try:
+        ct_df = run_query(f"""
+            SELECT trade_id, ticker, entry_time, exit_time,
+                   entry_price, exit_price, qty, pnl, pnl_pct,
+                   duration_seconds, strategy, broker
+            FROM completed_trades
+            WHERE entry_time::DATE = '{selected_date}'
+            ORDER BY exit_time
+        """)
+        if ct_df.empty:
+            st.info(f"No completed_trades rows for {selected_date}")
+        else:
+            ct_df['outcome'] = ct_df['pnl'].apply(lambda x: 'Win' if x > 0 else 'Loss')
+            ct_df['hold_min'] = (ct_df['duration_seconds'].fillna(0) / 60).round(1)
+
+            ct_k1, ct_k2, ct_k3, ct_k4 = st.columns(4)
+            ct_k1.metric("Trades", len(ct_df))
+            ct_k2.metric("Total P&L", f"${ct_df['pnl'].sum():+,.2f}")
+            ct_wins = (ct_df['pnl'] > 0).sum()
+            ct_k3.metric("Win Rate", f"{ct_wins / len(ct_df) * 100:.1f}%")
+            ct_k4.metric("Avg P&L %", f"{ct_df['pnl_pct'].mean():.2f}%")
+
+            ct_display = ct_df[['trade_id', 'ticker', 'entry_time', 'exit_time',
+                                'entry_price', 'exit_price', 'qty', 'pnl', 'pnl_pct',
+                                'hold_min', 'strategy', 'broker', 'outcome']].copy()
+            ct_display['entry_time'] = pd.to_datetime(ct_display['entry_time']).dt.strftime('%H:%M:%S')
+            ct_display['exit_time'] = pd.to_datetime(ct_display['exit_time']).dt.strftime('%H:%M:%S')
+            ct_display = ct_display.rename(columns={
+                'trade_id': 'Trade ID', 'ticker': 'Ticker',
+                'entry_time': 'Entry', 'exit_time': 'Exit',
+                'entry_price': 'Entry $', 'exit_price': 'Exit $',
+                'qty': 'Qty', 'pnl': 'P&L', 'pnl_pct': 'P&L %',
+                'hold_min': 'Hold (min)', 'strategy': 'Strategy',
+                'broker': 'Broker', 'outcome': 'Result',
+            })
+            st.dataframe(
+                ct_display.style.map(
+                    lambda v: 'color: #00CC96' if v == 'Win' else 'color: #EF553B' if v == 'Loss' else '',
+                    subset=['Result']
+                ),
+                use_container_width=True,
+                height=500,
+            )
+    except Exception as exc:
+        st.warning(f"completed_trades table not available: {exc}")

@@ -19,7 +19,7 @@ if os.path.exists(_env_path):
             if '=' in _line:
                 _k, _v = _line.split('=', 1)
                 _v = _v.strip().strip('"').strip("'")
-                if _k.strip() and _k.strip() not in os.environ:
+                if _k.strip():
                     os.environ[_k.strip()] = _v
 
 import streamlit as st
@@ -241,9 +241,13 @@ trades_df = run_query(f"""
         event_time as ts,
         event_payload->>'ticker' as ticker,
         COALESCE((event_payload->>'pnl')::FLOAT, 0) as pnl,
-        COALESCE(event_payload->>'exit_reason', event_payload->>'action', 'unknown') as reason,
+        COALESCE(event_payload->>'reason', event_payload->>'exit_reason',
+                 event_payload->>'action', 'unknown') as reason,
+        COALESCE(event_payload->>'strategy', '') as strategy,
+        COALESCE(event_payload->>'broker', '') as broker,
         COALESCE((event_payload->>'entry_price')::FLOAT, 0) as entry_price,
-        COALESCE((event_payload->>'current_price')::FLOAT, 0) as exit_price,
+        COALESCE((event_payload->>'exit_price')::FLOAT,
+                 (event_payload->>'current_price')::FLOAT, 0) as exit_price,
         COALESCE((event_payload->>'qty')::INT, 0) as qty
     FROM event_store
     WHERE event_type = 'PositionClosed'
@@ -454,9 +458,9 @@ with col_risk:
                      'green' if risk_m.get('expectancy', 0) > 0 else 'red')
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ROW 4: Trade Flow + Exit Reasons
+# ROW 4: Trade Flow + Exit Reasons + Strategy Breakdown
 # ═══════════════════════════════════════════════════════════════════════════════
-col_flow, col_exit = st.columns([3, 2])
+col_flow, col_exit, col_strat2 = st.columns([3, 2, 2])
 
 with col_flow:
     st.markdown('<div class="section-header">TRADE FLOW</div>', unsafe_allow_html=True)
@@ -493,13 +497,39 @@ with col_exit:
     fig.update_layout(**DARK_LAYOUT, height=250)
     st.plotly_chart(fig, use_container_width=True)
 
+with col_strat2:
+    st.markdown('<div class="section-header">BY STRATEGY</div>', unsafe_allow_html=True)
+    if 'strategy' in trades_df.columns and trades_df['strategy'].any():
+        # Clean strategy names (strip pro: prefix)
+        strat_clean = trades_df['strategy'].str.replace('pro:', '', regex=False).str.split(':').str[0]
+        strat_pnl = trades_df.groupby(strat_clean).agg(
+            count=('pnl', 'count'),
+            total_pnl=('pnl', 'sum'),
+            win_rate=('pnl', lambda x: (x > 0).mean() * 100),
+        ).sort_values('total_pnl', ascending=False)
+        strat_data = []
+        for name, row in strat_pnl.iterrows():
+            strat_data.append({
+                'Strategy': name or 'unknown',
+                '#': int(row['count']),
+                'P&L': f"${row['total_pnl']:+.2f}",
+                'Win%': f"{row['win_rate']:.0f}%",
+            })
+        st.dataframe(pd.DataFrame(strat_data), use_container_width=True,
+                      hide_index=True, height=250)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROW 5: Trade Log (compact terminal view)
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="section-header">TRADE LOG</div>', unsafe_allow_html=True)
 
-display_df = trades_df[['ts', 'ticker', 'qty', 'entry_price', 'exit_price', 'pnl', 'reason']].copy()
-display_df.columns = ['Time', 'Ticker', 'Qty', 'Entry', 'Exit', 'P&L', 'Reason']
+_log_cols = ['ts', 'ticker', 'qty', 'entry_price', 'exit_price', 'pnl', 'reason', 'strategy', 'broker']
+_log_cols = [c for c in _log_cols if c in trades_df.columns]
+display_df = trades_df[_log_cols].copy()
+_col_map = {'ts': 'Time', 'ticker': 'Ticker', 'qty': 'Qty', 'entry_price': 'Entry',
+            'exit_price': 'Exit', 'pnl': 'P&L', 'reason': 'Reason',
+            'strategy': 'Strategy', 'broker': 'Broker'}
+display_df.columns = [_col_map.get(c, c) for c in display_df.columns]
 display_df['Time'] = pd.to_datetime(display_df['Time']).dt.strftime('%H:%M:%S')
 display_df['Entry'] = display_df['Entry'].apply(lambda x: f"${x:.2f}" if x else "")
 display_df['Exit'] = display_df['Exit'].apply(lambda x: f"${x:.2f}" if x else "")
@@ -515,7 +545,7 @@ st.dataframe(
 # ── Footer ───────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div style="text-align: center; padding: 16px; color: #4a4a6a; font-family: 'SF Mono', monospace; font-size: 11px;">
-    TRADING HUB PRO | {total_trades} trades | {len(trades_df['ticker'].unique())} tickers | {selected_date} |
-    {'LIVE' if market_open else 'CLOSED'}
+    TRADING HUB V10 | {total_trades} trades | {len(trades_df['ticker'].unique())} tickers | {selected_date} |
+    {'LIVE' if market_open else 'CLOSED'} | Phase-Based Lifecycle Exits
 </div>
 """, unsafe_allow_html=True)

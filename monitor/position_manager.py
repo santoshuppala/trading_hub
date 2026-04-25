@@ -492,6 +492,11 @@ class PositionManager:
             'is_win':      pnl >= 0,
         }
 
+        # V10: Attach lifecycle data for ML/edge model
+        _lc = pos.get('_lifecycle_data')
+        if _lc:
+            trade['lifecycle'] = _lc
+
         # V8: Update per-broker qty tracking on any sell
         _sell_broker = getattr(parent, '_routed_broker', None) if parent else None
         if _sell_broker and '_broker_qty' in pos:
@@ -568,7 +573,7 @@ class PositionManager:
         _broker = getattr(parent, '_routed_broker', 'unknown') if parent else 'unknown'
         _strategy = trade.get('strategy', pos_strategy) if 'strategy' in trade else pos_strategy
         _engine = _strategy.split(':')[0] if ':' in _strategy else 'core'
-        _win = 'WIN' if pnl >= 0 else 'LOSS'
+        _win = 'BREAKEVEN' if abs(pnl) < 0.01 else ('WIN' if pnl > 0 else 'LOSS')
 
         send_alert(
             self._alert_email,
@@ -598,6 +603,8 @@ class PositionManager:
                     'reason': reason,
                     'strategy': pos.get('strategy', 'vwap_reclaim'),
                     'broker': broker,
+                    # V10: Lifecycle data for ML/edge model
+                    'lifecycle': pos.get('_lifecycle_data', {}),
                 },
             ),
             correlation_id=parent.event_id,

@@ -740,6 +740,16 @@ def main():
 
         write_status(managers)
 
+        # V10: Delete heartbeat file — prevents false HUNG detection on next startup.
+        # Without this, the stale heartbeat from today triggers "64337s stale" at 6 AM tomorrow.
+        try:
+            hb_path = os.path.join(PROJECT_ROOT, 'data', 'heartbeat.json')
+            if os.path.exists(hb_path):
+                os.remove(hb_path)
+                log.info("[shutdown] Removed heartbeat.json (prevents stale HUNG on next startup)")
+        except Exception:
+            pass
+
         # V7.1: Run post-session analytics (ML features, strategy scoring)
         try:
             import subprocess

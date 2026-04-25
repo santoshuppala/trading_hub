@@ -501,6 +501,31 @@ def main():
                 # V9: Wire streaming cvol into RVOLEngine for real-time RVOL
                 if rvol_engine:
                     rvol_engine.set_stream_client(tradier_stream)
+
+                # V10: Wire BarBuilder for sub-second BAR delivery.
+                # Starts with emit_bars=False. After monitor's first REST cycle
+                # populates bars_cache, monitor.seed_from_cache() seeds BarBuilder
+                # with full day history → auto-enables emit_bars=True.
+                # REST BAR emission is then skipped for tickers BarBuilder covers.
+                # Edge cases:
+                #   - Crash/restart: BarBuilder starts empty → reseeded on first cycle
+                #   - WebSocket disconnect: covers_ticker() returns False → REST resumes
+                #   - Illiquid tickers: no ticks → covers_ticker() False → REST fallback
+                #   - Manual kill+rerun: same as crash — clean slate, reseed from REST
+                try:
+                    from monitor.bar_builder import BarBuilder
+                    bar_builder = BarBuilder(bus=monitor._bus, max_history=200, emit_bars=False)
+                    if rvol_engine and hasattr(rvol_engine, '_baselines'):
+                        bar_builder.set_rvol_baselines(rvol_engine._baselines or {})
+                    tradier_stream.set_bar_builder(bar_builder)
+                    bar_builder.start()
+                    # Wire to monitor for automatic seeding after first REST fetch
+                    monitor.set_bar_builder(bar_builder)
+                    log.info("BarBuilder active — will seed from REST on first cycle "
+                             "then emit sub-second BARs")
+                except Exception as bb_exc:
+                    log.warning("BarBuilder init failed (non-fatal): %s", bb_exc)
+
                 log.info("Tradier streaming active | HOT tickers=%d", len(hot_tickers))
             else:
                 log.warning("Tradier streaming unavailable — using REST polling fallback")

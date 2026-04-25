@@ -156,12 +156,23 @@ class SessionWatchdog:
             self._print_results(results)
             return
 
+        # V10: Generate session report on SIGTERM (supervisor kills us at 4 PM)
+        import signal as _signal
+        def _on_shutdown(signum, frame):
+            log.info("Shutdown signal received — generating session report")
+            try:
+                self._generate_session_report()
+            except Exception as exc:
+                log.warning("Session report failed on shutdown: %s", exc)
+            raise SystemExit(0)
+        _signal.signal(_signal.SIGTERM, _on_shutdown)
+
         try:
             while True:
                 now = datetime.now(ET)
 
-                # Stop after market close (4:15 PM — 15 min grace)
-                if now.hour >= 16 and now.minute >= 15:
+                # Stop after market close (4:00 PM)
+                if now.hour >= 16:
                     log.info("Market closed — generating session report")
                     self._generate_session_report()
                     break
@@ -1122,23 +1133,45 @@ class SessionWatchdog:
 
                 # P&L from pre-computed field (FIFO-matched, always correct)
                 core_pnl = ledger.get('daily_pnl', 0.0)
-                core_closed = ledger.get('trade_count', 0)
 
-                # Open positions from pre-computed summary
-                open_pos = ledger.get('open_positions', {})
-                core_open = len(open_pos)
-                for t, info in open_pos.items():
-                    position_lines.append(
-                        f"  {t:6s}  {info.get('qty',0):>6.0f} shares @ ${info.get('avg_entry',0):>8.2f}  "
-                        f"stop=${info.get('stop_price',0):>8.2f}  target=${info.get('target_price',0):>8.2f}  "
-                        f"{info.get('strategy','')}"
-                    )
+                # Open positions from bot_state (authoritative, reconciled with broker)
+                # fill_ledger's open_positions can be stale after sells
+                try:
+                    with open(_BOT_STATE_FILE) as _bf:
+                        _bs = json.load(_bf)
+                    _live_pos = _bs.get('positions', {})
+                    core_open = len(_live_pos)
+                    for t, info in _live_pos.items():
+                        entry = info.get('entry_price', 0)
+                        stop = info.get('stop_price', 0)
+                        target = info.get('target_price', 0)
+                        strategy = info.get('strategy', '')
+                        qty = info.get('quantity', info.get('qty', 0))
+                        position_lines.append(
+                            f"  {t:6s}  {qty:>6.0f} shares @ ${entry:>8.2f}  "
+                            f"stop=${stop:>8.2f}  target=${target:>8.2f}  "
+                            f"{strategy}"
+                        )
+                except Exception:
+                    # Fallback to fill_ledger if bot_state unavailable
+                    open_pos = ledger.get('open_positions', {})
+                    core_open = len(open_pos)
+                    for t, info in open_pos.items():
+                        position_lines.append(
+                            f"  {t:6s}  {info.get('qty',0):>6.0f} shares @ ${info.get('avg_entry',0):>8.2f}  "
+                            f"stop=${info.get('stop_price',0):>8.2f}  target=${info.get('target_price',0):>8.2f}  "
+                            f"{info.get('strategy','')}"
+                        )
 
-                # Trade details from raw lots
+                # Trade details from raw lots (today only — not all-time)
                 lots = ledger.get('lots', [])
-                buy_lots = [l for l in lots if l['side'] == 'BUY']
-                sell_lots = [l for l in lots if l['side'] == 'SELL']
+                _today_str = datetime.now(ET).strftime('%Y-%m-%d')
+                buy_lots = [l for l in lots if l['side'] == 'BUY'
+                            and l.get('timestamp', '').startswith(_today_str)]
+                sell_lots = [l for l in lots if l['side'] == 'SELL'
+                             and l.get('timestamp', '').startswith(_today_str)]
                 core_buys = len(buy_lots)
+                core_closed = len(sell_lots)
 
                 for sl in sell_lots:
                     t = sl['ticker']
@@ -1186,7 +1219,7 @@ class SessionWatchdog:
 
         pnl = core_pnl + options_pnl
         open_positions = core_open + options_open
-        total_trades = core_buys + core_closed + options_trades
+        total_trades = core_closed + options_trades  # closed trades only (not buys+sells)
 
         # Overall status
         if crit_count > 0:
@@ -1363,14 +1396,14 @@ class SessionWatchdog:
             log.warning("  Alert send failed: %s", e)
 
     def _generate_session_report(self):
-        """Generate end-of-session summary report."""
+        """Generate end-of-session summary report with full broker reconciliation."""
+        now = datetime.now(ET)
         log.info("")
         log.info("=" * 60)
-        log.info("SESSION REPORT — %s", datetime.now(ET).strftime('%Y-%m-%d'))
+        log.info("SESSION REPORT — %s", now.strftime('%Y-%m-%d'))
         log.info("=" * 60)
         log.info("  Duration:     %s → %s",
-                 self.session_start.strftime('%H:%M'),
-                 datetime.now(ET).strftime('%H:%M'))
+                 self.session_start.strftime('%H:%M'), now.strftime('%H:%M'))
         log.info("  Checks run:   %d", self.checks_run)
         log.info("  Alerts sent:  %d", len(self.alerts_sent))
 
@@ -1382,52 +1415,245 @@ class SessionWatchdog:
             log.info("  Issues found: NONE")
 
         if self.heals_applied:
-            log.info("")
             log.info("  Auto-heals applied: %d", len(self.heals_applied))
-            for ts, action, result in self.heals_applied:
+            for ts, action, result in self.heals_applied[-5:]:
                 log.info("    [%s] %s → %s", ts, action, result)
         else:
-            log.info("  Auto-heals applied: NONE (clean session)")
+            log.info("  Auto-heals applied: NONE")
+
+        # ── Comprehensive P&L Report ────────────────────────────────────
+        report_lines = []
+        report_lines.append("")
+        report_lines.append("P&L REPORT")
+        report_lines.append("-" * 50)
+
+        # 1. Our realized P&L from FillLedger
+        our_realized = 0.0
+        our_trades = 0
+        our_open_count = 0
+        our_open_tickers = []
+        try:
+            if os.path.exists(FILL_LEDGER_PATH):
+                with open(FILL_LEDGER_PATH) as f:
+                    ledger = json.load(f)
+                our_realized = ledger.get('daily_pnl', 0.0)
+                our_trades = ledger.get('trade_count', 0)
+                our_open = ledger.get('open_positions', {})
+                our_open_count = len(our_open)
+                our_open_tickers = list(our_open.keys())
+        except Exception:
+            pass
+
+        report_lines.append(f"  OUR SYSTEM (FillLedger)")
+        report_lines.append(f"    Realized P&L:    ${our_realized:+,.2f}")
+        report_lines.append(f"    Trades today:    {our_trades}")
+        report_lines.append(f"    Open positions:  {our_open_count} {our_open_tickers}")
+
+        # 2. Broker accounts — BOD equity, EOD equity, P&L
+        report_lines.append("")
+        report_lines.append("  BROKER ACCOUNTS")
+
+        alpaca_bod = 0.0
+        alpaca_eod = 0.0
+        alpaca_pnl = 0.0
+        alpaca_open = {}
+        alpaca_unrealized = 0.0
+        tradier_bod = 0.0
+        tradier_eod = 0.0
+        tradier_pnl = 0.0
+        tradier_open = {}
+        tradier_unrealized = 0.0
+
+        try:
+            from alpaca.trading.client import TradingClient
+            ac = TradingClient(
+                os.getenv('APCA_API_KEY_ID', ''),
+                os.getenv('APCA_API_SECRET_KEY', ''), paper=True)
+            acct = ac.get_account()
+            alpaca_eod = float(acct.equity)
+            alpaca_bod = float(acct.last_equity)
+            alpaca_pnl = alpaca_eod - alpaca_bod
+
+            for p in ac.get_all_positions():
+                sym = str(p.symbol)
+                if len(sym) <= 10:
+                    unrealized = float(p.unrealized_pl)
+                    alpaca_unrealized += unrealized
+                    alpaca_open[sym] = {
+                        'qty': int(float(p.qty)),
+                        'entry': float(p.avg_entry_price),
+                        'unrealized': unrealized,
+                    }
+        except Exception as e:
+            report_lines.append(f"    Alpaca:   FETCH FAILED — {e}")
+
+        try:
+            import requests
+            t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TOKEN', '')
+            t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+            t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+            t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+            t_headers = {'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'}
+
+            r = requests.get(f'{t_base}/v1/accounts/{t_acct}/balances',
+                            headers=t_headers, timeout=10)
+            if r.ok:
+                b = r.json().get('balances', {})
+                tradier_eod = float(b.get('total_equity', 0))
+                # Tradier doesn't give last_equity — estimate from our baseline
+                tradier_bod = tradier_eod  # will be corrected below if equity tracker available
+
+            r2 = requests.get(f'{t_base}/v1/accounts/{t_acct}/positions',
+                             headers=t_headers, timeout=10)
+            if r2.ok:
+                pos_data = r2.json().get('positions', {})
+                if pos_data and pos_data != 'null':
+                    plist = pos_data.get('position', [])
+                    if isinstance(plist, dict): plist = [plist]
+                    for p in plist:
+                        qty = int(float(p.get('quantity', 0)))
+                        if qty > 0:
+                            cost = float(p.get('cost_basis', 0))
+                            tradier_open[p['symbol']] = {
+                                'qty': qty,
+                                'entry': cost / qty if qty else 0,
+                            }
+        except Exception as e:
+            report_lines.append(f"    Tradier:  FETCH FAILED — {e}")
+
+        # Try to get BOD from equity tracker baseline
+        try:
+            # Read baseline from the equity check logs
+            import subprocess
+            result = subprocess.run(
+                ['/usr/bin/grep', 'SESSION EQUITY BASELINE', f'logs/{now.strftime("%Y%m%d")}/core.log'],
+                capture_output=True, text=True, timeout=5)
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if 'alpaca' in line.lower():
+                        import re
+                        m = re.search(r'\$([0-9,]+\.\d+)', line)
+                        if m and alpaca_bod == 0:
+                            alpaca_bod = float(m.group(1).replace(',', ''))
+                    if 'tradier' in line.lower():
+                        m = re.search(r'\$([0-9,]+\.\d+)', line)
+                        if m:
+                            tradier_bod = float(m.group(1).replace(',', ''))
+        except Exception:
+            pass
+
+        # If we still don't have Tradier BOD, compute from Alpaca pattern
+        if tradier_bod == tradier_eod and tradier_eod > 0:
+            tradier_pnl = 0.0  # unknown
+        else:
+            tradier_pnl = tradier_eod - tradier_bod
+
+        report_lines.append(f"    {'':20s} {'BOD':>14s} {'EOD':>14s} {'P&L':>12s}")
+        report_lines.append(f"    {'Alpaca':20s} ${alpaca_bod:>13,.2f} ${alpaca_eod:>13,.2f} ${alpaca_pnl:>+11,.2f}")
+        report_lines.append(f"    {'Tradier':20s} ${tradier_bod:>13,.2f} ${tradier_eod:>13,.2f} ${tradier_pnl:>+11,.2f}")
+        combined_bod = alpaca_bod + tradier_bod
+        combined_eod = alpaca_eod + tradier_eod
+        combined_pnl = alpaca_pnl + tradier_pnl
+        report_lines.append(f"    {'-'*20} {'-'*14} {'-'*14} {'-'*12}")
+        report_lines.append(f"    {'COMBINED':20s} ${combined_bod:>13,.2f} ${combined_eod:>13,.2f} ${combined_pnl:>+11,.2f}")
+
+        # 3. Open positions detail
+        all_broker_open = {}
+        for sym, info in alpaca_open.items():
+            all_broker_open[sym] = {**info, 'broker': 'alpaca'}
+        for sym, info in tradier_open.items():
+            if sym in all_broker_open:
+                all_broker_open[sym]['qty'] += info['qty']
+                all_broker_open[sym]['broker'] += '+tradier'
+            else:
+                all_broker_open[sym] = {**info, 'unrealized': 0, 'broker': 'tradier'}
+
+        if all_broker_open:
+            report_lines.append("")
+            report_lines.append(f"  OPEN POSITIONS ({len(all_broker_open)})")
+            for sym, info in sorted(all_broker_open.items()):
+                unrealized = info.get('unrealized', 0)
+                report_lines.append(
+                    f"    {sym:6s}  {info['qty']:>4} shares @ ${info['entry']:>8.2f}  "
+                    f"unrealized=${unrealized:>+8.2f}  ({info['broker']})")
+
+        # 4. P&L reconciliation
+        report_lines.append("")
+        report_lines.append("  P&L RECONCILIATION")
+        report_lines.append(f"    Our realized (FillLedger):  ${our_realized:>+10,.2f}")
+        report_lines.append(f"    Broker combined P&L:        ${combined_pnl:>+10,.2f}")
+        drift = abs(our_realized - combined_pnl)
+        report_lines.append(f"    DRIFT:                      ${drift:>10,.2f}")
+        if drift < 5:
+            report_lines.append(f"    STATUS: IN SYNC")
+        elif drift < 50:
+            report_lines.append(f"    STATUS: MINOR DRIFT (unrealized positions may explain)")
+        else:
+            report_lines.append(f"    STATUS: SIGNIFICANT DRIFT — investigate")
+
+        # 5. WAL status
+        try:
+            from monitor.order_wal import wal
+            ws = wal.stats()
+            report_lines.append("")
+            report_lines.append("  ORDER WAL")
+            report_lines.append(f"    Orders today:   {ws.get('total_orders', 0)}")
+            report_lines.append(f"    Incomplete:     {ws.get('incomplete', 0)}")
+        except Exception:
+            pass
+
+        # Log everything
+        for line in report_lines:
+            log.info(line)
 
         # Final health check
-        final = self._run_all_checks()
         log.info("")
-        log.info("  Final status:")
+        log.info("  FINAL HEALTH CHECK")
+        final = self._run_all_checks()
         for r in final:
             icon = {'OK': 'OK ', 'WARN': 'WRN', 'CRITICAL': 'CRT'}.get(r.status, '???')
             log.info("    [%s] %s: %s", icon, r.name, r.message)
 
-        # Read final P&L
-        try:
-            state_file = _BOT_STATE_FILE
-            if os.path.exists(state_file):
-                with open(state_file) as f:
-                    state = json.load(f)
-                pnl = sum(t.get('pnl', 0) for t in state.get('trade_log', []))
-                trades = len(state.get('trade_log', []))
-                positions = len(state.get('positions', {}))
-                log.info("")
-                log.info("  Daily P&L:    $%.2f", pnl)
-                log.info("  Trades:       %d", trades)
-                log.info("  Open pos:     %d", positions)
-        except Exception:
-            pass
-
         log.info("=" * 60)
 
-        # Send summary alert
+        # ── Send email ──────────────────────────────────────────────────
         try:
             from config import ALERT_EMAIL
             from monitor.alerts import send_alert
             if ALERT_EMAIL:
-                summary = (
-                    f"SESSION WATCHDOG REPORT — {datetime.now(ET).strftime('%Y-%m-%d')}\n\n"
-                    f"Checks: {self.checks_run}\n"
-                    f"Alerts: {len(self.alerts_sent)}\n"
+                email_body = (
+                    f"SESSION REPORT — {now.strftime('%Y-%m-%d')}\n"
+                    f"{'=' * 50}\n\n"
+                    f"Duration: {self.session_start.strftime('%H:%M')} → {now.strftime('%H:%M')}\n"
+                    f"Checks: {self.checks_run} | Alerts: {len(self.alerts_sent)}\n"
                     f"Issues: {dict(self.issues_found) or 'None'}\n\n"
-                    f"Review logs: {log_file}"
                 )
-                send_alert(ALERT_EMAIL, summary, severity='INFO')
+                email_body += '\n'.join(report_lines)
+                email_body += f"\n\n{'=' * 50}\n"
+
+                status = 'GREEN' if drift < 5 else ('YELLOW' if drift < 50 else 'RED')
+                subject = (f"[{status}] EOD Report | P&L: ${our_realized:+,.2f} | "
+                          f"{our_trades} trades | {our_open_count} open | "
+                          f"Drift: ${drift:.2f}")
+                try:
+                    import smtplib
+                    from email.mime.text import MIMEText
+                    msg = MIMEText(email_body, 'plain')
+                    msg['Subject'] = subject
+                    msg['From'] = os.getenv('ALERT_EMAIL_USER', '')
+                    msg['To'] = ALERT_EMAIL
+                    s = smtplib.SMTP(
+                        os.getenv('ALERT_EMAIL_SERVER', 'smtp.mail.yahoo.com'),
+                        int(os.getenv('ALERT_EMAIL_PORT', '587')), timeout=15)
+                    s.ehlo(); s.starttls(); s.ehlo()
+                    s.login(os.getenv('ALERT_EMAIL_USER', ''), os.getenv('ALERT_EMAIL_PASS', ''))
+                    s.sendmail(msg['From'], [ALERT_EMAIL], msg.as_string())
+                    s.quit()
+                    log.info("[EOD] Report email sent")
+                except Exception as e:
+                    log.warning("[EOD] Email send failed: %s", e)
+                    # Fallback to alert queue
+                    send_alert(ALERT_EMAIL, email_body, severity='INFO')
         except Exception:
             pass
 

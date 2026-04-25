@@ -832,8 +832,20 @@ class RealTimeMonitor:
         # Remove local positions not at ANY broker.
         # V9: Record missing SELLs in trade_log + FillLedger so P&L is tracked.
         # Queries ALL brokers for actual fill price — no P&L goes unrecorded.
+        # V10: Dedup — skip tickers already externally closed in trade_log today.
+        # Without this, every restart re-discovers DB-recovered phantom positions
+        # and records duplicate external closes (ISRG bug: 5x on Apr 24).
+        _already_closed = {t.get('ticker') for t in self.trade_log
+                          if 'external_close' in t.get('reason', '')}
         all_broker_tickers = alpaca_tickers | tradier_tickers
         stale = [t for t in list(self.positions.keys()) if t not in all_broker_tickers]
+
+        # Silently remove positions already closed in a prior restart
+        for ticker in [t for t in stale if t in _already_closed]:
+            del self.positions[ticker]
+            log.info("[reconcile] %s already closed (dedup) — removing from state", ticker)
+
+        stale = [t for t in stale if t not in _already_closed]
         for ticker in stale:
             pos = self.positions[ticker]
             entry_price = pos.get('entry_price', 0)

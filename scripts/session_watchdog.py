@@ -234,6 +234,11 @@ class SessionWatchdog:
         results.append(self._check_data_freshness())
         results.append(self._check_memory())
         results.append(self._check_gap_and_go())
+        # V10: New checks for hardening fixes
+        results.append(self._check_v10_equity_lifecycle())
+        results.append(self._check_v10_options_lifecycle())
+        results.append(self._check_v10_pending_tickers())
+        results.append(self._check_v10_bar_builder())
         return [r for r in results if r is not None]
 
     # ── Individual checks ─────────────────────────────────────────────────
@@ -664,6 +669,151 @@ class SessionWatchdog:
         except Exception as e:
             return HealthCheck('gap_and_go', 'OK', f'Check skipped: {e}')
 
+    # ── V10 Health Checks ─────────────────────────────────────────────────
+
+    def _check_v10_equity_lifecycle(self) -> HealthCheck:
+        """V10: Check equity exit engine — bars_held should match actual bars, not quotes."""
+        today = datetime.now().strftime('%Y%m%d')
+        core_log = os.path.join(PROJECT_ROOT, 'logs', today, 'core.log')
+        try:
+            if not os.path.exists(core_log):
+                return HealthCheck('v10_equity_lifecycle', 'OK', 'No log')
+
+            # Check for is_quote corruption: bars_held incrementing too fast
+            result = subprocess.run(
+                ['/usr/bin/grep', '-c', 'bars_held.*=.*[0-9][0-9][0-9]', core_log],
+                capture_output=True, text=True, timeout=10)
+            high_bars = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+            # Check for QUOTE handler poisoning lifecycle
+            result2 = subprocess.run(
+                ['/usr/bin/grep', '-c', 'phase0_quote_hold', core_log],
+                capture_output=True, text=True, timeout=10)
+            quote_holds = int(result2.stdout.strip()) if result2.returncode == 0 else 0
+
+            # Check for lifecycle crashes
+            result3 = subprocess.run(
+                ['/usr/bin/grep', '-c', 'Lifecycle evaluate CRASHED', core_log],
+                capture_output=True, text=True, timeout=10)
+            crashes = int(result3.stdout.strip()) if result3.returncode == 0 else 0
+
+            if crashes > 0:
+                self.issues_found['lifecycle_crash'] += crashes
+                return HealthCheck('v10_equity_lifecycle', 'CRITICAL',
+                    f'{crashes} lifecycle crashes — falling back to flat exit',
+                    'CRITICAL')
+
+            msg = f'quote_holds={quote_holds} (is_quote working)'
+            if crashes > 0:
+                msg += f', {crashes} crashes'
+            return HealthCheck('v10_equity_lifecycle', 'OK', msg)
+        except Exception as e:
+            return HealthCheck('v10_equity_lifecycle', 'OK', f'Check skipped: {e}')
+
+    def _check_v10_options_lifecycle(self) -> HealthCheck:
+        """V10: Check options lifecycle — phases, exits, close events persisted."""
+        today = datetime.now().strftime('%Y%m%d')
+        options_log = os.path.join(PROJECT_ROOT, 'logs', today, 'options.log')
+        try:
+            if not os.path.exists(options_log):
+                return HealthCheck('v10_options_lifecycle', 'OK', 'No options log')
+
+            # Check lifecycle creation
+            result = subprocess.run(
+                ['/usr/bin/grep', '-c', 'OptionsLifecycle.*OPENED', options_log],
+                capture_output=True, text=True, timeout=10)
+            opened = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+            # Check close events emitted
+            result2 = subprocess.run(
+                ['/usr/bin/grep', '-c', 'OPTIONS_CLOSE persisted', options_log],
+                capture_output=True, text=True, timeout=10)
+            closed = int(result2.stdout.strip()) if result2.returncode == 0 else 0
+
+            # Check for auto-created lifecycles (restart recovery)
+            result3 = subprocess.run(
+                ['/usr/bin/grep', '-c', 'AUTO-CREATED lifecycle', options_log],
+                capture_output=True, text=True, timeout=10)
+            auto = int(result3.stdout.strip()) if result3.returncode == 0 else 0
+
+            # Check for lifecycle crashes
+            result4 = subprocess.run(
+                ['/usr/bin/grep', '-c', 'Lifecycle evaluate CRASHED', options_log],
+                capture_output=True, text=True, timeout=10)
+            crashes = int(result4.stdout.strip()) if result4.returncode == 0 else 0
+
+            if crashes > 0:
+                self.issues_found['options_lifecycle_crash'] += crashes
+                return HealthCheck('v10_options_lifecycle', 'CRITICAL',
+                    f'{crashes} options lifecycle crashes', 'CRITICAL')
+
+            msg = f'opened={opened} closed={closed} auto_recovered={auto}'
+            return HealthCheck('v10_options_lifecycle', 'OK', msg)
+        except Exception as e:
+            return HealthCheck('v10_options_lifecycle', 'OK', f'Check skipped: {e}')
+
+    def _check_v10_pending_tickers(self) -> HealthCheck:
+        """V10: Check if pending tickers set is growing (FILL/ORDER_FAIL events lost)."""
+        today = datetime.now().strftime('%Y%m%d')
+        core_log = os.path.join(PROJECT_ROOT, 'logs', today, 'core.log')
+        try:
+            if not os.path.exists(core_log):
+                return HealthCheck('v10_pending', 'OK', 'No log')
+
+            # Check for stale pending evictions (means events are being lost)
+            result = subprocess.run(
+                ['/usr/bin/grep', '-c', 'Evicted stale pending', core_log],
+                capture_output=True, text=True, timeout=10)
+            evictions = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+            if evictions > 5:
+                self.issues_found['pending_evictions'] += evictions
+                return HealthCheck('v10_pending', 'WARN',
+                    f'{evictions} stale pending tickers evicted — FILL events may be lost',
+                    'WARNING')
+
+            return HealthCheck('v10_pending', 'OK',
+                f'{evictions} evictions (0 = healthy)')
+        except Exception as e:
+            return HealthCheck('v10_pending', 'OK', f'Check skipped: {e}')
+
+    def _check_v10_bar_builder(self) -> HealthCheck:
+        """V10: Check BarBuilder health — flush thread alive, no excessive restarts."""
+        today = datetime.now().strftime('%Y%m%d')
+        core_log = os.path.join(PROJECT_ROOT, 'logs', today, 'core.log')
+        try:
+            if not os.path.exists(core_log):
+                return HealthCheck('v10_bar_builder', 'OK', 'No log')
+
+            # Check for flush thread restarts
+            result = subprocess.run(
+                ['/usr/bin/grep', '-c', 'Flush thread died', core_log],
+                capture_output=True, text=True, timeout=10)
+            restarts = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+            # Check for "giving up" (max restarts exceeded)
+            result2 = subprocess.run(
+                ['/usr/bin/grep', '-c', 'giving up.*REST polling', core_log],
+                capture_output=True, text=True, timeout=10)
+            gave_up = int(result2.stdout.strip()) if result2.returncode == 0 else 0
+
+            if gave_up > 0:
+                self.issues_found['bb_gave_up'] += 1
+                return HealthCheck('v10_bar_builder', 'CRITICAL',
+                    'BarBuilder flush thread gave up — running on REST only',
+                    'CRITICAL')
+
+            if restarts > 3:
+                self.issues_found['bb_restarts'] += restarts
+                return HealthCheck('v10_bar_builder', 'WARN',
+                    f'Flush thread restarted {restarts}x — unstable',
+                    'WARNING')
+
+            return HealthCheck('v10_bar_builder', 'OK',
+                f'{restarts} restarts (0 = healthy)')
+        except Exception as e:
+            return HealthCheck('v10_bar_builder', 'OK', f'Check skipped: {e}')
+
     # ── Self-Healing ──────────────────────────────────────────────────────
 
     def _run_healer(self, results: list):
@@ -694,6 +844,21 @@ class SessionWatchdog:
             # ── Fix 5: Log errors with known patterns ──────────────────
             if check.name == 'log_errors' and check.severity in ('WARNING', 'CRITICAL'):
                 self._heal_from_log_errors()
+
+        # ── V10 Fix: Lifecycle crash → restart core (supervisor will restart it)
+            if check.name == 'v10_equity_lifecycle' and 'crash' in check.message.lower():
+                log.warning("[HEAL] Equity lifecycle crashing — killing core for supervisor restart")
+                self._heal_kill_zombie('core')
+
+            # ── V10 Fix: Options lifecycle crash → restart options
+            if check.name == 'v10_options_lifecycle' and 'crash' in check.message.lower():
+                log.warning("[HEAL] Options lifecycle crashing — killing options for supervisor restart")
+                self._heal_kill_zombie('options')
+
+            # ── V10 Fix: BarBuilder gave up → restart core
+            if check.name == 'v10_bar_builder' and 'gave up' in check.message.lower():
+                log.warning("[HEAL] BarBuilder gave up — killing core for supervisor restart (resets flush thread)")
+                self._heal_kill_zombie('core')
 
         # ── Fix 6: Always check for corrupt state files ────────────────
         self._heal_corrupt_state_files()

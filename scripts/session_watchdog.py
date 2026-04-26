@@ -140,15 +140,11 @@ class SessionWatchdog:
         self._session_report = []
         self._updates_sent = set()             # hours already sent
 
-        # Auto-fix manager (paper trading = auto-apply, no approval needed)
+        # V10: HotfixManager DISABLED — auto code edits are too dangerous for live trading.
+        # The watchdog detects crashes, diagnoses root cause, fixes infrastructure
+        # (corrupt files, locks, cache), restarts processes, and alerts the operator.
+        # Code fixes require human judgment.
         self._hotfix_mgr = None
-        if enable_healing:
-            try:
-                from scripts.hotfix_manager import HotfixManager
-                self._hotfix_mgr = HotfixManager(auto_apply=True)
-                log.info("HotfixManager active — auto-apply mode (paper trading)")
-            except Exception as e:
-                log.warning("HotfixManager init failed: %s", e)
 
     def run(self, dry_run: bool = False):
         """Main loop — run checks every interval until market close."""

@@ -88,9 +88,26 @@ def _get_processes() -> str:
 
 def _is_market_hours() -> bool:
     now = datetime.now(ET)
-    # Mon-Fri, 9:25 AM to 4:05 PM
+    today = now.date()
+
+    # Weekend
     if now.weekday() >= 5:
         return False
+
+    # Market holidays (NYSE/NASDAQ full closures)
+    try:
+        from monitor.market_calendar import is_market_holiday, is_early_close, early_close_hour
+        if is_market_holiday(today):
+            return False
+        # Early close days: market closes at 1 PM ET
+        if is_early_close(today):
+            close_hour = early_close_hour()
+            if now.hour > close_hour or (now.hour == close_hour and now.minute > 5):
+                return False
+    except ImportError:
+        pass  # calendar not available — proceed with standard hours
+
+    # Standard hours: 9:25 AM to 4:05 PM ET
     if now.hour < 9 or (now.hour == 9 and now.minute < 25):
         return False
     if now.hour > 16 or (now.hour == 16 and now.minute > 5):

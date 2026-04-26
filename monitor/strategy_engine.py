@@ -399,8 +399,15 @@ class StrategyEngine:
         now  = datetime.now(ET)
         hour, minute = now.hour, now.minute
 
-        # ── EOD gate ─────────────────────────────────────────────────────────
-        if (hour, minute) >= _FORCE_CLOSE:
+        # ── EOD gate (V10: early close on half-days) ────────────────────────
+        _force_close = _FORCE_CLOSE
+        try:
+            from monitor.market_calendar import is_early_close, early_close_hour
+            if is_early_close(now.date()):
+                _force_close = (early_close_hour(), 0)  # 1:00 PM on early close days
+        except ImportError:
+            pass
+        if (hour, minute) >= _force_close:
             if ticker in self._positions:
                 pos = self._positions[ticker]
                 strategy = pos.get('strategy', 'vwap_reclaim') or 'vwap_reclaim'

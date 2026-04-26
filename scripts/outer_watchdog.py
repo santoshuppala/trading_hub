@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
 """
-Outer Watchdog — runs OUTSIDE the supervisor process tree.
+Outer Watchdog — long-running process OUTSIDE the supervisor tree.
 
-This is the top-level guardian. It monitors the supervisor itself and restarts
-it if it dies. The inner watchdog (session_watchdog.py) runs under the
-supervisor and monitors individual engines. This outer watchdog monitors
-the supervisor + inner watchdog.
+This is the TOP-LEVEL guardian. Start it BEFORE the supervisor. It:
+  1. Starts the supervisor
+  2. Monitors it continuously (every 60s)
+  3. Restarts it if it dies or hangs
+  4. Shuts down after market close
 
 Hierarchy:
-    cron/launchd → outer_watchdog.py (this file)
-                    └── monitors supervisor.py
-                        └── monitors core, options, inner watchdog
-                            └── monitors lifecycle, signals, exits
+    outer_watchdog.py (this file — start this, not supervisor directly)
+      └── supervisor.py (started by us)
+            └── core, options, inner watchdog
 
 Why separate:
-    If supervisor dies or hangs, the inner watchdog dies with it.
-    The outer watchdog detects this and restarts the supervisor.
-    It also catches issues the inner watchdog can't:
-    - Supervisor hung (alive but not restarting dead children)
-    - All processes dead (catastrophic failure)
-    - Disk full preventing any process from starting
-    - System clock jump (DST, NTP)
+    If supervisor dies or hangs, inner watchdog dies with it.
+    This process is the only thing that can fix that.
 
-Setup (cron — runs every 2 minutes during market hours):
-    # Mac/Linux crontab -e:
-    */2 9-16 * * 1-5 cd /path/to/trading_hub && python3 scripts/outer_watchdog.py >> logs/outer_watchdog.log 2>&1
-
-Setup (launchd — Mac):
-    See docs/launchd_outer_watchdog.plist
+Usage:
+    python scripts/outer_watchdog.py                  # normal: start + monitor
+    python scripts/outer_watchdog.py --check-only     # one check, no loop
+    python scripts/outer_watchdog.py --no-start       # monitor only (supervisor already running)
 
 Design:
-    - Stateless: reads only process table + log files + state files
-    - Idempotent: safe to run multiple times (no side effects if healthy)
+    - Long-running loop (not cron)
+    - Starts supervisor on launch
+    - Checks every 60s during market hours
     - Conservative: only restarts supervisor (never touches positions/orders)
-    - Fast: completes in <5 seconds, exits immediately
+    - Max 5 restarts/day, then alerts for manual intervention
 """
 import json
 import logging
@@ -290,5 +284,108 @@ def check_and_heal():
     _save_state(state)
 
 
+def start_supervisor() -> bool:
+    """Start the supervisor process. Returns True if started successfully."""
+    supervisor_script = os.path.join(PROJECT_ROOT, 'scripts', 'supervisor.py')
+    if not os.path.exists(supervisor_script):
+        log.error("Supervisor script not found: %s", supervisor_script)
+        return False
+
+    log.info("Starting supervisor...")
+    try:
+        subprocess.Popen(
+            [sys.executable, supervisor_script],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(10)  # give it time to start children
+
+        ps = _get_processes()
+        if 'supervisor.py' in ps:
+            log.info("Supervisor started successfully")
+            return True
+        else:
+            log.error("Supervisor failed to start")
+            return False
+    except Exception as e:
+        log.error("Supervisor start error: %s", e)
+        return False
+
+
+def run_loop(auto_start: bool = True, check_interval: int = 60):
+    """Main loop — start supervisor, then monitor continuously."""
+    log.info("=" * 60)
+    log.info("OUTER WATCHDOG STARTED")
+    log.info("  Check interval: %ds", check_interval)
+    log.info("  Auto-start supervisor: %s", auto_start)
+    log.info("=" * 60)
+
+    # Start supervisor if requested and not already running
+    if auto_start:
+        ps = _get_processes()
+        if 'supervisor.py' not in ps:
+            if _is_market_hours():
+                start_supervisor()
+            else:
+                log.info("Outside market hours — will start supervisor when market opens")
+
+    # Handle shutdown gracefully
+    import signal as _signal
+    _running = True
+    def _on_shutdown(signum, frame):
+        nonlocal _running
+        log.info("Shutdown signal received")
+        _running = False
+    _signal.signal(_signal.SIGTERM, _on_shutdown)
+    _signal.signal(_signal.SIGINT, _on_shutdown)
+
+    was_market_hours = False
+
+    while _running:
+        try:
+            now = datetime.now(ET)
+            in_market = _is_market_hours()
+
+            # Start supervisor at market open
+            if in_market and not was_market_hours and auto_start:
+                ps = _get_processes()
+                if 'supervisor.py' not in ps:
+                    log.info("Market opened — starting supervisor")
+                    start_supervisor()
+            was_market_hours = in_market
+
+            # Run health check during market hours
+            if in_market:
+                check_and_heal()
+
+            # Stop after market close (give 5 min buffer for EOD)
+            if now.hour >= 16 and now.minute >= 15:
+                log.info("Market closed — outer watchdog shutting down")
+                break
+
+            time.sleep(check_interval)
+
+        except Exception as e:
+            log.error("Check cycle error: %s", e)
+            time.sleep(check_interval)
+
+    log.info("Outer watchdog stopped")
+
+
 if __name__ == '__main__':
-    check_and_heal()
+    import argparse
+    parser = argparse.ArgumentParser(description='Outer Watchdog')
+    parser.add_argument('--check-only', action='store_true',
+                        help='Run one check and exit')
+    parser.add_argument('--no-start', action='store_true',
+                        help='Do not auto-start supervisor')
+    parser.add_argument('--interval', type=int, default=60,
+                        help='Check interval in seconds (default: 60)')
+    args = parser.parse_args()
+
+    if args.check_only:
+        check_and_heal()
+    else:
+        run_loop(auto_start=not args.no_start, check_interval=args.interval)

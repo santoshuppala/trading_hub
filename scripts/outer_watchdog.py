@@ -442,12 +442,29 @@ def start_supervisor() -> bool:
 
 
 def run_loop(auto_start: bool = True, check_interval: int = 60):
-    """Main loop — start supervisor, then monitor continuously."""
+    """Main loop — start supervisor, then monitor continuously.
+
+    Merges outer watchdog (process-level) with inner watchdog (quality checks):
+    - Process health: is supervisor/core/options alive?
+    - Quality health: lifecycle crashes, P&L drift, data staleness, signal rate
+    - Self-healing: corrupt JSON, stale locks, zombie processes, cache cleanup
+    - Periodic updates: hourly email with P&L and position summary
+    - Session report: EOD comprehensive report with broker reconciliation
+    """
     log.info("=" * 60)
-    log.info("OUTER WATCHDOG STARTED")
+    log.info("UNIFIED WATCHDOG STARTED")
     log.info("  Check interval: %ds", check_interval)
     log.info("  Auto-start supervisor: %s", auto_start)
     log.info("=" * 60)
+
+    # Initialize inner watchdog (quality checks + healing + reporting)
+    inner = None
+    try:
+        from scripts.session_watchdog import SessionWatchdog
+        inner = SessionWatchdog(check_interval=check_interval, enable_healing=True)
+        log.info("Inner watchdog checks loaded (15 health checks + self-healing)")
+    except Exception as e:
+        log.warning("Inner watchdog init failed: %s — running process checks only", e)
 
     # Start supervisor if requested and not already running
     if auto_start:
@@ -483,13 +500,35 @@ def run_loop(auto_start: bool = True, check_interval: int = 60):
                     start_supervisor()
             was_market_hours = in_market
 
-            # Run health check during market hours
             if in_market:
+                # ── Outer checks: process-level health ───────────────
                 check_and_heal()
 
-            # Stop after market close (give 5 min buffer for EOD)
-            if now.hour >= 16 and now.minute >= 15:
-                log.info("Market closed — outer watchdog shutting down")
+                # ── Inner checks: quality-level health + healing ─────
+                if inner:
+                    try:
+                        results = inner._run_all_checks()
+                        inner._print_results(results)
+                        if inner.enable_healing:
+                            inner._run_healer(results)
+                        # Alert on critical issues
+                        for check in results:
+                            if check.severity == 'CRITICAL':
+                                inner._send_alert(check)
+                        # Hourly status email
+                        inner._maybe_send_periodic_update(results)
+                        inner.checks_run += 1
+                    except Exception as ie:
+                        log.warning("Inner check cycle failed: %s", ie)
+
+            # EOD: generate session report, then shut down
+            if now.hour >= 16 and now.minute >= 10:
+                log.info("Market closed — generating session report")
+                if inner:
+                    try:
+                        inner._generate_session_report()
+                    except Exception as re:
+                        log.warning("Session report failed: %s", re)
                 break
 
             time.sleep(check_interval)
@@ -498,7 +537,7 @@ def run_loop(auto_start: bool = True, check_interval: int = 60):
             log.error("Check cycle error: %s", e)
             time.sleep(check_interval)
 
-    log.info("Outer watchdog stopped")
+    log.info("Unified watchdog stopped")
 
 
 if __name__ == '__main__':

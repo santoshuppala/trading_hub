@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+Session Watchdog — DEPRECATED as standalone process.
+
+V10: Merged into outer_watchdog.py. This file is now used as a LIBRARY only.
+The outer watchdog imports SessionWatchdog and runs its checks directly.
+Do NOT run this file as a separate process — use outer_watchdog.py instead.
+
+Original description:
 Session Watchdog — Self-healing monitor for unattended trading sessions.
 
 Runs alongside the supervisor. Monitors health, detects issues, applies

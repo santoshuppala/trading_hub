@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-Watchdog launcher — auto-discovered by supervisor.
+DEPRECATED — V10: Watchdog merged into outer_watchdog.py.
 
-Runs session_watchdog.py with 2-minute check interval.
-Non-critical: watchdog crash doesn't affect trading.
+The supervisor no longer auto-discovers this script (_SKIP_SCRIPTS).
+Use outer_watchdog.py instead — it combines process-level monitoring
+(supervisor alive?) with quality-level monitoring (lifecycle health,
+P&L drift, data staleness) in a single process outside the supervisor tree.
+
+Start: python scripts/outer_watchdog.py
+Or:    ./scripts/install_launchd.sh
 """
+import sys
+print("DEPRECATED: Use outer_watchdog.py instead.", file=sys.stderr)
+print("  python scripts/outer_watchdog.py", file=sys.stderr)
+sys.exit(1)
 import os
 import sys
 import runpy

@@ -87,7 +87,8 @@ _DEFAULT_PROCESSES = {
 }
 
 # V8: Skip scripts that should NOT be auto-discovered
-_SKIP_SCRIPTS = {'run_pro.py', 'run_pop.py', 'run_monitor.py'}
+# V10: run_watchdog.py deprecated — inner watchdog merged into outer_watchdog.py
+_SKIP_SCRIPTS = {'run_pro.py', 'run_pop.py', 'run_monitor.py', 'run_watchdog.py'}
 
 
 def _load_engine_config() -> dict:

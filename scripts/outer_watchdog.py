@@ -486,11 +486,42 @@ def run_loop(auto_start: bool = True, check_interval: int = 60):
     _signal.signal(_signal.SIGINT, _on_shutdown)
 
     was_market_hours = False
+    eod_done_today = False
 
     while _running:
         try:
             now = datetime.now(ET)
             in_market = _is_market_hours()
+
+            # ── Outside market hours: sleep, don't exit ──────────
+            # launchd KeepAlive would restart us immediately if we exit,
+            # wasting CPU. Instead, sleep until next market window.
+            if not in_market:
+                if was_market_hours and not eod_done_today:
+                    # Just crossed market close — run EOD report once
+                    log.info("Market closed — generating session report")
+                    if inner:
+                        try:
+                            inner._generate_session_report()
+                        except Exception as re:
+                            log.warning("Session report failed: %s", re)
+                    eod_done_today = True
+                    was_market_hours = False
+
+                # Reset EOD flag at midnight
+                if now.hour == 0 and now.minute < 2:
+                    eod_done_today = False
+                    if inner:
+                        inner.checks_run = 0
+                        inner.alerts_sent.clear()
+                        inner.issues_found.clear()
+                        inner.heals_applied.clear()
+
+                # Sleep longer outside market hours (5 min)
+                time.sleep(300)
+                continue
+
+            # ── Market hours: active monitoring ──────────────────
 
             # Start supervisor at market open
             if in_market and not was_market_hours and auto_start:
@@ -498,38 +529,28 @@ def run_loop(auto_start: bool = True, check_interval: int = 60):
                 if 'supervisor.py' not in ps:
                     log.info("Market opened — starting supervisor")
                     start_supervisor()
+                eod_done_today = False  # new trading day
             was_market_hours = in_market
 
-            if in_market:
-                # ── Outer checks: process-level health ───────────────
-                check_and_heal()
+            # ── Outer checks: process-level health ───────────────
+            check_and_heal()
 
-                # ── Inner checks: quality-level health + healing ─────
-                if inner:
-                    try:
-                        results = inner._run_all_checks()
-                        inner._print_results(results)
-                        if inner.enable_healing:
-                            inner._run_healer(results)
-                        # Alert on critical issues
-                        for check in results:
-                            if check.severity == 'CRITICAL':
-                                inner._send_alert(check)
-                        # Hourly status email
-                        inner._maybe_send_periodic_update(results)
-                        inner.checks_run += 1
-                    except Exception as ie:
-                        log.warning("Inner check cycle failed: %s", ie)
-
-            # EOD: generate session report, then shut down
-            if now.hour >= 16 and now.minute >= 10:
-                log.info("Market closed — generating session report")
-                if inner:
-                    try:
-                        inner._generate_session_report()
-                    except Exception as re:
-                        log.warning("Session report failed: %s", re)
-                break
+            # ── Inner checks: quality-level health + healing ─────
+            if inner:
+                try:
+                    results = inner._run_all_checks()
+                    inner._print_results(results)
+                    if inner.enable_healing:
+                        inner._run_healer(results)
+                    # Alert on critical issues
+                    for check in results:
+                        if check.severity == 'CRITICAL':
+                            inner._send_alert(check)
+                    # Hourly status email
+                    inner._maybe_send_periodic_update(results)
+                    inner.checks_run += 1
+                except Exception as ie:
+                    log.warning("Inner check cycle failed: %s", ie)
 
             time.sleep(check_interval)
 

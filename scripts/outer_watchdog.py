@@ -146,6 +146,132 @@ def _send_alert(message: str, severity: str = 'CRITICAL'):
         log.warning("Alert send failed: %s", e)
 
 
+def _diagnose_death() -> dict:
+    """Diagnose why the supervisor died. Returns {reason, fix, details}."""
+    today = datetime.now().strftime('%Y%m%d')
+    sup_log = os.path.join(PROJECT_ROOT, 'logs', today, 'supervisor.log')
+    result = {'reason': 'unknown', 'fix': None, 'details': ''}
+
+    # 1. Read last 50 lines of supervisor log
+    traceback = ''
+    if os.path.exists(sup_log):
+        try:
+            r = subprocess.run(['/usr/bin/tail', '-50', sup_log],
+                               capture_output=True, text=True, timeout=5)
+            tail = r.stdout
+            if 'Traceback' in tail:
+                traceback = tail[tail.rfind('Traceback'):][:500]
+        except Exception:
+            pass
+
+    # 2. Pattern match: known failure modes
+    if traceback:
+        if 'JSONDecodeError' in traceback:
+            result['reason'] = 'corrupt JSON state file'
+            result['fix'] = 'restore_json'
+            result['details'] = traceback[:200]
+        elif 'PermissionError' in traceback:
+            result['reason'] = 'permission error on file'
+            result['fix'] = 'fix_permissions'
+            result['details'] = traceback[:200]
+        elif 'No space left' in traceback or 'OSError' in traceback:
+            result['reason'] = 'disk full or OS error'
+            result['fix'] = 'clean_disk'
+            result['details'] = traceback[:200]
+        elif 'ModuleNotFoundError' in traceback or 'ImportError' in traceback:
+            result['reason'] = 'import error (corrupted pycache?)'
+            result['fix'] = 'clear_pycache'
+            result['details'] = traceback[:200]
+        elif 'ConnectionRefusedError' in traceback or '401' in traceback:
+            result['reason'] = 'API connection failed (token expired?)'
+            result['fix'] = None  # can't auto-fix, just restart
+            result['details'] = traceback[:200]
+        elif 'MemoryError' in traceback or 'Killed' in tail:
+            result['reason'] = 'out of memory (OOM killed)'
+            result['fix'] = 'clean_disk'  # free memory by cleaning logs
+            result['details'] = 'Process killed by OS'
+        else:
+            result['reason'] = f'crash: {traceback.split(chr(10))[-1][:100]}'
+            result['details'] = traceback[:200]
+    else:
+        # No traceback — clean exit or killed
+        if os.path.exists(sup_log):
+            age = (time.time() - os.path.getmtime(sup_log)) / 60
+            result['reason'] = f'exited cleanly or killed (log {age:.0f}min old)'
+        else:
+            result['reason'] = 'no supervisor log found'
+            result['fix'] = 'clean_state'
+
+    return result
+
+
+def _apply_fix(fix_type: str):
+    """Apply a pre-restart fix based on diagnosis."""
+    try:
+        if fix_type == 'restore_json':
+            # Restore corrupt JSON files from backups
+            from config import DATA_DIR
+            for fname in os.listdir(DATA_DIR):
+                if fname.endswith('.json') and not fname.endswith(('.prev', '.prev2', '.sha256')):
+                    fpath = os.path.join(DATA_DIR, fname)
+                    try:
+                        with open(fpath) as f:
+                            json.load(f)
+                    except (json.JSONDecodeError, ValueError):
+                        backup = fpath + '.prev'
+                        if os.path.exists(backup):
+                            import shutil
+                            shutil.copy2(backup, fpath)
+                            log.info("Restored %s from .prev", fname)
+
+        elif fix_type == 'fix_permissions':
+            from config import DATA_DIR
+            for fname in os.listdir(DATA_DIR):
+                fpath = os.path.join(DATA_DIR, fname)
+                try:
+                    os.chmod(fpath, 0o644)
+                except Exception:
+                    pass
+
+        elif fix_type == 'clean_disk':
+            # Remove old logs (>3 days)
+            import shutil
+            from datetime import timedelta
+            logs_dir = os.path.join(PROJECT_ROOT, 'logs')
+            cutoff = datetime.now() - timedelta(days=3)
+            for entry in os.listdir(logs_dir):
+                entry_path = os.path.join(logs_dir, entry)
+                if os.path.isdir(entry_path) and len(entry) == 8:
+                    try:
+                        dir_date = datetime.strptime(entry, '%Y%m%d')
+                        if dir_date < cutoff:
+                            shutil.rmtree(entry_path)
+                            log.info("Cleaned old logs: %s", entry)
+                    except (ValueError, OSError):
+                        pass
+
+        elif fix_type == 'clear_pycache':
+            import shutil
+            for root, dirs, files in os.walk(PROJECT_ROOT):
+                if '__pycache__' in dirs:
+                    shutil.rmtree(os.path.join(root, '__pycache__'))
+
+        elif fix_type == 'clean_state':
+            # Remove stale lock files
+            from config import DATA_DIR
+            for fname in os.listdir(DATA_DIR):
+                if fname.endswith('.lock') or fname.endswith('.flock'):
+                    fpath = os.path.join(DATA_DIR, fname)
+                    age = time.time() - os.path.getmtime(fpath)
+                    if age > 300:
+                        os.remove(fpath)
+                        log.info("Removed stale lock: %s", fname)
+
+        log.info("Fix '%s' applied successfully", fix_type)
+    except Exception as e:
+        log.warning("Fix '%s' failed: %s", fix_type, e)
+
+
 def check_and_heal():
     """Main check: is the trading system healthy? Fix if not."""
     now = datetime.now(ET)
@@ -177,7 +303,7 @@ def check_and_heal():
         _save_state(state)
         return
 
-    # ── Check 2: Supervisor dead — restart it ────────────────────
+    # ── Check 2: Supervisor dead — diagnose, fix, restart ─────────
     if not supervisor_alive:
         if state['restarts_today'] >= 5:
             msg = (f"OUTER WATCHDOG: Supervisor has been restarted {state['restarts_today']}x today. "
@@ -188,39 +314,40 @@ def check_and_heal():
             _save_state(state)
             return
 
-        log.warning("Supervisor NOT running — restarting")
-        try:
-            supervisor_script = os.path.join(PROJECT_ROOT, 'scripts', 'supervisor.py')
-            subprocess.Popen(
-                [sys.executable, supervisor_script],
-                cwd=PROJECT_ROOT,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,  # detach from our process group
-            )
-            time.sleep(10)
+        # ── Pre-restart diagnostics: WHY did it die? ─────────────
+        diagnosis = _diagnose_death()
+        log.warning("Supervisor NOT running — diagnosis: %s", diagnosis['reason'])
 
-            # Verify it started
-            ps2 = _get_processes()
-            if 'supervisor.py' in ps2:
-                state['restarts_today'] += 1
-                state['last_restart'] = now.strftime('%H:%M:%S')
-                log.info("Supervisor restarted successfully (restart #%d today)",
-                         state['restarts_today'])
-                _send_alert(
-                    f"Outer Watchdog restarted supervisor (restart #{state['restarts_today']} today).\n"
-                    f"Core was {'alive' if core_alive else 'DEAD'}.\n"
-                    f"Options was {'alive' if options_alive else 'DEAD'}.",
-                    severity='WARNING')
-            else:
-                log.error("Supervisor restart FAILED — process didn't start")
-                _send_alert(
-                    "OUTER WATCHDOG: Supervisor restart FAILED.\n"
-                    "The trading system is DOWN. Manual intervention required.",
-                    severity='CRITICAL')
-        except Exception as e:
-            log.error("Supervisor restart error: %s", e)
-            _send_alert(f"OUTER WATCHDOG: Restart error: {e}", severity='CRITICAL')
+        # ── Pre-restart fixes: clean up before restarting ────────
+        if diagnosis.get('fix'):
+            log.info("Applying pre-restart fix: %s", diagnosis['fix'])
+            _apply_fix(diagnosis['fix'])
+
+        # ── Restart supervisor ───────────────────────────────────
+        if start_supervisor():
+            state['restarts_today'] += 1
+            state['last_restart'] = now.strftime('%H:%M:%S')
+            state.setdefault('restart_log', []).append({
+                'time': now.strftime('%H:%M:%S'),
+                'reason': diagnosis['reason'],
+                'fix': diagnosis.get('fix', 'none'),
+            })
+            # Keep only last 10 entries
+            state['restart_log'] = state['restart_log'][-10:]
+
+            _send_alert(
+                f"Outer Watchdog restarted supervisor (#{state['restarts_today']} today).\n"
+                f"Reason: {diagnosis['reason']}\n"
+                f"Fix applied: {diagnosis.get('fix', 'none')}\n"
+                f"Core was {'alive' if core_alive else 'DEAD'}.\n"
+                f"Options was {'alive' if options_alive else 'DEAD'}.",
+                severity='WARNING')
+        else:
+            _send_alert(
+                "OUTER WATCHDOG: Supervisor restart FAILED.\n"
+                f"Diagnosis: {diagnosis['reason']}\n"
+                "The trading system is DOWN. Manual intervention required.",
+                severity='CRITICAL')
 
     # ── Check 3: Supervisor alive but core dead ──────────────────
     elif supervisor_alive and not core_alive:

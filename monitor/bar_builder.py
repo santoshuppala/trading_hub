@@ -266,28 +266,49 @@ class BarBuilder:
     def covers_ticker(self, ticker: str) -> bool:
         """True if BarBuilder will actually emit BAR events for this ticker.
 
-        Must satisfy ALL three conditions:
+        Must satisfy BOTH conditions:
         - Seeded (has REST history for detectors)
         - Received WebSocket ticks this flush cycle (not illiquid)
-        - In _hot_tickers (open position — BarBuilder only emits for these)
 
-        If any condition fails, REST should emit BAR for this ticker.
+        If either fails, REST should emit BAR for this ticker.
+        Illiquid tickers with no WebSocket trades still use REST (60s).
         """
         return (ticker in self._seeded_tickers
-                and ticker in self._tickers_with_ticks
-                and ticker in self._hot_tickers)
+                and ticker in self._tickers_with_ticks)
 
     def is_active(self) -> bool:
         """True if BarBuilder is running, seeded, and flushed recently.
 
         If flush hasn't happened in 2+ minutes, something is wrong
         (thread died, no ticks at all) → monitor should fall back to REST.
+        V10: Auto-restarts flush thread if it died silently.
         """
         if not self._running or not self._seeded:
             return False
+
+        # V10: Detect and restart dead flush thread (max 5 restarts, then give up)
+        if self._flush_thread and not self._flush_thread.is_alive() and self._running:
+            if not hasattr(self, '_flush_restart_count'):
+                self._flush_restart_count = 0
+            self._flush_restart_count += 1
+            if self._flush_restart_count <= 5:
+                log.error("[BarBuilder] Flush thread died — restarting (%d/5)",
+                          self._flush_restart_count)
+                self._flush_thread = threading.Thread(
+                    target=self._flush_loop, daemon=True, name='bar-builder-flush')
+                self._flush_thread.start()
+            else:
+                log.critical("[BarBuilder] Flush thread died %d times — giving up. "
+                             "REST polling will handle all bar events.",
+                             self._flush_restart_count)
+                # Return False → monitor falls back to REST polling
+                return False
+
         if self._last_flush_time <= 0:
             return False
-        return (time.time() - self._last_flush_time) < 120.0
+        import os as _os
+        _liveness_sec = float(_os.getenv('BAR_BUILDER_LIVENESS_SEC', '120'))
+        return (time.time() - self._last_flush_time) < _liveness_sec
 
     # ── Trade tick ingestion ─────────────────────────────────────────
 
@@ -311,6 +332,7 @@ class BarBuilder:
         if timestamp <= 0:
             timestamp = time.time()
 
+        _pending = []
         with self._lock:
             self._ticks_received += 1
             self._tickers_active.add(ticker)
@@ -318,10 +340,17 @@ class BarBuilder:
             # Check if we crossed a minute boundary
             current_min = self._get_current_minute()
             if current_min > self._current_minute:
-                self._flush_minute_locked()
+                _pending = self._flush_minute_locked()
                 self._current_minute = current_min
 
             self._current[ticker].add_tick(price, size, timestamp)
+
+        # Emit outside lock
+        for _t, _ts in _pending:
+            try:
+                self._emit_bar_event(_t, _ts)
+            except Exception as exc:
+                log.warning("[BarBuilder] Failed to emit BAR for %s: %s", _t, exc)
 
     # ── Minute boundary flush ────────────────────────────────────────
 
@@ -331,27 +360,48 @@ class BarBuilder:
             time.sleep(0.1)
             current_min = self._get_current_minute()
             if current_min > self._current_minute:
+                _pending = []
                 with self._lock:
                     if current_min > self._current_minute:
-                        self._flush_minute_locked()
+                        _pending = self._flush_minute_locked()
                         self._current_minute = current_min
+                # Emit outside lock
+                for _t, _ts in _pending:
+                    try:
+                        self._emit_bar_event(_t, _ts)
+                    except Exception as exc:
+                        log.warning("[BarBuilder] Failed to emit BAR for %s: %s", _t, exc)
 
     def _flush_minute(self):
-        """Flush completed bars (thread-safe wrapper)."""
-        with self._lock:
-            self._flush_minute_locked()
+        """Flush completed bars (thread-safe wrapper).
 
-    def _flush_minute_locked(self):
+        V10: Collects events under lock, emits AFTER lock release to prevent
+        deadlock if a subscriber tries to acquire BarBuilder lock.
+        """
+        pending_events = []
+        with self._lock:
+            pending_events = self._flush_minute_locked()
+
+        # Emit outside lock — subscribers can safely call back into BarBuilder
+        for ticker, ts in pending_events:
+            try:
+                self._emit_bar_event(ticker, ts)
+            except Exception as exc:
+                log.warning("[BarBuilder] Failed to emit BAR for %s: %s", ticker, exc)
+
+    def _flush_minute_locked(self) -> list:
         """Flush all completed bars for the previous minute.
 
         Must be called with self._lock held.
+        Returns list of (ticker, timestamp) tuples to emit AFTER lock release.
         """
         if not self._current:
-            return
+            return []
 
         bars_flushed = 0
         now_et = datetime.now(ET)
         tickers_this_flush: Set[str] = set()
+        to_emit: list = []
 
         for ticker, acc in self._current.items():
             if not acc.is_valid():
@@ -365,19 +415,12 @@ class BarBuilder:
             if len(self._history[ticker]) > self._max_history:
                 self._history[ticker] = self._history[ticker][-self._max_history:]
 
-            # Emit BAR event only for HOT tickers (open positions).
-            # Emitting for all 225 seeded tickers overwhelms EventBus queues.
-            # Entry signals for non-position tickers come from REST polling (60s).
-            # Exit signals for open positions get sub-second bars here.
+            # Collect events to emit OUTSIDE lock (prevents deadlock)
             if (self._emit_bars and self._bus
                     and ticker in self._seeded_tickers
-                    and ticker in self._hot_tickers
                     and len(self._history[ticker]) >= 2):
-                try:
-                    self._emit_bar_event(ticker, now_et)
-                    bars_flushed += 1
-                except Exception as exc:
-                    log.warning("[BarBuilder] Failed to emit BAR for %s: %s", ticker, exc)
+                to_emit.append((ticker, now_et))
+                bars_flushed += 1
 
         self._bars_emitted += bars_flushed
         self._last_flush_time = time.time()
@@ -387,6 +430,8 @@ class BarBuilder:
 
         # Reset accumulators for new minute
         self._current = defaultdict(BarAccumulator)
+
+        return to_emit
 
     def _emit_bar_event(self, ticker: str, now_et: datetime):
         """Build and emit a BAR event for a ticker."""

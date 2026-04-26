@@ -131,6 +131,10 @@ class ProSetupEngine:
         self._5min_cache: Dict[str, object] = {}     # {ticker: df_5min}
         self._5min_cache_len: Dict[str, int] = {}    # {ticker: len(df) when cached}
 
+        # V10.1: Skip unchanged bars — avoid re-evaluating same data
+        # Key: (ticker, len(df), last_close, last_volume)
+        self._last_bar_key: Dict[str, tuple] = {}
+
         log.info(
             "[ProSetupEngine] ready  detectors=%d  max_pos=%d  "
             "cooldown=%ds  budget=$%.0f",
@@ -147,6 +151,20 @@ class ProSetupEngine:
 
         if len(df) < _MIN_BARS:
             return
+
+        # V10.1: Skip if this exact bar was already evaluated.
+        # Both BarBuilder and REST may emit BAR for the same ticker.
+        # Also, REST re-emits same data when no new bar formed.
+        # Key on (len, last_close, last_volume) — changes when new bar arrives.
+        try:
+            _last = df.iloc[-1]
+            _bar_key = (len(df), float(_last.get('close', _last.get('c', 0))),
+                        float(_last.get('volume', _last.get('v', 0))))
+            if self._last_bar_key.get(ticker) == _bar_key:
+                return  # same bar, already evaluated
+            self._last_bar_key[ticker] = _bar_key
+        except Exception:
+            pass  # if key extraction fails, evaluate anyway
 
         # EOD gate: no new signals after 3:45 PM ET
         from datetime import datetime

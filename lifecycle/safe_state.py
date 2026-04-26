@@ -114,27 +114,61 @@ class SafeStateFile:
         # Serialize full state
         serialized = json.dumps(data, indent=2, default=str)
 
-        # Rotate backups: current → prev → prev2
-        self._rotate_backups()
+        # V10: Pre-flight disk space check (need ~2x serialized size for tmp + final)
+        try:
+            stat = os.statvfs(os.path.dirname(self._path) or '.')
+            free_bytes = stat.f_bavail * stat.f_frsize
+            needed = len(serialized.encode()) * 3  # safety margin
+            if free_bytes < needed:
+                log.critical("[SafeState] DISK FULL — %d bytes free, need %d. "
+                             "Skipping write to preserve existing state.", free_bytes, needed)
+                return False
+        except (OSError, AttributeError):
+            pass  # statvfs not available on all platforms — proceed with write
 
         # Atomic write: tmp → fsync → replace
+        # Rotate AFTER successful write (not before) to preserve current on failure
         tmp = self._path + '.tmp'
-        with open(tmp, 'w') as f:
-            f.write(serialized)
-            f.flush()
-            os.fsync(f.fileno())  # force to disk before replace
-        # Verify written bytes match expected (catches disk-full truncation)
-        if os.path.getsize(tmp) != len(serialized.encode()):
-            log.error("[SafeState] Write size mismatch for %s — disk may be full",
-                      self._path)
-            os.unlink(tmp)
+        try:
+            with open(tmp, 'w') as f:
+                f.write(serialized)
+                f.flush()
+                os.fsync(f.fileno())
+            # Verify written bytes match expected
+            if os.path.getsize(tmp) != len(serialized.encode()):
+                log.error("[SafeState] Write size mismatch for %s — disk may be full",
+                          self._path)
+                os.unlink(tmp)
+                return False
+        except OSError as exc:
+            log.critical("[SafeState] Write FAILED for %s: %s — preserving existing state",
+                         self._path, exc)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             return False
-        os.replace(tmp, self._path)
 
-        # Write checksum sidecar
+        # Rotate backups AFTER successful tmp write (current → prev → prev2)
+        self._rotate_backups()
+        try:
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            log.critical("[SafeState] os.replace FAILED for %s: %s — cleaning up tmp",
+                         self._path, exc)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+
+        # Embed checksum in sidecar (best-effort — main file is already safe)
         file_hash = hashlib.sha256(serialized.encode()).hexdigest()
-        with open(self._checksum_path, 'w') as f:
-            f.write(file_hash)
+        try:
+            with open(self._checksum_path, 'w') as f:
+                f.write(file_hash)
+        except OSError as exc:
+            log.warning("[SafeState] Checksum write failed: %s", exc)
 
         self._last_hash = content_hash
         log.debug("[SafeState] %s v%d written (%d bytes)",
@@ -173,6 +207,18 @@ class SafeStateFile:
                     log.error("[SafeState] ALL copies corrupt/missing: %s",
                               self._path)
                     return None, False
+
+                # V10: Version monotonic check — reject if lower than last seen
+                file_version = data.get('_version', 0)
+                if not hasattr(self, '_last_read_version'):
+                    self._last_read_version = 0
+                if file_version < self._last_read_version:
+                    log.warning(
+                        "[SafeState] Version regression: file v%d < last seen v%d "
+                        "— possible concurrent writer. Using higher version.",
+                        file_version, self._last_read_version)
+                else:
+                    self._last_read_version = file_version
 
                 # Check staleness
                 fresh = self._check_freshness(data)

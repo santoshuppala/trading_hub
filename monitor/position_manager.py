@@ -284,7 +284,7 @@ class PositionManager:
         # The position dict written here is the authoritative record; monitor.py
         # will backfill stop/target on the same tick if it is still orchestrating.
         import time as _time
-        self._last_order_time[ticker] = _time.time()
+        self._last_order_time[ticker] = _time.monotonic()
         self._reclaimed_today.add(ticker)
 
         # Use FillPayload's stop/target when present (Pro/Pop signals carry these).
@@ -509,9 +509,11 @@ class PositionManager:
                 if len(bq) <= 1:
                     pos.pop('_broker_qty', None)
 
-        # Partial exit: qty sold is less than total position
+        # Partial exit: qty sold is less than total position.
+        # V10: Treat ANY sell that doesn't fully close as partial — not just PARTIAL_SELL.
+        # This handles broker partial fills on SELL_STOP/SELL_TARGET where only N of M shares fill.
         remaining = pos['quantity'] - qty
-        if remaining > 0 and reason == 'PARTIAL_SELL':
+        if remaining > 0:
             pos['quantity']     = remaining
             pos['partial_done'] = True
             # Move stop to breakeven only if it's currently below entry (don't lower a trailing stop)
@@ -564,7 +566,7 @@ class PositionManager:
         # Full close
         del self._positions[ticker]
         import time as _time
-        self._last_order_time[ticker] = _time.time()
+        self._last_order_time[ticker] = _time.monotonic()
 
         # V7: Registry release handled by RegistryGate on POSITION CLOSED event
         # (centralized — only Core writes to registry)
@@ -649,8 +651,8 @@ class PositionManager:
                 try:
                     from .order_wal import wal as _wal
                     _wal.recorded(_wal_cid, lot_id=sell_lot.lot_id)
-                except Exception:
-                    pass
+                except Exception as _we:
+                    log.warning("[PositionManager] WAL recorded failed: %s", _we)
 
             # Shadow validation: compare ledger P&L vs computed P&L
             if matches:

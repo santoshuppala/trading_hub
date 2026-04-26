@@ -377,8 +377,9 @@ class RealTimeMonitor:
                             cancelled += 1
                             log.info("[order-cleanup] Cancelled stale Alpaca order: %s %s %s",
                                      order.side, order.symbol, order.id)
-                        except Exception:
-                            pass
+                        except Exception as _ce:
+                            log.warning("[order-cleanup] Alpaca cancel failed for %s: %s",
+                                        order.id, _ce)
         except Exception as exc:
             log.warning("[order-cleanup] Alpaca cleanup failed: %s", exc)
 
@@ -1223,8 +1224,8 @@ class RealTimeMonitor:
                             },
                         ),
                     ))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    log.warning("[live_reconcile] POSITION emit failed for %s: %s", ticker, _exc)
 
                 fixes += 1
 
@@ -1386,13 +1387,53 @@ class RealTimeMonitor:
             self._bars_cache.pop(t, None)
             self._bars_cache_times.pop(t, None)
 
-        # V8: Alert if data coverage drops below 90%
+        # V10: Track data freshness — detect silent fetch failures
+        if new_bars:
+            self._last_successful_fetch = time.monotonic()
+        elif not hasattr(self, '_last_successful_fetch'):
+            self._last_successful_fetch = time.monotonic()
+
+        _fetch_age = time.monotonic() - getattr(self, '_last_successful_fetch', time.monotonic())
+        if _fetch_age > 120 and not hasattr(self, '_stale_alert_sent'):
+            log.critical("[DataQuality] NO DATA for %.0fs — data pipeline may be dead", _fetch_age)
+            send_alert(self._alert_email,
+                       f"DATA PIPELINE STALE: No bars fetched for {int(_fetch_age)}s. "
+                       f"Check API connectivity and rate limits.",
+                       severity='CRITICAL')
+            self._stale_alert_sent = True
+        elif _fetch_age <= 120:
+            self._stale_alert_sent = False  # reset once data flows again
+
+        # V10: Data coverage circuit breaker
+        # <50% for 2 consecutive cycles → halt new entries (exits still run)
+        if not hasattr(self, '_low_coverage_count'):
+            self._low_coverage_count = 0
+            self._data_circuit_open = False
+
         if self.tickers:
             coverage = len(new_bars) / len(self.tickers)
-            if coverage < 0.90:
+            if coverage < 0.50:
+                self._low_coverage_count += 1
+                if self._low_coverage_count >= 2 and not self._data_circuit_open:
+                    self._data_circuit_open = True
+                    log.critical(
+                        "[DataQuality] CIRCUIT BREAKER: %.0f%% coverage for %d cycles — "
+                        "halting new entries", coverage * 100, self._low_coverage_count)
+                    send_alert(self._alert_email,
+                               f"DATA CIRCUIT BREAKER: {coverage:.0%} coverage. "
+                               f"New entries halted until data recovers.",
+                               severity='CRITICAL')
+            elif coverage < 0.90:
                 log.warning(
                     "[DataQuality] Only %.0f%% tickers fetched (%d/%d) — data incomplete",
                     coverage * 100, len(new_bars), len(self.tickers))
+                self._low_coverage_count = 0
+            else:
+                if self._data_circuit_open:
+                    log.info("[DataQuality] Coverage recovered to %.0f%% — resuming entries",
+                             coverage * 100)
+                self._low_coverage_count = 0
+                self._data_circuit_open = False
 
         # V8: Tiered scanning — classify tickers before emit_batch
         scan_tickers = self._ticker_scanner.classify(self.tickers, self._bars_cache)
@@ -1441,6 +1482,10 @@ class RealTimeMonitor:
         _skipped_nocache = 0
         _skipped_bb = 0
         for ticker in scan_tickers:
+            # V10: Data circuit breaker — only emit for open positions (exits)
+            if getattr(self, '_data_circuit_open', False) and ticker not in self.positions:
+                continue
+
             # Skip if BarBuilder is actively covering this ticker
             if _bb_active and _bb.covers_ticker(ticker):
                 _skipped_bb += 1
@@ -1514,8 +1559,8 @@ class RealTimeMonitor:
         # (3) seeds BarBuilder — so every ticker on the radar has full data.
         self._sync_stream_and_data()
 
-        # V9 (R3): Stale order cleanup
-        if now_mono - getattr(self, '_last_order_cleanup', 0) > 300:
+        # V10: Stale order cleanup every 60s (was 300s — too slow for active trading)
+        if now_mono - getattr(self, '_last_order_cleanup', 0) > 60:
             self._last_order_cleanup = now_mono
             try:
                 self._cleanup_stale_open_orders()

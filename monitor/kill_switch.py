@@ -9,6 +9,7 @@ Usage:
         block_order()
 """
 import logging
+import threading
 import time
 from typing import Dict, Optional
 
@@ -28,19 +29,30 @@ class PerStrategyKillSwitch:
     stop Pro from trading.
     """
 
+    # V10: Per-broker loss limit (prevents asymmetric loss when one broker fails)
+    _DEFAULT_BROKER_LOSS_LIMIT = -10_000.0
+
     def __init__(
         self,
         bus: EventBus,
         limits: Dict[str, float],
         alert_email: Optional[str] = None,
+        broker_loss_limit: float = _DEFAULT_BROKER_LOSS_LIMIT,
     ):
         self._limits = limits  # {strategy_prefix: max_daily_loss}
         self._pnl: Dict[str, float] = {k: 0.0 for k in limits}
         self._halted: Dict[str, bool] = {k: False for k in limits}
+        self._lock = threading.Lock()  # protects _pnl + _halted atomically
         self._alert_email = alert_email
 
+        # V10: Per-broker P&L tracking
+        self._broker_loss_limit = broker_loss_limit
+        self._broker_pnl: Dict[str, float] = {}  # {broker_name: cumulative_pnl}
+        self._broker_halted: Dict[str, bool] = {}
+
         bus.subscribe(EventType.POSITION, self._on_position, priority=10)
-        log.info("[KillSwitch] initialized | limits=%s", limits)
+        log.info("[KillSwitch] initialized | limits=%s | broker_limit=$%.0f",
+                 limits, broker_loss_limit)
 
     def _on_position(self, event: Event) -> None:
         """Track realized P&L on position close."""
@@ -57,14 +69,32 @@ class PerStrategyKillSwitch:
             if prefix not in self._pnl:
                 return
 
-            self._pnl[prefix] += float(p.pnl)
+            # Atomic: update P&L + check limits under single lock
+            broker = cd.get('broker', getattr(event, '_routed_broker', None) or 'unknown')
+            alerts = []
+            with self._lock:
+                # Per-strategy P&L
+                self._pnl[prefix] += float(p.pnl)
+                if not self._halted[prefix] and self._pnl[prefix] <= self._limits[prefix]:
+                    self._halted[prefix] = True
+                    alerts.append(
+                        f"KILL SWITCH: strategy '{prefix}' halted — "
+                        f"daily P&L ${self._pnl[prefix]:+.2f} breached "
+                        f"limit ${self._limits[prefix]:+.2f}")
 
-            # Check limit
-            if not self._halted[prefix] and self._pnl[prefix] <= self._limits[prefix]:
-                self._halted[prefix] = True
-                msg = (f"KILL SWITCH: strategy '{prefix}' halted — "
-                       f"daily P&L ${self._pnl[prefix]:+.2f} breached "
-                       f"limit ${self._limits[prefix]:+.2f}")
+                # V10: Per-broker P&L
+                if broker and broker != 'unknown':
+                    self._broker_pnl.setdefault(broker, 0.0)
+                    self._broker_pnl[broker] += float(p.pnl)
+                    if (not self._broker_halted.get(broker, False)
+                            and self._broker_pnl[broker] <= self._broker_loss_limit):
+                        self._broker_halted[broker] = True
+                        alerts.append(
+                            f"KILL SWITCH: broker '{broker}' halted — "
+                            f"daily P&L ${self._broker_pnl[broker]:+.2f} breached "
+                            f"limit ${self._broker_loss_limit:+.2f}")
+
+            for msg in alerts:
                 log.critical(msg)
                 try:
                     from .alerts import send_alert
@@ -74,27 +104,45 @@ class PerStrategyKillSwitch:
         except Exception as exc:
             log.warning("[KillSwitch] _on_position error: %s", exc)
 
-    def is_halted(self, strategy_prefix: str) -> bool:
-        """Check if a strategy is halted. Called by RiskEngine/RiskAdapter."""
-        return self._halted.get(strategy_prefix, False)
+    def is_halted(self, strategy_prefix: str, broker: str = '') -> bool:
+        """Check if a strategy or broker is halted. Called by RiskEngine/RiskAdapter."""
+        with self._lock:
+            if self._halted.get(strategy_prefix, False):
+                return True
+            if broker and self._broker_halted.get(broker, False):
+                return True
+            return False
 
     def status(self) -> dict:
         """Return current kill switch state for monitoring."""
-        return {
-            prefix: {
-                'pnl': round(self._pnl.get(prefix, 0), 2),
-                'limit': self._limits.get(prefix, 0),
-                'halted': self._halted.get(prefix, False),
+        with self._lock:
+            strategies = {
+                prefix: {
+                    'pnl': round(self._pnl.get(prefix, 0), 2),
+                    'limit': self._limits.get(prefix, 0),
+                    'halted': self._halted.get(prefix, False),
+                }
+                for prefix in self._limits
             }
-            for prefix in self._limits
-        }
+            brokers = {
+                broker: {
+                    'pnl': round(pnl, 2),
+                    'limit': self._broker_loss_limit,
+                    'halted': self._broker_halted.get(broker, False),
+                }
+                for broker, pnl in self._broker_pnl.items()
+            }
+            return {'strategies': strategies, 'brokers': brokers}
 
     def reset_day(self) -> None:
-        """Reset all P&L counters and un-halt all strategies."""
-        for prefix in self._pnl:
-            self._pnl[prefix] = 0.0
-            self._halted[prefix] = False
-        log.info("[KillSwitch] daily reset — all strategies un-halted")
+        """Reset all P&L counters and un-halt all strategies + brokers."""
+        with self._lock:
+            for prefix in self._pnl:
+                self._pnl[prefix] = 0.0
+                self._halted[prefix] = False
+            self._broker_pnl.clear()
+            self._broker_halted.clear()
+        log.info("[KillSwitch] daily reset — all strategies + brokers un-halted")
 
     @staticmethod
     def _infer_prefix(strategy: str) -> str:

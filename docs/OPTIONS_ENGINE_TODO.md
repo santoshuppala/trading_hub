@@ -1,7 +1,7 @@
 # Options Engine — TODO
 
-**Last updated**: 2026-04-13
-**Status**: Architecture complete, backtesting blocked on mock chain compatibility
+**Last updated**: 2026-04-26
+**Status**: V10 exit lifecycle deployed, PF analysis wired, awaiting live data
 
 ---
 
@@ -133,10 +133,52 @@
 
 ---
 
+## V10 Exit Lifecycle (NEW — April 26)
+
+### Architecture
+```
+Phase = f(DTE)           → OPEN (>21) / THETA (21-10) / CLOSE (≤10)
+Override = f(moneyness)  → continuous pressure 0→1, escalates at >0.7
+Behavior = f(Greeks)     → weighted risk score, strategy-aware fatal signals
+```
+
+### Per-Strategy Behavior
+| | Credit | Debit | Volatility |
+|---|---|---|---|
+| Fatal signal | delta adverse + high pressure | vega adverse (IV crush) | vega adverse (IV revert) |
+| Phase 1 stop | 2x credit received | 50% entry cost | 50% entry cost |
+| Phase 2 stop | 1.5x credit (tighter) | 40% entry cost | 40% entry cost |
+| Phase 1 profit | 50% max reward | 80% max reward | 60% max reward |
+| Phase 2 profit | 40% (earlier) | 50% (lower) | 50% (lower) |
+| Phase 3 | Roll if profitable + safe | Close all | Close all |
+
+### PF Analysis
+- Per-check snapshots every 2.5 min (19 fields: spot, Greeks, risk_score, etc.)
+- `scripts/analyze_options_pf.py` — daily breakdown
+- `scripts/weekly_options_review.py` — weekly calibration (auto-triggers Fridays)
+- Calibration checks: score separation, monotonicity, threshold optimization
+
+### Key Files
+```
+options/
+├── options_exit_engine.py # V10: Phase-based lifecycle (NEW)
+├── engine.py              # Wired lifecycle, close events, orphan recovery
+├── broker.py              # Multi-leg partial fill detection
+├── ...
+scripts/
+├── analyze_options_pf.py  # Daily PF analysis (NEW)
+├── weekly_options_review.py # Weekly calibration (NEW)
+lifecycle/
+├── eod_report.py          # Friday auto-trigger for weekly review
+├── adapters/
+│   └── options_adapter.py # Orphan rebuild from broker contracts
+```
+
 ## Architecture Reference
 
 ```
 options/
+├── options_exit_engine.py # V10: Phase-based exit lifecycle
 ├── engine.py              # Main orchestrator (entry + exit + monitoring)
 ├── selector.py            # Strategy selection (IV rank-based)
 ├── iv_tracker.py          # Historical IV rank/percentile
@@ -144,6 +186,7 @@ options/
 ├── risk.py                # Budget + position limits (tracks max_risk)
 ├── chain.py               # Alpaca option chain client (real API)
 ├── broker.py              # Alpaca order execution (real API)
+├── portfolio_greeks.py    # Aggregate Greeks tracking
 ├── strategies/
 │   ├── base.py            # OptionsTradeSpec, OptionLeg, BaseOptionsStrategy
 │   ├── directional.py     # long_call, long_put
@@ -152,6 +195,10 @@ options/
 │   ├── neutral.py         # iron_condor, iron_butterfly (skew-aware)
 │   ├── time_based.py      # calendar, diagonal
 │   └── complex.py         # butterfly
+│
+scripts/
+├── analyze_options_pf.py  # Daily PF analysis
+├── weekly_options_review.py # Weekly calibration + threshold recommendations
 │
 backtests/
 ├── engine.py              # Backtest orchestrator (options wired in)
@@ -164,7 +211,7 @@ backtests/
     └── csv_reporter.py    # Trades + equity curve + summary CSVs
 ```
 
-## Key Config (config.py)
+## Key Config (config.py + env vars)
 
 ```
 ALPACA_OPTIONS_KEY        # Separate Alpaca account for options
@@ -176,14 +223,21 @@ OPTIONS_TOTAL_BUDGET      = 10000   # total capital
 OPTIONS_ORDER_COOLDOWN    = 300     # seconds per ticker
 OPTIONS_MIN_DTE           = 20
 OPTIONS_MAX_DTE           = 45
-OPTIONS_PROFIT_TARGET_CREDIT = 0.50
-OPTIONS_PROFIT_TARGET_DEBIT  = 0.80 (was 1.00)
-OPTIONS_STOP_LOSS_FRACTION   = 0.50 (was 0.80)
-OPTIONS_DTE_CLOSE            = 10   (was 7)
+
+# V10: Configurable via env vars (with safe defaults)
+OPT_PROFIT_CREDIT        = 0.50    # credit profit target
+OPT_PROFIT_DEBIT         = 0.80    # debit profit target
+OPT_STOP_CREDIT          = 1.00    # credit stop (legacy; lifecycle uses 2x credit)
+OPT_STOP_DEBIT           = 0.50    # debit stop
+OPT_DTE_CLOSE            = 10      # DTE close threshold
+OPT_DTE_ROLL             = 14      # DTE roll consideration
+OPT_THETA_BLEED_PCT      = 0.60    # theta bleed exit %
+READ_ONLY                = false   # block new entries (exits still run)
+FF_OPTIONS_LIFECYCLE      = true    # feature flag: enable lifecycle engine
 ```
 
-## Current Rating: 7.5/10
+## Current Rating: 8.5/10
 
-**What works**: Architecture, 13 strategies, IV rank, earnings calendar, exit management, real API integration.
-**What's blocked**: Backtesting (mock chain field mismatch), live validation (needs paper trading).
-**Realistic return target**: +15-30% annually on $10K options account.
+**What works**: Architecture, 13 strategies, IV rank, earnings calendar, V10 phase-based exit lifecycle, risk-regime management, full journey persistence, PF analysis pipeline, orphan recovery, 47 production hardening fixes.
+**What's needed**: Live PF data (first week), entry quality scoring, Kelly sizing, VIX regime gating.
+**Next milestone**: Week 1 PF review (auto-triggers Friday EOD).

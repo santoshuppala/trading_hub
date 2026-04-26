@@ -53,6 +53,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Optional, Set, Dict
 
@@ -70,11 +71,25 @@ log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-SLIPPAGE_PCT   = 0.0001   # 0.01% — slippage allowance added to ask for sizing
-MAX_SPREAD_PCT = 0.002    # 0.2%  — max bid/ask spread; wider → skip entry
-MIN_RVOL       = 2.0      # minimum relative volume for momentum confirmation
-RSI_LOW        = 40.0     # RSI must be >= RSI_LOW (allow recovery trades)
-RSI_HIGH       = 75.0     # RSI must be <= RSI_HIGH (allow early momentum)
+import os as _os
+
+def _safe_float(env_key: str, default: float) -> float:
+    try:
+        return float(_os.getenv(env_key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+def _safe_int(env_key: str, default: int) -> int:
+    try:
+        return int(_os.getenv(env_key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+SLIPPAGE_PCT   = 0.0001
+MAX_SPREAD_PCT = _safe_float('RISK_MAX_SPREAD_PCT', 0.002)
+MIN_RVOL       = _safe_float('RISK_MIN_RVOL', 2.0)
+RSI_LOW        = _safe_float('RISK_RSI_LOW', 40.0)
+RSI_HIGH       = _safe_float('RISK_RSI_HIGH', 75.0)
 
 
 class RiskEngine:
@@ -109,10 +124,24 @@ class RiskEngine:
         self._trade_budget    = trade_budget
         # V9: Optional streaming client for instant price lookups
         self._stream_client   = None  # set via set_stream_client()
+        self._stream_lock     = threading.Lock()  # V10: protects _stream_client reference
         self._alert_email     = alert_email
         self._sizer           = RiskSizer()
+        # V10: Track pending (in-flight) BUY orders to prevent position limit bypass
+        # Ticker added when ORDER_REQ emitted, removed on FILL or ORDER_FAIL
+        # Dict {ticker: monotonic_time} for TTL eviction (60s) if events are lost
+        self._pending_tickers: dict = {}
+        self._pending_lock = threading.Lock()
+        self._PENDING_TTL = 60.0  # seconds before auto-evicting stale pending
+
+        # V10: Read-only mode — signals generate, exits run, but no new BUY orders
+        self._read_only = _os.getenv('READ_ONLY', '').lower() in ('true', '1', 'yes')
+        if self._read_only:
+            log.warning("[RiskEngine] READ-ONLY MODE — BUY orders will be blocked")
 
         bus.subscribe(EventType.SIGNAL, self._on_signal)
+        bus.subscribe(EventType.FILL, self._on_fill_clear_pending, priority=99)
+        bus.subscribe(EventType.ORDER_FAIL, self._on_fail_clear_pending, priority=99)
 
     # ── Event handler ────────────────────────────────────────────────────────
 
@@ -120,6 +149,10 @@ class RiskEngine:
         p: SignalPayload = event.payload
 
         if p.action == 'BUY':
+            # V10: Read-only mode blocks new entries (exits still run for safety)
+            if self._read_only:
+                log.info("[RiskEngine] READ-ONLY: blocked BUY for %s", p.ticker)
+                return
             self._handle_buy(p, event)
         else:
             # Sell signals bypass all risk checks — exits must always execute.
@@ -146,8 +179,21 @@ class RiskEngine:
             # 1. Max positions — V8: count only VWAP positions (not Pro/Pop)
             # Pro positions share the same dict but have strategy='pro:...'
             # Without this filter, 5 Pro positions would block all VWAP entries
-            vwap_count = sum(1 for pos in self._positions.values()
+            # Snapshot to avoid RuntimeError if dict changes during iteration
+            _positions_snap = list(self._positions.values())
+            vwap_count = sum(1 for pos in _positions_snap
                              if not str(pos.get('strategy', '')).startswith('pro:'))
+            # V10: Include pending (in-flight) orders to prevent limit bypass
+            # Evict stale entries (>60s — FILL/ORDER_FAIL event was lost)
+            with self._pending_lock:
+                _now = time.monotonic()
+                _stale = [t for t, ts in self._pending_tickers.items()
+                          if _now - ts > self._PENDING_TTL]
+                for t in _stale:
+                    del self._pending_tickers[t]
+                    log.warning("[RiskEngine] Evicted stale pending ticker %s (>%.0fs)",
+                                t, self._PENDING_TTL)
+                vwap_count += len(self._pending_tickers)
             if vwap_count >= self._max_positions:
                 self._block(ticker, p.action,
                             f"max VWAP positions reached ({vwap_count}/{self._max_positions})",
@@ -155,7 +201,8 @@ class RiskEngine:
                 return
 
             # 2. Cooldown
-            elapsed = time.time() - self._last_order_time.get(ticker, 0.0)
+            # V10: Use monotonic clock for cooldown (immune to DST/NTP jumps)
+            elapsed = time.monotonic() - self._last_order_time.get(ticker, 0.0)
             if elapsed < self._order_cooldown:
                 remaining = int(self._order_cooldown - elapsed)
                 self._block(ticker, p.action,
@@ -226,7 +273,7 @@ class RiskEngine:
             except Exception:
                 pass
             corr_ok, corr_reason = self._sizer.check_correlation(
-                ticker, set(self._positions.keys()), news_context=news_ctx,
+                ticker, set(list(self._positions.keys())), news_context=news_ctx,
             )
             if not corr_ok:
                 self._block(ticker, p.action, corr_reason, event)
@@ -316,6 +363,11 @@ class RiskEngine:
                 correlation_id=event.event_id,
             )
             _order_event._wal_client_id = _wal_cid  # carry WAL ID downstream
+
+            # V10: Track as pending before emit (cleared on FILL/ORDER_FAIL)
+            with self._pending_lock:
+                self._pending_tickers[ticker] = time.monotonic()
+
             self._bus.emit(_order_event)
             _approved = True
         finally:
@@ -381,13 +433,35 @@ class RiskEngine:
             correlation_id=event.event_id,
         ))
 
+    # ── V10: Clear pending tickers on fill or failure ──────────────────────
+
+    def _on_fill_clear_pending(self, event: Event) -> None:
+        """Remove ticker from pending set when BUY fill arrives."""
+        try:
+            p = event.payload
+            if hasattr(p, 'side') and str(p.side).upper() == 'BUY':
+                with self._pending_lock:
+                    self._pending_tickers.pop(getattr(p, 'ticker', ''), None)
+        except Exception:
+            pass
+
+    def _on_fail_clear_pending(self, event: Event) -> None:
+        """Remove ticker from pending set when order fails."""
+        try:
+            p = event.payload
+            with self._pending_lock:
+                self._pending_tickers.pop(getattr(p, 'ticker', ''), None)
+        except Exception:
+            pass
+
     def set_stream_client(self, stream_client) -> None:
         """V9: Attach TradierStreamClient for instant price lookups.
 
         When set, _get_spread() uses streaming bid/ask (<1ms) instead of
         REST API call (0.5-3s). Falls back to REST if streaming unavailable.
         """
-        self._stream_client = stream_client
+        with self._stream_lock:
+            self._stream_client = stream_client
         log.info("[RiskEngine] Stream client attached — using streaming prices for spread check")
 
     def _get_spread(self, ticker: str, signal_ask: float):
@@ -407,9 +481,11 @@ class RiskEngine:
         spread_pct = None
 
         # V9: Try streaming price first (<1ms vs 0.5-3s REST)
-        if self._stream_client is not None:
+        with self._stream_lock:
+            _sc = self._stream_client
+        if _sc is not None:
             try:
-                quote = self._stream_client.get_quote(ticker)
+                quote = _sc.get_quote(ticker)
                 if quote and quote.get('ask', 0) > 0 and quote.get('bid', 0) > 0:
                     ask_price = quote['ask']
                     bid = quote['bid']

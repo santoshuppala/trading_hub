@@ -274,10 +274,10 @@ def test_8i_stop_at_current_price():
     result = analyzer.check_position_exit('STOP_T', pos, df_copy, {})
     log.info(f"  result={result}")
     # At current_price == stop_price, the condition is current_price <= stop_price -> True
-    assert result in ('sell_stop', None), \
-        f"Expected 'sell_stop' or None at stop, got {result!r}"
-    if result == 'sell_stop':
-        log.info("  PASS: stop_price == current_price triggers sell_stop")
+    assert result in ('SELL_STOP', None), \
+        f"Expected 'SELL_STOP' or None at stop, got {result!r}"
+    if result == 'SELL_STOP':
+        log.info("  PASS: stop_price == current_price triggers SELL_STOP")
     else:
         log.info("  PASS: stop_price == current_price returned None (may fail RSI/VWAP guard first)")
     return True
@@ -300,10 +300,10 @@ def test_8j_target_at_current_price():
 
     result = analyzer.check_position_exit('TARGET_T', pos, df_copy, {})
     log.info(f"  result={result}")
-    assert result in ('sell_target', 'sell_rsi', None), \
+    assert result in ('SELL_TARGET', 'SELL_RSI', None), \
         f"Unexpected result at target: {result!r}"
-    if result == 'sell_target':
-        log.info("  PASS: target_price == current_price triggers sell_target")
+    if result == 'SELL_TARGET':
+        log.info("  PASS: target_price == current_price triggers SELL_TARGET")
     else:
         log.info(f"  PASS: target at current price returned {result!r}")
     return True

@@ -26,6 +26,7 @@ from .earnings_calendar import EarningsCalendar
 from .iv_tracker import IVTracker
 from .risk import OptionsRiskGate
 from .selector import OptionStrategySelector
+from .options_exit_engine import OptionsPositionLifecycle, OptionsExitDecision
 from .strategies import STRATEGY_REGISTRY
 from .strategies.base import OptionsTradeSpec
 
@@ -33,24 +34,24 @@ log = logging.getLogger(__name__)
 
 _MIN_BARS: int = 52
 
-# ── Exit management thresholds ──────────────────────────────────────────────
-# Profit targets (fraction of max_reward to capture before closing)
-PROFIT_TARGET_CREDIT  = 0.50   # credit strategies: close at 50% of max reward
-PROFIT_TARGET_DEBIT   = 0.80   # debit strategies: close at 80% of max reward (don't be greedy)
-PROFIT_TARGET_VOLAT   = 0.60   # volatility strategies: close at 60% of max reward
+# ── Exit management thresholds (V10: configurable via env vars, safe defaults) ─
+import os as _os
+def _sf(k, d):
+    try: return float(_os.getenv(k, str(d)))
+    except (ValueError, TypeError): return d
 
-# Stop losses (fraction of max_risk at which to cut)
-# V9: Different thresholds for credit vs debit — credit spreads need room to breathe
-STOP_LOSS_CREDIT      = 1.00   # credit: close at 100% of max_risk (let theta work, cap at max loss)
-STOP_LOSS_DEBIT       = 0.50   # debit: close at 50% of max_risk (cut losses early)
+PROFIT_TARGET_CREDIT  = _sf('OPT_PROFIT_CREDIT', 0.50)
+PROFIT_TARGET_DEBIT   = _sf('OPT_PROFIT_DEBIT', 0.80)
+PROFIT_TARGET_VOLAT   = _sf('OPT_PROFIT_VOLAT', 0.60)
 
-# DTE thresholds
-DTE_CLOSE_THRESHOLD   = 10    # close any position with <= 10 DTE (was 7, gamma risk)
-DTE_ROLL_THRESHOLD    = 14    # consider rolling at 14 DTE (credit strategies)
+STOP_LOSS_CREDIT      = _sf('OPT_STOP_CREDIT', 1.00)
+STOP_LOSS_DEBIT       = _sf('OPT_STOP_DEBIT', 0.50)
 
-# Theta bleed: close if position lost > X% of entry cost with DTE still remaining
-THETA_BLEED_PCT       = 0.60   # close if lost 60% of value with 15+ DTE left
-THETA_BLEED_MIN_DTE   = 15
+DTE_CLOSE_THRESHOLD   = int(_sf('OPT_DTE_CLOSE', 10))
+DTE_ROLL_THRESHOLD    = int(_sf('OPT_DTE_ROLL', 14))
+
+THETA_BLEED_PCT       = _sf('OPT_THETA_BLEED_PCT', 0.60)
+THETA_BLEED_MIN_DTE   = int(_sf('OPT_THETA_BLEED_MIN_DTE', 15))
 
 # Position monitoring interval (seconds) — checked on every BAR
 _MONITOR_COOLDOWN     = 30.0   # don't re-check same ticker faster than 30s
@@ -92,6 +93,7 @@ class OptionsPosition:
     portfolio_delta:  float = 0.0      # net delta of this position
     portfolio_theta:  float = 0.0      # net theta (daily decay)
     portfolio_vega:   float = 0.0      # net vega (IV sensitivity)
+    greeks_updated_at: float = 0.0    # V10: monotonic timestamp of last Greeks refresh
 
     @property
     def is_credit(self) -> bool:
@@ -204,6 +206,9 @@ class OptionsEngine:
         self._positions: Dict[str, OptionsPosition] = {}
         self._positions_lock = threading.Lock()
 
+        # ── V10: Per-position lifecycle managers ──────────────────────
+        self._lifecycles: Dict[str, OptionsPositionLifecycle] = {}
+
         # ── Portfolio-level Greeks ─────────────────────────────────────
         self._portfolio_delta = 0.0
         self._portfolio_theta = 0.0
@@ -220,6 +225,11 @@ class OptionsEngine:
         # Checked as FIRST line in _on_signal, _on_bar, _execute_entry.
         # Prevents new entries even if BAR events arrive before tick() returns False.
         self._halted = False
+
+        # V10: Read-only mode — monitor and exit, but don't enter new positions
+        self._read_only = _os.getenv('READ_ONLY', '').lower() in ('true', '1', 'yes')
+        if self._read_only:
+            log.warning("[OptionsEngine] READ-ONLY MODE — new entries blocked")
 
         # ── Subscribe ──────────────────────────────────────────────────
         bus.subscribe(EventType.SIGNAL,     self._on_signal,     priority=3)
@@ -617,7 +627,11 @@ class OptionsEngine:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _monitor_positions(self, ticker: str, spot: float) -> None:
-        """Check if any open position on this ticker needs exit."""
+        """Check if any open position on this ticker needs exit.
+
+        V10: Uses OptionsPositionLifecycle for phase-based exits.
+        Falls back to flat _evaluate_exit if no lifecycle exists (legacy positions).
+        """
         # Take a snapshot under lock to avoid race conditions
         with self._positions_lock:
             pos = self._positions.get(ticker)
@@ -629,14 +643,99 @@ class OptionsEngine:
                 return
             pos.last_check_time = now
 
-            # Copy reference — pos is still in dict, safe to evaluate outside lock
-            # because only this thread processes this ticker's bars
-
         self._update_position_greeks(pos)
-        exit_reason = self._evaluate_exit(pos, spot)
 
+        # ── V10: Lifecycle-based evaluation ──────────────────────────
+        with self._positions_lock:
+            lifecycle = self._lifecycles.get(ticker)
+
+        # Auto-create lifecycle for positions without one (restart recovery,
+        # reconciled positions, pre-upgrade legacy). Uses position data
+        # already available — no API calls needed.
+        if lifecycle is None and pos.spec is not None:
+            try:
+                short_s, long_s = self._extract_strikes(pos.spec)
+                entry_iv = self._estimate_iv(ticker, spot) or 0.20
+                if entry_iv < 0.05:
+                    entry_iv = 0.20
+                lifecycle = OptionsPositionLifecycle(
+                    ticker=ticker,
+                    strategy_type=pos.strategy_type,
+                    entry_cost=pos.entry_cost,
+                    max_risk=pos.max_risk,
+                    max_reward=pos.max_reward,
+                    entry_iv=entry_iv,
+                    entry_delta=pos.portfolio_delta,
+                    entry_underlying=spot,  # best available (actual entry price lost)
+                    short_strikes=tuple(short_s),
+                    long_strikes=tuple(long_s),
+                    atr=spot * 0.01,  # fallback ATR estimate
+                    dte_at_entry=pos.dte,
+                )
+                with self._positions_lock:
+                    self._lifecycles[ticker] = lifecycle
+                log.info("[OptionsEngine] %s AUTO-CREATED lifecycle (restart recovery) "
+                         "| phase=%d dte=%d", ticker, lifecycle.phase, pos.dte)
+            except Exception as exc:
+                log.warning("[OptionsEngine] Failed to auto-create lifecycle for %s: %s "
+                            "— using flat exit check", ticker, exc)
+                lifecycle = None
+
+        if lifecycle:
+            # Get current mark-to-market
+            close_value = self._get_position_mark(pos)
+            if close_value is None:
+                return
+            pos.current_value = close_value
+            pos.current_pnl = close_value - pos.entry_cost
+
+            # Get current IV for vega state
+            current_iv = self._estimate_iv(ticker, spot) or 0.0
+
+            try:
+                decision = lifecycle.evaluate(
+                    spot=spot,
+                    current_value=close_value,
+                    dte=pos.dte,
+                    current_iv=current_iv,
+                    current_delta=pos.portfolio_delta,
+                    current_theta=pos.portfolio_theta,
+                    current_gamma=0.0,  # aggregate gamma not tracked yet
+                    current_vega=pos.portfolio_vega,
+                )
+            except Exception as exc:
+                log.error("[OptionsEngine] Lifecycle evaluate CRASHED for %s: %s — "
+                          "falling back to flat exit check", ticker, exc)
+                # Fall through to flat exit check below
+                lifecycle = None
+
+            if lifecycle and decision and decision.action == 'EXIT':
+                with self._positions_lock:
+                    if ticker not in self._positions:
+                        return
+                self._close_position(pos, decision.reason, spot)
+                return
+
+            if lifecycle and decision and decision.action == 'ROLL':
+                with self._positions_lock:
+                    if ticker not in self._positions:
+                        return
+                self._close_position(pos, decision.reason, spot)
+                log.info("[OptionsEngine] %s ROLL signaled — closed current position "
+                         "(auto re-entry at DTE=%d is TODO)", ticker, decision.roll_target_dte)
+                return
+
+            if lifecycle and decision and decision.action == 'TIGHTEN':
+                log.info("[OptionsEngine] %s TIGHTEN — %s", ticker, decision.reason)
+                return
+
+            if lifecycle:
+                # HOLD — do nothing
+                return
+
+        # ── Fallback: flat exit check (legacy positions without lifecycle) ──
+        exit_reason = self._evaluate_exit(pos, spot)
         if exit_reason:
-            # Re-check under lock that position still exists before closing
             with self._positions_lock:
                 if ticker not in self._positions:
                     return
@@ -841,6 +940,32 @@ class OptionsEngine:
         pos.portfolio_delta = net_delta
         pos.portfolio_theta = net_theta
         pos.portfolio_vega  = net_vega
+        pos.greeks_updated_at = time.monotonic()
+
+        # V10: Warn if Greeks are stale (chain data older than 90s)
+        if pos.greeks_updated_at - pos.last_check_time > 90:
+            log.warning("[OptionsEngine] Greeks stale for %s: %.0fs since last update",
+                        pos.ticker, pos.greeks_updated_at - pos.last_check_time)
+
+    @staticmethod
+    def _extract_strikes(spec: OptionsTradeSpec) -> Tuple[List[float], List[float]]:
+        """Extract short and long strikes from OCC symbols in trade spec legs.
+
+        OCC format: AAPL240119C00180000 → strike = 180.000
+        Last 8 chars / 1000 = strike price.
+        """
+        short_strikes = []
+        long_strikes = []
+        for leg in spec.legs:
+            try:
+                strike = int(leg.symbol[-8:]) / 1000.0
+            except (ValueError, IndexError):
+                continue
+            if leg.side.upper() == 'SELL':
+                short_strikes.append(strike)
+            else:
+                long_strikes.append(strike)
+        return short_strikes, long_strikes
 
     # ═══════════════════════════════════════════════════════════════════════════
     # POSITION CLOSE — Execute exit and clean up
@@ -849,8 +974,10 @@ class OptionsEngine:
     def _close_position(
         self, pos: OptionsPosition, reason: str, spot: float,
     ) -> None:
-        """Close an open position and clean up all state."""
+        """Close an open position, persist full lifecycle journey, and clean up."""
         ticker = pos.ticker
+        with self._positions_lock:
+            lifecycle = self._lifecycles.get(ticker)
 
         log.info(
             "[OptionsEngine] CLOSING %s %s | reason=%s | pnl=$%.2f | held=%.1fmin | dte=%d",
@@ -874,12 +1001,16 @@ class OptionsEngine:
             else:
                 self._risk.record_win(ticker)
 
+            # ── V10: Emit OPTIONS_CLOSE event with full lifecycle journey ──
+            self._emit_close_event(pos, reason, spot, lifecycle)
+
             # Release from risk gate
             self._risk.release(ticker)
 
-            # Remove from positions
+            # Remove from positions and lifecycle (atomically under lock)
             with self._positions_lock:
                 self._positions.pop(ticker, None)
+                self._lifecycles.pop(ticker, None)
 
             # Update portfolio Greeks
             self._recalculate_portfolio_greeks()
@@ -895,6 +1026,84 @@ class OptionsEngine:
                 "[OptionsEngine] CLOSE FAILED %s %s | reason=%s — position remains open",
                 ticker, pos.strategy_type, reason,
             )
+
+    def _emit_close_event(
+        self, pos: OptionsPosition, reason: str, spot: float,
+        lifecycle: Optional[OptionsPositionLifecycle],
+    ) -> None:
+        """Emit durable OPTIONS_CLOSE event with full lifecycle data for DB persistence.
+
+        Captures the entire journey: entry → phases → Greeks evolution → exit reason.
+        Persisted to event_store + completed_trades via EventSourcingSubscriber.
+        """
+        import json as _json
+
+        # Lifecycle data (if lifecycle exists — legacy positions may not have one)
+        lc_data = {}
+        if lifecycle:
+            lc_data = {
+                'exit_phase': int(lifecycle.phase),
+                'checks_count': lifecycle.checks_count,
+                'entry_iv': round(lifecycle.entry_iv, 4),
+                'entry_delta': round(lifecycle.entry_delta, 4),
+                'entry_underlying': round(lifecycle.entry_underlying, 4),
+                'short_strikes': list(lifecycle.short_strikes),
+                'long_strikes': list(lifecycle.long_strikes),
+                'atr': round(lifecycle.atr, 4),
+                'dte_at_entry': lifecycle.dte_at_entry,
+                'credit_received': round(lifecycle.credit_received, 2),
+                'best_pnl': round(lifecycle.best_pnl, 2),
+                'worst_pnl': round(lifecycle.worst_pnl, 2),
+                'moneyness_pressure': round(lifecycle.moneyness_pressure, 4),
+                # Full phase transition + decision event log
+                'events': lifecycle._events,
+                # V10: Periodic Greeks/risk snapshots for PF analysis
+                'snapshots': lifecycle._snapshots,
+            }
+
+        legs_data = []
+        for leg in pos.spec.legs:
+            legs_data.append({
+                'symbol': leg.symbol,
+                'side': leg.side,
+                'qty': leg.qty,
+                'limit_price': leg.limit_price,
+            })
+
+        close_payload = {
+            # ── Position identity ─────────────────────────────────
+            'ticker': pos.ticker,
+            'strategy_type': pos.strategy_type,
+            'expiry_date': pos.expiry_date,
+            'legs': legs_data,
+            # ── Entry data ────────────────────────────────────────
+            'entry_cost': round(pos.entry_cost, 2),
+            'max_risk': round(pos.max_risk, 2),
+            'max_reward': round(pos.max_reward, 2),
+            'holding_minutes': round(pos.holding_minutes, 1),
+            # ── Exit data ─────────────────────────────────────────
+            'exit_reason': reason,
+            'exit_spot': round(spot, 4) if spot else 0,
+            'exit_value': round(pos.current_value, 2),
+            'realized_pnl': round(pos.current_pnl, 2),
+            'dte_at_exit': pos.dte,
+            # ── Greeks at exit ────────────────────────────────────
+            'exit_delta': round(pos.portfolio_delta, 4),
+            'exit_theta': round(pos.portfolio_theta, 4),
+            'exit_vega': round(pos.portfolio_vega, 4),
+            # ── Full lifecycle journey ────────────────────────────
+            'lifecycle': lc_data,
+        }
+
+        try:
+            self._bus.emit(
+                Event(type=EventType.OPTIONS_CLOSE, payload=close_payload),
+                durable=True,
+            )
+        except Exception as exc:
+            # Close event emission failure must NEVER block position close
+            log.warning("[OptionsEngine] Failed to emit OPTIONS_CLOSE for %s: %s",
+                        pos.ticker, exc)
 
     def close_all_positions(self, reason: str = 'eod_close') -> None:
         """Close all open positions (called at end of day or emergency)."""
@@ -943,8 +1152,10 @@ class OptionsEngine:
         7. Track position for monitoring
         """
         # M4: Kill switch halt — block entry immediately
-        if self._halted:
+        if self._halted or self._read_only:
             self._risk.unreserve(ticker)
+            if self._read_only:
+                log.info("[OptionsEngine] READ-ONLY: blocked entry for %s", ticker)
             return
 
         # Step 1: Pre-check risk gate (skip pending check — we already hold the reservation)
@@ -1011,7 +1222,13 @@ class OptionsEngine:
             self._risk.unreserve(ticker)
             return
 
-        # Step 7: Track position for monitoring
+        # Step 7: Create lifecycle FIRST (before position tracking)
+        # If this fails, position is not tracked → no orphaned positions.
+        short_strikes, long_strikes = self._extract_strikes(trade_spec)
+        entry_iv = self._estimate_iv(ticker, spot_price) or 0.0
+        if entry_iv < 0.05:
+            entry_iv = 0.20  # floor: avoid vega state nullification
+
         pos = OptionsPosition(
             ticker=ticker,
             strategy_type=strategy_type,
@@ -1025,8 +1242,34 @@ class OptionsEngine:
             last_check_time=time.monotonic(),
         )
 
+        try:
+            lifecycle = OptionsPositionLifecycle(
+                ticker=ticker,
+                strategy_type=strategy_type,
+                entry_cost=trade_spec.net_debit,
+                max_risk=trade_spec.max_risk,
+                max_reward=trade_spec.max_reward,
+                entry_iv=entry_iv,
+                entry_delta=pos.portfolio_delta,
+                entry_underlying=spot_price,
+                short_strikes=tuple(short_strikes),
+                long_strikes=tuple(long_strikes),
+                atr=atr_value if atr_value > 0 else spot_price * 0.01,
+                dte_at_entry=pos.dte,
+            )
+        except Exception as exc:
+            log.error("[OptionsEngine] Lifecycle creation failed for %s: %s — "
+                      "closing broker position", ticker, exc)
+            if self._broker:
+                self._broker.close_position(ticker, trade_spec.legs)
+            self._risk.release(ticker)
+            self._risk.unreserve(ticker)
+            return
+
+        # Atomically add both position AND lifecycle under lock
         with self._positions_lock:
             self._positions[ticker] = pos
+            self._lifecycles[ticker] = lifecycle
 
         self._daily_entries += 1
         self._recalculate_portfolio_greeks()

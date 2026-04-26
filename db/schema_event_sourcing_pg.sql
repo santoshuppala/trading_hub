@@ -7,6 +7,11 @@
  * Projections are built FROM events, never the other way around
  */
 
+-- V10: Advisory lock prevents concurrent schema changes
+-- Lock ID 20260426 is arbitrary but unique to this schema.
+-- If another migration is running, this blocks until it finishes.
+SELECT pg_advisory_lock(20260426);
+
 -- ============================================================================
 -- 1. CORE EVENT STORE (Immutable, Append-Only)
 -- ============================================================================
@@ -288,3 +293,6 @@ GRANT UPDATE ON position_state, completed_trades, signal_history, fill_history, 
 GRANT EXECUTE ON FUNCTION get_aggregate_events TO trading;
 GRANT EXECUTE ON FUNCTION get_latency_metrics TO trading;
 GRANT EXECUTE ON FUNCTION audit_event_store TO trading;
+
+-- V10: Release advisory lock
+SELECT pg_advisory_unlock(20260426);

@@ -198,10 +198,17 @@ class AlpacaBroker(BaseBroker):
 
             # ── Build bracket order if stop/target available ──────────
             bracket_kwargs = {}
-            if p.stop_price and p.stop_price > 0 and p.stop_price < limit_price:
+            # V10: Ensure stop is below limit price (not just non-zero)
+            # If fill improves significantly, stop could end up above entry.
+            _stop = p.stop_price
+            if _stop and _stop > 0 and _stop >= limit_price:
+                _stop = limit_price - max(limit_price * 0.003, p.atr_value * 0.5 if p.atr_value else limit_price * 0.003)
+                log.warning("[AlpacaBroker] Stop adjusted: signal=$%.2f >= limit=$%.2f → $%.2f",
+                            p.stop_price, limit_price, _stop)
+            if _stop and _stop > 0 and _stop < limit_price:
                 bracket_kwargs['order_class'] = OrderClass.BRACKET
                 bracket_kwargs['stop_loss'] = StopLossRequest(
-                    stop_price=round(p.stop_price, 2),
+                    stop_price=round(_stop, 2),
                 )
                 if p.target_price and p.target_price > limit_price:
                     bracket_kwargs['take_profit'] = TakeProfitRequest(

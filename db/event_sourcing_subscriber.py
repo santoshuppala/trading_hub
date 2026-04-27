@@ -123,6 +123,7 @@ class EventSourcingSubscriber:
             EventType.PRO_STRATEGY_SIGNAL:  self._on_pro_strategy_signal,
             EventType.HEARTBEAT:            self._on_heartbeat,
             EventType.OPTIONS_SIGNAL:       self._on_options_signal,
+            EventType.OPTIONS_CLOSE:        self._on_options_close,
             EventType.QUOTE:                self._on_quote,
             EventType.NEWS_DATA:            self._on_news_data,
             EventType.SOCIAL_DATA:          self._on_social_data,
@@ -210,6 +211,39 @@ class EventSourcingSubscriber:
 
         except Exception as exc:
             log.error("EventSourcingSubscriber._write_event error: %s", exc)
+            # V10: Fallback — write to local JSON file so events can be replayed later.
+            # This prevents data loss when DB is unreachable.
+            self._fallback_write(event_type, aggregate_id, event_payload, event)
+
+    def _fallback_write(self, event_type: str, aggregate_id: str,
+                         payload: Dict, event: Event) -> None:
+        """Write event to local JSON Lines file when DB is unreachable.
+
+        File: data/event_fallback_{date}.jsonl
+        Events can be replayed into DB via: cat file | psql COPY or script.
+        """
+        try:
+            import os
+            fallback_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+            os.makedirs(fallback_dir, exist_ok=True)
+            from datetime import datetime, timezone
+            date_str = datetime.now(timezone.utc).strftime('%Y%m%d')
+            path = os.path.join(fallback_dir, f'event_fallback_{date_str}.jsonl')
+            record = {
+                'event_type': event_type,
+                'aggregate_id': aggregate_id,
+                'event_id': str(event.event_id),
+                'timestamp': event.timestamp.isoformat() if event.timestamp else None,
+                'payload': payload,
+            }
+            with open(path, 'a') as f:
+                f.write(json.dumps(record, default=str) + '\n')
+            log.warning("[EventSourcing] Event written to fallback file: %s", path)
+        except Exception as fb_exc:
+            log.critical("[EventSourcing] FALLBACK WRITE ALSO FAILED: %s — "
+                         "event_type=%s aggregate=%s DATA LOST",
+                         fb_exc, event_type, aggregate_id)
 
     # ── Event Handlers (one per EventBus event type) ────────────────────────
 
@@ -785,6 +819,87 @@ class EventSourcingSubscriber:
             )
         except Exception as exc:
             log.debug("EventSourcingSubscriber._on_options_signal error: %s", exc)
+
+    def _on_options_close(self, event: Event) -> None:
+        """Options position closed — persists full lifecycle journey.
+
+        Captures: entry details, exit reason, realized P&L, Greeks at exit,
+        phase transitions, moneyness pressure, IV crush/stall events, and
+        the complete decision event log for ML training.
+        """
+        try:
+            p = event.payload  # plain dict (not frozen dataclass)
+            if not isinstance(p, dict):
+                log.error("[EventSourcing] OPTIONS_CLOSE payload is not dict: %s",
+                          type(p).__name__)
+                return
+
+            ticker = p.get('ticker', 'UNKNOWN')
+            lc = p.get('lifecycle', {})
+
+            # ── 1. Write to event_store (immutable audit log) ────────
+            self._write_event(
+                event_type="OptionsPositionClosed",
+                aggregate_type="OptionsPosition",
+                aggregate_id=f"options_{ticker}_{event.timestamp.isoformat()}",
+                event_payload=p,
+                event=event,
+                source_system="OptionsEngine",
+            )
+
+            # ── 2. Write to position_events (queryable projection) ───
+            self._writer.enqueue('position_events', {
+                'ts': _ensure_aware(event.timestamp),
+                'ticker': ticker,
+                'action': 'CLOSED',
+                'qty': len(p.get('legs', [])),
+                'entry_price': _safe_float(p.get('entry_cost', 0)),
+                'current_price': _safe_float(p.get('exit_value', 0)),
+                'stop_price': 0,
+                'target_price': _safe_float(p.get('max_reward', 0)),
+                'unrealised_pnl': 0,
+                'realised_pnl': _safe_float(p.get('realized_pnl', 0)),
+                'event_id': _to_uuid(event.event_id),
+                'correlation_id': _to_uuid(getattr(event, 'correlation_id', None)),
+                'ingested_at': _NOW(),
+            })
+
+            # ── 3. Write to completed_trades (trade history) ─────────
+            from datetime import datetime, timezone
+            import uuid
+
+            pnl = _safe_float(p.get('realized_pnl', 0))
+            entry_cost = abs(_safe_float(p.get('entry_cost', 0))) or 1.0
+            pnl_pct = round(pnl / entry_cost * 100, 2) if entry_cost else 0.0
+            holding_min = _safe_float(p.get('holding_minutes', 0))
+
+            self._writer.enqueue('completed_trades', {
+                'trade_id': str(uuid.uuid4()),
+                'ticker': ticker,
+                'entry_time': '',  # not available as ISO (monotonic-based)
+                'exit_time': datetime.now(timezone.utc).isoformat(),
+                'entry_price': _safe_float(p.get('entry_cost', 0)),
+                'exit_price': _safe_float(p.get('exit_value', 0)),
+                'qty': len(p.get('legs', [])),
+                'pnl': pnl,
+                'pnl_pct': pnl_pct,
+                'duration_seconds': int(holding_min * 60),
+                'strategy': f"options:{p.get('strategy_type', 'unknown')}",
+                'opened_event_id': '',
+                'closed_event_id': str(getattr(event, 'event_id', '')),
+                'broker': 'alpaca_options',
+            })
+
+            log.info(
+                "[EventSourcing] OPTIONS_CLOSE persisted | %s %s | "
+                "reason=%s | pnl=$%.2f | phase=%s | events=%d",
+                ticker, p.get('strategy_type', ''),
+                p.get('exit_reason', ''), pnl,
+                lc.get('exit_phase', '?'),
+                len(lc.get('events', [])),
+            )
+        except Exception as exc:
+            log.warning("EventSourcingSubscriber._on_options_close error: %s", exc)
 
     def _on_quote(self, event: Event) -> None:
         """Quote received — bid/ask data critical for slippage analysis."""

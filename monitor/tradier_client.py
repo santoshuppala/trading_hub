@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 import pandas as pd
 import requests
@@ -14,6 +15,44 @@ log = logging.getLogger(__name__)
 
 TRADIER_BASE_URL = 'https://api.tradier.com/v1'
 _MAX_WORKERS = 40
+
+
+class _TokenBucket:
+    """Simple thread-safe token bucket rate limiter.
+
+    Tradier limit: 120 requests/minute. We use 100 to leave headroom.
+    """
+
+    def __init__(self, rate: float = 100.0, capacity: float = 100.0):
+        self._rate = rate          # tokens per second
+        self._capacity = capacity  # max burst
+        self._tokens = capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, timeout: float = 10.0) -> bool:
+        """Block until a token is available. Returns False on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self._capacity,
+                                   self._tokens + (now - self._last) * (self._rate / 60.0))
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return True
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.05)
+
+
+# V10: Rate limit for Tradier API.
+# Tradier limit is 120 req/min. Each batch fetch does 2 calls/ticker
+# (timesales + history) across 40 workers. Set high enough to not block
+# batch fetches but still prevent hammering on retries.
+# 500/min with burst of 60 covers 253 tickers × 2 calls = 506 within 20s batch.
+_tradier_bucket = _TokenBucket(rate=500, capacity=60)
 
 
 class TradierDataClient(BaseDataClient):
@@ -44,6 +83,8 @@ class TradierDataClient(BaseDataClient):
     # ------------------------------------------------------------------
 
     def _get(self, path, params=None):
+        # V10: Proactive rate limiting — block before sending, not after 429
+        _tradier_bucket.acquire(timeout=10.0)
         # V8: Retry on 5xx errors (had 26 x 502 today) + 429 rate limit + 401 circuit breaker
         for attempt in range(3):
             try:
@@ -56,11 +97,21 @@ class TradierDataClient(BaseDataClient):
                     continue
                 raise
 
-            # V8: 401 circuit breaker — stop all fetches if token expired
+            # V10: 401 circuit breaker — stop all fetches + alert on token expiry
             if resp.status_code == 401:
+                self._consecutive_401s = getattr(self, '_consecutive_401s', 0) + 1
                 if not getattr(self, '_auth_alert_sent', False):
                     log.critical("Tradier API 401 — token expired! All data fetches will fail.")
                     self._auth_alert_sent = True
+                    try:
+                        from monitor.alerts import send_alert
+                        send_alert(None,
+                                   f"TRADIER TOKEN EXPIRED: API returning 401. "
+                                   f"Data pipeline and order execution are DOWN. "
+                                   f"Rotate token and restart immediately.",
+                                   severity='CRITICAL')
+                    except Exception:
+                        pass
                 resp.raise_for_status()
 
             # Retryable status codes (429 rate limit + 5xx server errors)

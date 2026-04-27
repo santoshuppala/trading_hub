@@ -268,6 +268,7 @@ INSERT INTO event_types (event_type, aggregate_type, description) VALUES
     ('ProStrategySignal',   'Signal',   'Pro setup engine signal'),
     ('PopStrategySignal',   'Signal',   'Pop strategy engine signal'),
     ('OptionsSignal',       'Signal',   'Options strategy signal'),
+    ('OptionsPositionClosed','OptionsPosition', 'Options position closed with full lifecycle'),
 
     -- Risk Events
     ('RiskBlocked',         'Risk',     'Position blocked by risk adapter'),

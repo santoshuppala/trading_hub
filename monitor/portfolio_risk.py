@@ -487,9 +487,10 @@ class PortfolioRiskGate:
 
     def status(self) -> dict:
         """Return current portfolio risk status."""
+        _snap = list(self._positions.values())
         unrealized = sum(
             (pos['current_price'] - pos['entry_price']) * pos['qty']
-            for pos in self._positions.values()
+            for pos in _snap
         )
         return {
             'halted': self._halted,

@@ -405,9 +405,19 @@ class AlpacaOptionsBroker:
                 )
                 cancelled = self.cancel_order(str(order_id))
                 if not cancelled:
-                    # Cancel failed — almost certainly filled. Verify and return.
+                    # Cancel failed — may be filled or partially filled. Verify.
                     recheck = self.get_order_status(str(order_id))
                     recheck_status = recheck.get("status", "").lower()
+                    # V10: Detect partial fills on multi-leg (shouldn't happen
+                    # with Alpaca mleg but defensive)
+                    if recheck_status == 'partially_filled':
+                        log.error(
+                            "[AlpacaOptionsBroker] PARTIAL FILL on mleg %s %s — "
+                            "attempting cancel remainder. This should not happen "
+                            "with Alpaca mleg orders.",
+                            trade_spec.strategy_type, trade_spec.ticker)
+                        self.cancel_order(str(order_id))
+                        return False
                     if recheck_status == "filled":
                         log.info(
                             "[AlpacaOptionsBroker] FILLED mleg %s %s (detected after cancel race) | avg=$%.2f | %d legs",

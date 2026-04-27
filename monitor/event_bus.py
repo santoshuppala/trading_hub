@@ -301,6 +301,9 @@ class EventType(Enum):
     # Emitted by OptionsEngine after strategy selection + option chain lookup.
     # Does NOT route through the existing RiskEngine or AlpacaBroker.
     OPTIONS_SIGNAL = auto()
+    # Emitted by OptionsEngine when a position is closed.
+    # Captures full lifecycle journey: phases, Greeks evolution, exit reason, P&L.
+    OPTIONS_CLOSE  = auto()
     # ── External data snapshots (persistence only, non-durable) ────────────
     # Emitted by PopStrategyEngine after fetching Benzinga/StockTwits data
     # for tickers that pass the early-exit filter.  Consumed only by
@@ -333,6 +336,7 @@ _DEFAULT_ASYNC_CONFIG.update({
     EventType.PRO_STRATEGY_SIGNAL: {'maxsize': 100, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 2},
     # Options signals — same profile as SIGNAL; low frequency
     EventType.OPTIONS_SIGNAL: {'maxsize': 50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
+    EventType.OPTIONS_CLOSE:  {'maxsize': 50, 'policy': BackpressurePolicy.BLOCK,       'n_workers': 1},
 })
 
 _DEFAULT_PRIORITY.update({
@@ -344,6 +348,7 @@ _DEFAULT_PRIORITY.update({
     EventType.POP_SIGNAL:          EventPriority.MEDIUM,
     EventType.PRO_STRATEGY_SIGNAL: EventPriority.MEDIUM,
     EventType.OPTIONS_SIGNAL:      EventPriority.MEDIUM,
+    EventType.OPTIONS_CLOSE:       EventPriority.HIGH,
     EventType.RISK_BLOCK: EventPriority.MEDIUM,
     EventType.BAR:        EventPriority.LOW,
     EventType.QUOTE:      EventPriority.LOW,
@@ -1647,8 +1652,8 @@ class EventBus:
                 with self._count_lock:
                     self._slow_calls += 1
                 log.warning(
-                    f"[slow-handler] {key.__qualname__} took {elapsed_ms:.1f}ms "
-                    f"on {event.type.name} "
+                    f"[slow-handler] {key.__qualname__}[{ticker}] took {elapsed_ms:.1f}ms "
+                    f"on {event.type.name} seq={event.sequence} "
                     f"(threshold {SLOW_THRESHOLD_SEC * 1000:.0f}ms)"
                 )
             return

@@ -31,9 +31,14 @@ class TradierBroker:
     supports_fractional) so BrokerRegistry can iterate it generically.
     """
 
-    FILL_TIMEOUT_SEC = 5.0
-    FILL_POLL_SEC = 0.5
-    MAX_RETRIES = 2
+    def _sf(k, d):
+        import os
+        try: return float(os.getenv(k, str(d)))
+        except (ValueError, TypeError): return d
+    FILL_TIMEOUT_SEC = _sf('TRADIER_FILL_TIMEOUT', 8.0)
+    FILL_POLL_SEC = _sf('TRADIER_FILL_POLL', 0.5)
+    MAX_RETRIES = int(_sf('TRADIER_MAX_RETRIES', 3))
+    RETRY_BACKOFF_BASE = _sf('TRADIER_BACKOFF_BASE', 1.0)
 
     def __init__(
         self,
@@ -119,6 +124,10 @@ class TradierBroker:
         # engine monitors exits in-process. Alpaca handles broker-side brackets.
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
+                # V10: Use WAL client_id as tag for dedup on crash recovery.
+                # Tradier's 'tag' field (up to 255 chars) is returned with
+                # order status, allowing us to detect duplicate submissions.
+                _tag = self._current_wal_cid or ''
                 order_data = {
                     "class": "equity",
                     "symbol": ticker,
@@ -126,8 +135,9 @@ class TradierBroker:
                     "quantity": str(qty),
                     "type": "limit",
                     "price": f"{price:.2f}",
-                        "duration": "day",
-                    }
+                    "duration": "day",
+                    "tag": _tag,
+                }
 
                 resp = self._session.post(
                     f"{self._base}/v1/accounts/{self._account}/orders",
@@ -186,27 +196,44 @@ class TradierBroker:
                     ))
 
                     # Submit standalone stop-loss order for crash protection
-                    if p.stop_price and p.stop_price > 0:
-                        self._submit_stop_order(ticker, filled_qty, p.stop_price)
+                    # V10: Ensure stop is ALWAYS below fill price.
+                    # Signal stop is computed from expected entry, but actual fill
+                    # can be lower (limit order improvement). If stop > fill,
+                    # broker fires stop immediately = instant loss.
+                    _stop = p.stop_price
+                    if _stop and _stop > 0:
+                        if _stop >= fill_price:
+                            # Stop above entry — force it below by min(0.3% of price, ATR*0.5)
+                            _min_offset = fill_price * 0.003
+                            _atr_offset = (p.atr_value * 0.5) if p.atr_value else _min_offset
+                            _stop = fill_price - max(_min_offset, _atr_offset)
+                            log.warning(
+                                "[TradierBroker] STOP ADJUSTED for %s: signal_stop=$%.2f > "
+                                "fill=$%.2f — lowered to $%.2f (%.2f%% below entry)",
+                                ticker, p.stop_price, fill_price, _stop,
+                                (fill_price - _stop) / fill_price * 100)
+                        self._submit_stop_order(ticker, filled_qty, _stop)
 
                     return
 
-                # Not filled — cancel and retry
+                # Not filled — cancel and retry with backoff
                 self._cancel_order(order_id)
+                backoff = self.RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                 log.info(
-                    "[TradierBroker] BUY %s not filled attempt %d/%d",
-                    ticker,
-                    attempt,
-                    self.MAX_RETRIES,
+                    "[TradierBroker] BUY %s not filled attempt %d/%d — "
+                    "retrying in %.1fs",
+                    ticker, attempt, self.MAX_RETRIES, backoff,
                 )
+                time.sleep(backoff)
 
             except Exception as exc:
+                backoff = self.RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                 log.warning(
-                    "[TradierBroker] BUY %s error attempt %d: %s",
-                    ticker,
-                    attempt,
-                    exc,
+                    "[TradierBroker] BUY %s error attempt %d: %s — "
+                    "retrying in %.1fs",
+                    ticker, attempt, exc, backoff,
                 )
+                time.sleep(backoff)
 
         # All retries exhausted
         log.warning(
@@ -282,6 +309,7 @@ class TradierBroker:
         independently. Easier to cancel before selling than OTOCO children.
         """
         try:
+            _tag = self._current_wal_cid or ''
             resp = self._session.post(
                 f"{self._base}/v1/accounts/{self._account}/orders",
                 data={
@@ -292,6 +320,7 @@ class TradierBroker:
                     "type": "stop",
                     "stop": f"{stop_price:.2f}",
                     "duration": "day",
+                    "tag": _tag,
                 },
                 timeout=10,
             )
@@ -361,8 +390,10 @@ class TradierBroker:
                         price=p.price, reason=f'{p.reason} (no position at tradier)')))
                     return
         except Exception as exc:
-            log.warning("[TradierBroker] Position check failed for %s (proceeding with sell): %s",
-                      ticker, exc)
+            log.error("[TradierBroker] Position check FAILED for %s: %s — "
+                      "blocking sell (cannot verify broker state)", ticker, exc)
+            self._emit_order_fail(p, parent_event)
+            return
 
         # Cancel bracket child orders before selling
         self._cancel_open_orders(ticker)
@@ -375,6 +406,7 @@ class TradierBroker:
         )
 
         try:
+            _tag = self._current_wal_cid or ''
             resp = self._session.post(
                 f"{self._base}/v1/accounts/{self._account}/orders",
                 data={
@@ -384,6 +416,7 @@ class TradierBroker:
                     "quantity": str(qty),
                     "type": "market",
                     "duration": "day",
+                    "tag": _tag,
                 },
                 timeout=10,
             )

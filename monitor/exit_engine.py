@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, Dict, Any
@@ -335,6 +336,22 @@ class PositionLifecycle:
         # V10: Event log — captures every phase transition and decision for DB/ML
         self._events: list = []  # list of dicts, one per significant event
 
+        # V10.1: Rolling buffers for trade quality scorer (deque for O(1) eviction)
+        self._bar_opens: deque = deque(maxlen=10)
+        self._bar_highs: deque = deque(maxlen=10)
+        self._bar_lows: deque = deque(maxlen=10)
+        self._bar_closes: deque = deque(maxlen=10)
+        self._bar_volumes: deque = deque(maxlen=10)
+        self._vwap_history: deque = deque(maxlen=10)
+        self._prev_trend_score: float | None = None
+        self._prev_failure_score: float | None = None
+        self._prev_trend_state: str | None = None
+        self._latest_score: dict | None = None
+
+        # Phase-specific rolling state
+        self._phase1_lows: list = []
+        self._phase4_lows: list = []
+
         log.info(
             "[Lifecycle] %s OPENED | strategy=%s phase=0 entry=$%.2f "
             "stop=$%.2f R=$%.2f key=$%.2f invalidation=$%.2f "
@@ -372,25 +389,80 @@ class PositionLifecycle:
     def evaluate(self, bar_high: float, bar_low: float, bar_close: float,
                  bar_volume: float = 0, entry_bar_volume: float = 0,
                  rsi: float = 50.0, vwap: float = 0.0,
-                 current_bar_num: int = 0) -> ExitDecision:
-        """Evaluate exit decision for current bar.
+                 current_bar_num: int = 0,
+                 bar_open: float = 0.0,
+                 is_quote: bool = False) -> ExitDecision:
+        """Evaluate exit decision for current bar or real-time quote.
 
         Args:
-            bar_high/low/close: current bar OHLC
+            bar_high/low/close: current bar OHLC (or bid for quotes)
             bar_volume: current bar volume
             entry_bar_volume: volume on the entry bar (for momentum validation)
             rsi: current RSI value
             vwap: current session VWAP
             current_bar_num: monotonic bar counter
+            bar_open: bar open price (for directional volume + closing strength)
+            is_quote: True for QUOTE-driven evaluation. Skips bars_held increment,
+                      buffer appends, and scorer to prevent poisoning from
+                      high-frequency identical data points.
 
         Returns:
             ExitDecision with action and reasoning
         """
-        self.bars_held += 1
+        # Running high/low always update (real-time price tracking)
         self.running_high = max(self.running_high, bar_high)
         self.running_low = min(self.running_low, bar_low)
 
+        # Only count actual bars, not quotes
+        if not is_quote:
+            self.bars_held += 1
+
         unrealized_r = (bar_close - self.entry_price) / self.R if self.R > 0 else 0
+
+        # ── V10.1: Update rolling buffers for scorer (BAR only) ──────
+        # All buffers append unconditionally to keep lengths aligned for scorer.
+        if not is_quote:
+            self._bar_opens.append(bar_open if bar_open > 0 else bar_close)
+            self._bar_highs.append(bar_high)
+            self._bar_lows.append(bar_low)
+            self._bar_closes.append(bar_close)
+            self._bar_volumes.append(bar_volume)
+            self._vwap_history.append(vwap if vwap > 0 else (
+                self._vwap_history[-1] if self._vwap_history else bar_close))
+
+        # ── V10.1: Score trade quality (BAR only, logging only) ──────
+        if not is_quote and self.bars_held >= 3:
+            try:
+                from .trade_scorer import score_trade
+                self._latest_score = score_trade(
+                    bar_open=bar_open or (self._bar_closes[-2] if len(self._bar_closes) >= 2 else bar_close),
+                    bar_high=bar_high, bar_low=bar_low,
+                    bar_close=bar_close, bar_volume=bar_volume,
+                    entry_price=self.entry_price, atr=self.atr, R=self.R,
+                    running_high=self.running_high, running_low=self.running_low,
+                    vwap=vwap, rsi=rsi,
+                    bar_opens=list(self._bar_opens),
+                    bar_highs=list(self._bar_highs), bar_lows=list(self._bar_lows),
+                    bar_closes=list(self._bar_closes), bar_volumes=list(self._bar_volumes),
+                    vwap_history=list(self._vwap_history),
+                    prev_trend_score=self._prev_trend_score,
+                    prev_failure_score=self._prev_failure_score,
+                )
+                self._prev_trend_score = self._latest_score['trend_score_smooth']
+                self._prev_failure_score = self._latest_score['failure_score_smooth']
+                # Update state with hysteresis
+                self._prev_trend_state = self._latest_score['trend_state']
+
+                self._log_event(
+                    'SCORE',
+                    f"trend={self._latest_score['trend_score']:.2f} "
+                    f"fail={self._latest_score['failure_score']:.2f} "
+                    f"state={self._latest_score['trend_state']}",
+                    score=self._latest_score,
+                )
+            except Exception as exc:
+                # Scorer failure must NEVER affect exit logic
+                log.debug("[Lifecycle] Scorer failed for %s: %s", self.ticker, exc)
 
         # ── STOP LOSS: always active, every phase ────────────────────
         if bar_low <= self.stop_price:
@@ -417,22 +489,27 @@ class PositionLifecycle:
             )
 
         # ── Phase-specific logic ─────────────────────────────────────
+        # Phase 0: thesis validation on BARS only (quotes could fail on bid noise)
+        # Stop loss above still fires on quotes — protects against real crashes.
         if self.phase == Phase.PHASE0_VALIDATION:
+            if is_quote:
+                return ExitDecision(action='HOLD', phase=0, reason='phase0_quote_hold',
+                                    bars_in_phase=self.bars_held, unrealized_r=unrealized_r)
             return self._evaluate_phase0(bar_high, bar_low, bar_close,
                                           bar_volume, entry_bar_volume,
                                           rsi, vwap, unrealized_r)
 
         elif self.phase == Phase.PHASE1_PROTECTION:
-            return self._evaluate_phase1(bar_close, unrealized_r)
+            return self._evaluate_phase1(bar_close, bar_low, unrealized_r, is_quote)
 
         elif self.phase == Phase.PHASE2_BREAKEVEN:
-            return self._evaluate_phase2(bar_high, bar_close, rsi, vwap, unrealized_r)
+            return self._evaluate_phase2(bar_high, bar_close, rsi, vwap, unrealized_r, is_quote)
 
         elif self.phase == Phase.PHASE3_HARVEST:
-            return self._evaluate_phase3(bar_high, bar_close, rsi, vwap, unrealized_r)
+            return self._evaluate_phase3(bar_high, bar_close, rsi, vwap, unrealized_r, is_quote)
 
         elif self.phase == Phase.PHASE4_RUNNER:
-            return self._evaluate_phase4(bar_high, bar_close, rsi, vwap, unrealized_r)
+            return self._evaluate_phase4(bar_high, bar_close, rsi, vwap, unrealized_r, is_quote)
 
         return ExitDecision(action='HOLD', phase=self.phase, reason='default',
                             unrealized_r=unrealized_r)
@@ -551,7 +628,8 @@ class PositionLifecycle:
 
     # ── Phase 1: Protection ──────────────────────────────────────────
 
-    def _evaluate_phase1(self, bar_close, unrealized_r) -> ExitDecision:
+    def _evaluate_phase1(self, bar_close, bar_low, unrealized_r,
+                          is_quote: bool = False) -> ExitDecision:
         """Protection phase: stop only, no indicator exits.
 
         Three ways to advance to Phase 2:
@@ -573,15 +651,16 @@ class PositionLifecycle:
             )
 
         # Transition 3: Structure-based — higher low forming
-        # Track bar lows to detect higher lows (building support)
-        if not hasattr(self, '_phase1_lows'):
-            self._phase1_lows = []
-        self._phase1_lows.append(self.running_low)
+        # Only track actual bar lows (quotes would poison with identical bid values)
+        if not is_quote:
+            self._phase1_lows.append(bar_low)
+            if len(self._phase1_lows) > 10:
+                self._phase1_lows = self._phase1_lows[-10:]
 
         if len(self._phase1_lows) >= 2:
             prev_low = self._phase1_lows[-2]
             curr_low = self._phase1_lows[-1]
-            # Higher low: current bar's running low is above previous,
+            # Higher low: current bar's low is above previous bar's low,
             # and price is above entry (building structure)
             if curr_low > prev_low and bar_close > self.entry_price:
                 self._advance_phase(Phase.PHASE2_BREAKEVEN)
@@ -605,7 +684,8 @@ class PositionLifecycle:
 
     # ── Phase 2: Breakeven ───────────────────────────────────────────
 
-    def _evaluate_phase2(self, bar_high, bar_close, rsi, vwap, unrealized_r) -> ExitDecision:
+    def _evaluate_phase2(self, bar_high, bar_close, rsi, vwap, unrealized_r,
+                          is_quote: bool = False) -> ExitDecision:
         """Breakeven phase: move stop to entry (with cushion), RSI tightens trail mildly.
 
         V10: Strategy-aware behavior:
@@ -633,8 +713,9 @@ class PositionLifecycle:
                                 price=bar_close, unrealized_r=unrealized_r, rsi=rsi)
             self.trail_stop = max(self.trail_stop, tightened)
 
-        # VWAP monitoring — strategy-dependent action
-        self._check_vwap(bar_close, vwap)
+        # VWAP monitoring — BAR only (rapid quotes could false-trigger 2-bar breakdown)
+        if not is_quote:
+            self._check_vwap(bar_close, vwap)
         if self._vwap_breakdown_confirmed():
             if self.profile.vwap_phase2_action == 'exit':
                 # VWAP IS the thesis (vwap_reclaim) → full exit
@@ -703,7 +784,8 @@ class PositionLifecycle:
 
     # ── Phase 3: Profit Harvest ──────────────────────────────────────
 
-    def _evaluate_phase3(self, bar_high, bar_close, rsi, vwap, unrealized_r) -> ExitDecision:
+    def _evaluate_phase3(self, bar_high, bar_close, rsi, vwap, unrealized_r,
+                          is_quote: bool = False) -> ExitDecision:
         """Profit harvest: trail under structure, RSI tightens.
 
         V10: Confluence-aware behavior:
@@ -739,8 +821,9 @@ class PositionLifecycle:
                 tight = self.running_high - self.R * (self.profile.rsi_phase3_trail_r + 0.1)
                 self.trail_stop = max(self.trail_stop, tight)
 
-        # VWAP monitoring — Phase 3: profit locked, full exit on confirmed breakdown
-        self._check_vwap(bar_close, vwap)
+        # VWAP monitoring — BAR only (Phase 3: profit locked, full exit on confirmed breakdown)
+        if not is_quote:
+            self._check_vwap(bar_close, vwap)
         if self._vwap_breakdown_confirmed():
             return ExitDecision(
                 action='EXIT', phase=3, reason='VWAP_BREAKDOWN_phase3',
@@ -763,7 +846,8 @@ class PositionLifecycle:
 
     # ── Phase 4: Runner ──────────────────────────────────────────────
 
-    def _evaluate_phase4(self, bar_high, bar_close, rsi, vwap, unrealized_r) -> ExitDecision:
+    def _evaluate_phase4(self, bar_high, bar_close, rsi, vwap, unrealized_r,
+                          is_quote: bool = False) -> ExitDecision:
         """Runner phase: let winners run. Structure trail only.
 
         V10 Runner spec:
@@ -776,11 +860,11 @@ class PositionLifecycle:
         - EOD: force close per existing rules (Phase 4 does NOT override)
         """
         # ── 1. Track 5-bar swing low (only ratchet up) ───────────────
-        if not hasattr(self, '_phase4_lows'):
-            self._phase4_lows = []
-        self._phase4_lows.append(bar_close)  # use close, not low (less noisy)
-        if len(self._phase4_lows) > 5:
-            self._phase4_lows = self._phase4_lows[-5:]
+        # Only append actual bar closes (quotes would flood with identical bids)
+        if not is_quote:
+            self._phase4_lows.append(bar_close)  # use close, not low (less noisy)
+            if len(self._phase4_lows) > 5:
+                self._phase4_lows = self._phase4_lows[-5:]
 
         swing_low = min(self._phase4_lows) if self._phase4_lows else bar_close
 

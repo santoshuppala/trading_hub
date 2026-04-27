@@ -1,8 +1,79 @@
-# Trading Hub (V9)
+# Trading Hub (V10)
 
-A real-time algorithmic trading system built on a hybrid streaming + polling architecture. V9 adds lot-based position tracking (FillLedger), real-time WebSocket streaming, sub-second exit detection, and 47 correctness fixes over V8.
+A real-time algorithmic trading system built on a hybrid streaming + polling architecture. V10 adds phase-based exit lifecycle engines for both equities and options, 47 production hardening fixes, numpy indicator optimization (14x speedup), and full trade journey persistence for ML/PF analysis.
 
 > **Disclaimer:** This is for educational purposes only. Trading involves significant risk. Always start with paper trading. Consult a financial advisor before trading with real money.
+
+---
+
+## V10 Changes (April 2026)
+
+### Equity Exit Engine — Phase-Based Lifecycle
+- 5-phase lifecycle per position (Validation → Protection → Breakeven → Harvest → Runner)
+- `is_quote` parameter isolates QUOTE handler from BAR logic (prevents bars_held corruption, buffer poisoning, false VWAP exits)
+- Trade quality scorer (trend_score + failure_score) logs per-bar for ML training
+- Phase 1 higher-low detection fixed (was using monotonically decreasing running_low)
+- `deque(maxlen=10)` for scorer buffers (O(1) eviction, JSON-safe persistence)
+
+### Options Exit Engine — Risk-Regime Lifecycle (NEW)
+- 3-phase lifecycle: OPEN (DTE>21) → THETA (21≥DTE>10) → CLOSE/ROLL (DTE≤10)
+- Moneyness pressure: continuous 0→1 gradient (not binary threshold)
+- Weighted risk score: delta(1.5) + vega(1.2) + theta(1.0) with strategy-aware fatal signals
+- Credit stop: 2x credit (Phase 1) → 1.5x (Phase 2), tightens with moneyness pressure
+- IV crush exit for debit/vol positions (>15% IV drop from entry)
+- Stall detection: exits debit positions not progressing vs time
+- Roll quality check: profitable + safe distance + IV not adverse
+- Greeks state machine: vega/theta/delta classified as FAVORABLE/ADVERSE/NEUTRAL
+- Full lifecycle journey persisted to DB (OPTIONS_CLOSE event)
+- Orphaned positions auto-rebuilt from broker contracts on restart
+- Per-check snapshots every 2.5 min for PF analysis
+
+### Signals Optimization
+- Numpy fast path for RSI/ATR/VWAP computation (14x faster than pandas)
+- Content-based LRU cache with `OrderedDict` (survives DataFrame recreation)
+- `v_arr.sum()` cache key invalidates on backfill corrections
+- `math.isfinite()` validation catches inf values (not just NaN)
+- Flat-price RSI guard (returns 50.0, not 0.0)
+
+### Production Hardening (47 fixes across 20 files)
+
+| Category | Fixes |
+|----------|-------|
+| Thread safety | Kill switch atomic lock, position dict snapshots, stream client lock, pending order tracking |
+| Order execution | Tradier tag dedup, sell verification, partial fill handling, exponential backoff (3 retries, 1s/2s/4s) |
+| State management | Disk-full protection, write-before-rotate, os.replace cleanup, version monotonic check |
+| Risk controls | Per-broker daily loss limit, pending orders in position count, data coverage circuit breaker |
+| Monitoring | Data staleness alert (120s), stale order cleanup (60s), BarBuilder auto-restart (max 5x) |
+| Resilience | DB write fallback to JSON file, WebSocket reconnect backoff (2s→60s), token bucket rate limiter (100 req/min) |
+| Configuration | RSI/RVOL/timeouts configurable via env vars with safe defaults, feature flag system |
+| Operations | Read-only mode (`READ_ONLY=true`), weekly PF review auto-triggered Fridays |
+
+### PF Analysis & Monitoring
+- `scripts/analyze_options_pf.py` — daily PF breakdown by strategy, exit reason, risk score
+- `scripts/weekly_options_review.py` — weekly calibration with threshold recommendations
+- Auto-triggered every Friday EOD via lifecycle shutdown hook
+- Snapshots capture: spot, pnl, IV, Greeks, risk_score, moneyness_pressure every 2.5 min
+
+### Environment Variables (NEW)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `READ_ONLY` | false | Block new entries, exits still run |
+| `RISK_RSI_LOW` | 40.0 | RSI lower bound for entries |
+| `RISK_RSI_HIGH` | 75.0 | RSI upper bound for entries |
+| `RISK_MIN_RVOL` | 2.0 | Minimum relative volume |
+| `RISK_MAX_SPREAD_PCT` | 0.002 | Max bid-ask spread |
+| `TRADIER_FILL_TIMEOUT` | 8.0 | Fill poll timeout (seconds) |
+| `TRADIER_MAX_RETRIES` | 3 | Order submission retries |
+| `TRADIER_BACKOFF_BASE` | 1.0 | Retry backoff base (seconds) |
+| `OPT_PROFIT_CREDIT` | 0.50 | Options credit profit target |
+| `OPT_STOP_CREDIT` | 1.00 | Options credit stop (legacy flat) |
+| `OPT_DTE_CLOSE` | 10 | Options DTE close threshold |
+| `BAR_BUILDER_LIVENESS_SEC` | 120 | BarBuilder staleness timeout |
+| `FF_PENDING_ORDER_DEDUP` | true | Feature flag: pending order tracking |
+| `FF_PER_BROKER_KILL` | true | Feature flag: per-broker loss limit |
+| `FF_OPTIONS_LIFECYCLE` | true | Feature flag: options lifecycle engine |
+| `FF_DATA_CIRCUIT_BREAKER` | true | Feature flag: data coverage breaker |
 
 ---
 

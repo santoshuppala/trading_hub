@@ -377,8 +377,9 @@ class RealTimeMonitor:
                             cancelled += 1
                             log.info("[order-cleanup] Cancelled stale Alpaca order: %s %s %s",
                                      order.side, order.symbol, order.id)
-                        except Exception:
-                            pass
+                        except Exception as _ce:
+                            log.warning("[order-cleanup] Alpaca cancel failed for %s: %s",
+                                        order.id, _ce)
         except Exception as exc:
             log.warning("[order-cleanup] Alpaca cleanup failed: %s", exc)
 
@@ -1090,6 +1091,66 @@ class RealTimeMonitor:
 
     # ── Live reconciliation (periodic, lightweight) ────────────────────────
 
+    def _get_phantom_exit_price(self, ticker: str, broker: str, entry_price: float) -> float:
+        """V10: Query broker for the actual exit fill price of a phantom position.
+
+        When a position disappears from broker (stop fired externally),
+        we need the real fill price — not entry price — for accurate P&L.
+        """
+        try:
+            if broker in ('tradier', 'tradier_reconciled'):
+                import requests
+                t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TOKEN', '')
+                t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+                t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+                if t_token and t_acct:
+                    resp = requests.get(
+                        f'{t_base}/v1/accounts/{t_acct}/orders',
+                        headers={'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'},
+                        params={'filter': 'filled'},
+                        timeout=5)
+                    if resp.ok:
+                        orders = resp.json().get('orders', {})
+                        if orders and orders != 'null':
+                            order_list = orders.get('order', [])
+                            if isinstance(order_list, dict):
+                                order_list = [order_list]
+                            # Find the most recent filled SELL for this ticker
+                            for o in reversed(order_list):
+                                if (o.get('symbol') == ticker
+                                        and o.get('side') == 'sell'
+                                        and o.get('status') == 'filled'):
+                                    fill_price = float(o.get('avg_fill_price', 0))
+                                    if fill_price > 0:
+                                        log.info("[live-reconcile] Found broker exit for %s: $%.2f",
+                                                 ticker, fill_price)
+                                        return fill_price
+
+            elif broker in ('alpaca', 'alpaca_reconciled'):
+                tc = getattr(self, '_trading_client', None)
+                if tc:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus, OrderSide
+                    orders = tc.get_orders(filter=GetOrdersRequest(
+                        status=QueryOrderStatus.CLOSED,
+                        symbols=[ticker],
+                        side=OrderSide.SELL,
+                        limit=5))
+                    for o in orders:
+                        if str(o.filled_avg_price):
+                            fill_price = float(o.filled_avg_price)
+                            if fill_price > 0:
+                                log.info("[live-reconcile] Found broker exit for %s: $%.2f",
+                                         ticker, fill_price)
+                                return fill_price
+
+        except Exception as e:
+            log.warning("[live-reconcile] Broker exit price lookup failed for %s: %s", ticker, e)
+
+        # Fallback: entry price (P&L = $0, better than wrong number)
+        return entry_price
+
     def _live_reconcile(self) -> None:
         """V8: Periodic lightweight reconciliation during trading hours.
 
@@ -1176,11 +1237,19 @@ class RealTimeMonitor:
                 strategy = pos.get('strategy', 'unknown')
                 pos_broker = pos.get('_broker', 'unknown')
 
-                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
-                            "Closing (entry=$%.2f qty=%d strategy=%s)",
-                            ticker, entry_price, qty, strategy)
+                # V10: Query broker for actual exit fill price (stop may have fired)
+                exit_price = entry_price  # fallback: break-even
+                try:
+                    exit_price = self._get_phantom_exit_price(ticker, pos_broker, entry_price)
+                except Exception as ep_exc:
+                    log.warning("[live-reconcile] Could not get exit price for %s: %s", ticker, ep_exc)
 
-                # V10: Record SELL lot in FillLedger (close the stale open lots)
+                pnl = round((exit_price - entry_price) * qty, 2)
+                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
+                            "Closing (entry=$%.2f exit=$%.2f qty=%d pnl=$%.2f strategy=%s)",
+                            ticker, entry_price, exit_price, qty, pnl, strategy)
+
+                # V10: Record SELL lot in FillLedger with REAL exit price
                 if hasattr(self, '_fill_ledger') and self._fill_ledger:
                     try:
                         from monitor.fill_lot import FillLot
@@ -1190,7 +1259,7 @@ class RealTimeMonitor:
                             ticker=ticker,
                             side='SELL',
                             qty=float(qty),
-                            fill_price=entry_price,  # break-even (no exit price known)
+                            fill_price=exit_price,
                             timestamp=datetime.now(ET),
                             order_id=f'live_reconcile_phantom',
                             broker=pos_broker,
@@ -1200,7 +1269,7 @@ class RealTimeMonitor:
                         matches = self._fill_ledger.append(sell_lot)
                         ledger_pnl = sum(m.realized_pnl for m in matches) if matches else 0
                         log.info("[live-reconcile] FillLedger SELL: %s %s@$%.2f → %d matches, pnl=$%.2f",
-                                 ticker, qty, entry_price, len(matches) if matches else 0, ledger_pnl)
+                                 ticker, qty, exit_price, len(matches) if matches else 0, ledger_pnl)
                     except Exception as e:
                         log.warning("[live-reconcile] FillLedger phantom SELL failed for %s: %s", ticker, e)
 
@@ -1215,16 +1284,19 @@ class RealTimeMonitor:
                             ticker=ticker,
                             action='CLOSED',
                             position=None,
-                            pnl=0.0,
+                            pnl=pnl,
                             close_detail={
                                 'strategy': strategy,
                                 'broker': pos_broker,
                                 'reason': 'phantom_live_reconcile',
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'qty': qty,
                             },
                         ),
                     ))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    log.warning("[live_reconcile] POSITION emit failed for %s: %s", ticker, _exc)
 
                 fixes += 1
 
@@ -1386,13 +1458,60 @@ class RealTimeMonitor:
             self._bars_cache.pop(t, None)
             self._bars_cache_times.pop(t, None)
 
-        # V8: Alert if data coverage drops below 90%
+        # V10: Track data freshness — detect silent fetch failures
+        if new_bars:
+            self._last_successful_fetch = time.monotonic()
+        elif not hasattr(self, '_last_successful_fetch'):
+            self._last_successful_fetch = time.monotonic()
+
+        _fetch_age = time.monotonic() - getattr(self, '_last_successful_fetch', time.monotonic())
+        if _fetch_age > 120 and not hasattr(self, '_stale_alert_sent'):
+            log.critical("[DataQuality] NO DATA for %.0fs — data pipeline may be dead", _fetch_age)
+            send_alert(self._alert_email,
+                       f"DATA PIPELINE STALE: No bars fetched for {int(_fetch_age)}s. "
+                       f"Check API connectivity and rate limits.",
+                       severity='CRITICAL')
+            self._stale_alert_sent = True
+        elif _fetch_age <= 120:
+            self._stale_alert_sent = False  # reset once data flows again
+
+        # V10: Data coverage circuit breaker
+        # <30% for 3 consecutive cycles → halt new entries (exits still run)
+        # Threshold lowered from 50%→30% because Tradier routinely serves
+        # 40-60% of tickers within the 20s batch timeout.
+        # Grace period: first 15 min after market open (data sources ramp up slowly)
+        if not hasattr(self, '_low_coverage_count'):
+            self._low_coverage_count = 0
+            self._data_circuit_open = False
+
         if self.tickers:
             coverage = len(new_bars) / len(self.tickers)
-            if coverage < 0.90:
+            _now_et = datetime.now(ET)
+            _minutes_since_open = (_now_et.hour - 9) * 60 + (_now_et.minute - 30)
+            _in_grace = _minutes_since_open < 15  # first 15 min = low coverage normal
+
+            if coverage < 0.30 and not _in_grace:
+                self._low_coverage_count += 1
+                if self._low_coverage_count >= 3 and not self._data_circuit_open:
+                    self._data_circuit_open = True
+                    log.critical(
+                        "[DataQuality] CIRCUIT BREAKER: %.0f%% coverage for %d cycles — "
+                        "halting new entries", coverage * 100, self._low_coverage_count)
+                    send_alert(self._alert_email,
+                               f"DATA CIRCUIT BREAKER: {coverage:.0%} coverage. "
+                               f"New entries halted until data recovers.",
+                               severity='CRITICAL')
+            elif coverage < 0.90:
                 log.warning(
                     "[DataQuality] Only %.0f%% tickers fetched (%d/%d) — data incomplete",
                     coverage * 100, len(new_bars), len(self.tickers))
+                self._low_coverage_count = 0
+            else:
+                if self._data_circuit_open:
+                    log.info("[DataQuality] Coverage recovered to %.0f%% — resuming entries",
+                             coverage * 100)
+                self._low_coverage_count = 0
+                self._data_circuit_open = False
 
         # V8: Tiered scanning — classify tickers before emit_batch
         scan_tickers = self._ticker_scanner.classify(self.tickers, self._bars_cache)
@@ -1441,6 +1560,10 @@ class RealTimeMonitor:
         _skipped_nocache = 0
         _skipped_bb = 0
         for ticker in scan_tickers:
+            # V10: Data circuit breaker — only emit for open positions (exits)
+            if getattr(self, '_data_circuit_open', False) and ticker not in self.positions:
+                continue
+
             # Skip if BarBuilder is actively covering this ticker
             if _bb_active and _bb.covers_ticker(ticker):
                 _skipped_bb += 1
@@ -1514,8 +1637,8 @@ class RealTimeMonitor:
         # (3) seeds BarBuilder — so every ticker on the radar has full data.
         self._sync_stream_and_data()
 
-        # V9 (R3): Stale order cleanup
-        if now_mono - getattr(self, '_last_order_cleanup', 0) > 300:
+        # V10: Stale order cleanup every 60s (was 300s — too slow for active trading)
+        if now_mono - getattr(self, '_last_order_cleanup', 0) > 60:
             self._last_order_cleanup = now_mono
             try:
                 self._cleanup_stale_open_orders()

@@ -212,7 +212,20 @@ def send_alert(alert_email, message, severity='INFO'):
     try:
         _alert_queue.put_nowait((alert_email, tagged_message))
     except queue.Full:
-        log.warning(f"Alert queue full — dropping: {tagged_message[:120]}")
+        if severity == 'CRITICAL':
+            # CRITICAL alerts must not be dropped — evict oldest to make room
+            try:
+                _alert_queue.get_nowait()  # discard oldest
+            except queue.Empty:
+                pass
+            try:
+                _alert_queue.put_nowait((alert_email, tagged_message))
+            except queue.Full:
+                pass
+            log.error("Alert queue full — evicted oldest for CRITICAL: %s",
+                      tagged_message[:200])
+        else:
+            log.error("Alert queue full — dropping: %s", tagged_message[:200])
 
 
 # ── SMTP delivery (runs in background thread only) ────────────────────────────
@@ -315,5 +328,5 @@ def _deliver(alert_email: str, message: str) -> None:
     if server:
         try:
             server.quit()
-        except:
+        except Exception:
             pass

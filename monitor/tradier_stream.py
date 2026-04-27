@@ -56,8 +56,9 @@ _SESSION_URL = 'https://api.tradier.com/v1/markets/events/session'
 # WebSocket endpoint (returned by session creation, but hardcoded as fallback)
 _WS_URL = 'wss://stream.tradier.com/v1/markets/events'
 
-# Reconnect delay after disconnect
-_RECONNECT_DELAY = 5  # seconds
+# Reconnect delay after disconnect (V10: exponential backoff)
+_RECONNECT_DELAY_BASE = 2    # seconds (base)
+_RECONNECT_DELAY_MAX = 60    # seconds (cap)
 
 # Maximum time without data before forcing reconnect
 _HEARTBEAT_TIMEOUT = 60  # seconds
@@ -255,12 +256,15 @@ class TradierStreamClient:
                 if not self._running:
                     break
                 self._reconnect_count += 1
+                # V10: Exponential backoff with cap (2s, 4s, 8s, 16s, 32s, 60s)
+                delay = min(_RECONNECT_DELAY_BASE * (2 ** min(self._reconnect_count - 1, 5)),
+                            _RECONNECT_DELAY_MAX)
                 log.warning(
                     "[TradierStream] Disconnected (reconnect #%d): %s — "
                     "retrying in %ds",
-                    self._reconnect_count, exc, _RECONNECT_DELAY,
+                    self._reconnect_count, exc, delay,
                 )
-                time.sleep(_RECONNECT_DELAY)
+                time.sleep(delay)
                 # Refresh session (may have expired)
                 try:
                     self._session_id = self._create_session()

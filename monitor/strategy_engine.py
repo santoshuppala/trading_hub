@@ -107,6 +107,7 @@ class StrategyEngine:
         self._lifecycles: Dict[str, PositionLifecycle] = {}
         self._bar_counter: Dict[str, int] = {}  # monotonic bar counter per ticker
         self._start_time: float = time.monotonic()  # for post-restart grace period
+        self._last_bar_key: dict = {}  # skip unchanged bars
 
         bus.subscribe(EventType.BAR, self._on_bar)
         # V10: Listen for POSITION CLOSED to clean up lifecycles
@@ -193,6 +194,7 @@ class StrategyEngine:
                 bar_high=bid, bar_low=bid, bar_close=bid,
                 bar_volume=last_volume, entry_bar_volume=entry_volume,
                 rsi=last_rsi, vwap=last_vwap,
+                is_quote=True,  # skip bars_held++, buffer appends, scorer
             )
 
             if decision.action == 'EXIT':
@@ -331,6 +333,20 @@ class StrategyEngine:
         if df is None or df.empty or len(df) < _MIN_BARS:
             return
 
+        # V10.1: Skip unchanged bars for ENTRY checks only.
+        # Open positions ALWAYS evaluate (lifecycle needs every bar).
+        # Entry detection can safely skip if no new bar arrived.
+        if ticker not in self._positions:
+            try:
+                _last = df.iloc[-1]
+                _bar_key = (len(df), float(_last.get('close', _last.get('c', 0))),
+                            float(_last.get('volume', _last.get('v', 0))))
+                if self._last_bar_key.get(ticker) == _bar_key:
+                    return
+                self._last_bar_key[ticker] = _bar_key
+            except Exception:
+                pass
+
         # V9 (R1): Validate bar data before strategy processing
         # Rejects: price=0, NaN, negative volume, stale, OHLC inconsistent,
         # out-of-order bars (sequence check)
@@ -383,8 +399,15 @@ class StrategyEngine:
         now  = datetime.now(ET)
         hour, minute = now.hour, now.minute
 
-        # ── EOD gate ─────────────────────────────────────────────────────────
-        if (hour, minute) >= _FORCE_CLOSE:
+        # ── EOD gate (V10: early close on half-days) ────────────────────────
+        _force_close = _FORCE_CLOSE
+        try:
+            from monitor.market_calendar import is_early_close, early_close_hour
+            if is_early_close(now.date()):
+                _force_close = (early_close_hour(), 0)  # 1:00 PM on early close days
+        except ImportError:
+            pass
+        if (hour, minute) >= _force_close:
             if ticker in self._positions:
                 pos = self._positions[ticker]
                 strategy = pos.get('strategy', 'vwap_reclaim') or 'vwap_reclaim'
@@ -569,13 +592,14 @@ class StrategyEngine:
         # Get bar OHLC for lifecycle
         try:
             last_bar = df.iloc[-1]
+            bar_open = float(last_bar.get('open', last_bar.get('o', 0)))
             bar_high = float(last_bar.get('high', last_bar.get('h', current_price)))
             bar_low = float(last_bar.get('low', last_bar.get('l', current_price)))
             bar_close = float(last_bar.get('close', last_bar.get('c', current_price)))
             bar_volume = float(last_bar.get('volume', last_bar.get('v', 0)))
             pos['_last_volume'] = bar_volume  # cache for QUOTE handler
         except Exception:
-            bar_high = bar_low = bar_close = current_price
+            bar_open = bar_high = bar_low = bar_close = current_price
             bar_volume = 0
 
         # Increment bar counter
@@ -636,6 +660,19 @@ class StrategyEngine:
                 lc.trail_stop = _lc_state.get('trail_stop', lc.trail_stop)
                 lc.running_high = _lc_state.get('running_high', lc.running_high)
                 lc.vwap_below_count = _lc_state.get('vwap_below_count', 0)
+                # Restore scorer buffers for continuity (deque with maxlen)
+                from collections import deque as _deque
+                lc._bar_closes = _deque(_lc_state.get('_bar_closes', []), maxlen=10)
+                lc._bar_volumes = _deque(_lc_state.get('_bar_volumes', []), maxlen=10)
+                lc._bar_opens = _deque(_lc_state.get('_bar_opens', []), maxlen=10)
+                lc._bar_highs = _deque(_lc_state.get('_bar_highs', []), maxlen=10)
+                lc._bar_lows = _deque(_lc_state.get('_bar_lows', []), maxlen=10)
+                lc._vwap_history = _deque(_lc_state.get('_vwap_history', []), maxlen=10)
+                lc._prev_trend_score = _lc_state.get('_prev_trend_score')
+                lc._prev_failure_score = _lc_state.get('_prev_failure_score')
+                # Restore phase-specific rolling state
+                lc._phase1_lows = _lc_state.get('_phase1_lows', [])
+                lc._phase4_lows = _lc_state.get('_phase4_lows', [])
                 log.info("[Lifecycle] %s RESTORED from state | phase=%d bars=%d "
                          "partial=%s trail=$%.2f running_high=$%.2f",
                          ticker, lc.phase, lc.bars_held, lc.partial_done,
@@ -668,6 +705,8 @@ class StrategyEngine:
                 bar_volume=bar_volume, entry_bar_volume=entry_vol,
                 rsi=rsi_value, vwap=vwap,
                 current_bar_num=self._bar_counter.get(ticker, 0),
+                bar_open=bar_open,
+                is_quote=False,  # explicit: BAR-based evaluation
             )
         except Exception as lc_exc:
             # Safety net: if lifecycle crashes, fall back to stop-loss check.
@@ -694,6 +733,18 @@ class StrategyEngine:
             'trail_stop': lifecycle.trail_stop,
             'running_high': lifecycle.running_high,
             'vwap_below_count': lifecycle.vwap_below_count,
+            # Scorer buffers (last 5 for restart continuity, list for JSON)
+            '_bar_closes': list(lifecycle._bar_closes)[-5:],
+            '_bar_volumes': list(lifecycle._bar_volumes)[-5:],
+            '_bar_opens': list(lifecycle._bar_opens)[-5:],
+            '_bar_highs': list(lifecycle._bar_highs)[-5:],
+            '_bar_lows': list(lifecycle._bar_lows)[-5:],
+            '_vwap_history': list(lifecycle._vwap_history)[-5:],
+            '_prev_trend_score': lifecycle._prev_trend_score,
+            '_prev_failure_score': lifecycle._prev_failure_score,
+            # Phase-specific rolling state (for restart recovery)
+            '_phase1_lows': lifecycle._phase1_lows[-10:],
+            '_phase4_lows': lifecycle._phase4_lows[-5:],
         }
 
         # ── Act on lifecycle decision ────────────────────────────────
@@ -727,6 +778,8 @@ class StrategyEngine:
             'invalidation': round(lifecycle.invalidation, 4),
             # V10: Full decision event log for ML training
             'events': lifecycle._events,
+            # V10.1: Final scorer state at exit
+            'final_score': lifecycle._latest_score,
         }
 
         if decision.action == 'EXIT':

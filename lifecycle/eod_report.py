@@ -127,6 +127,38 @@ class SatelliteEODReport:
         except Exception as exc:
             log.warning("[%s] EOD report generation failed: %s", self._name, exc)
 
+        # V10: Weekly options PF review — auto-triggers on Fridays
+        if self._name == 'options':
+            self._check_weekly_review()
+
+    def _check_weekly_review(self) -> None:
+        """Auto-run weekly PF analysis on Fridays."""
+        try:
+            now = datetime.now(ET)
+            if now.weekday() != 4:  # 4 = Friday
+                return
+
+            log.info("[%s] Friday EOD — running weekly options PF review", self._name)
+            from scripts.weekly_options_review import load_trades, generate_report
+            trades = load_trades(days=7)
+            report = generate_report(trades, days=7)
+            log.info("\n%s", report)
+            self._send_alert(report)
+
+            # Save report file
+            import os
+            report_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'data', 'reports')
+            os.makedirs(report_dir, exist_ok=True)
+            path = os.path.join(report_dir,
+                                f'options_weekly_{now.strftime("%Y%m%d")}.txt')
+            with open(path, 'w') as f:
+                f.write(report)
+            log.info("[%s] Weekly report saved: %s", self._name, path)
+        except Exception as exc:
+            log.warning("[%s] Weekly review failed: %s", self._name, exc)
+
     def _send_alert(self, message: str) -> None:
         try:
             from monitor.alerts import send_alert

@@ -47,7 +47,12 @@ class _TokenBucket:
             time.sleep(0.05)
 
 
-_tradier_bucket = _TokenBucket(rate=100, capacity=100)
+# V10: Rate limit for Tradier API.
+# Tradier limit is 120 req/min. Each batch fetch does 2 calls/ticker
+# (timesales + history) across 40 workers. Set high enough to not block
+# batch fetches but still prevent hammering on retries.
+# 500/min with burst of 60 covers 253 tickers × 2 calls = 506 within 20s batch.
+_tradier_bucket = _TokenBucket(rate=500, capacity=60)
 
 
 class TradierDataClient(BaseDataClient):

@@ -1405,7 +1405,9 @@ class RealTimeMonitor:
             self._stale_alert_sent = False  # reset once data flows again
 
         # V10: Data coverage circuit breaker
-        # <50% for 2 consecutive cycles → halt new entries (exits still run)
+        # <30% for 3 consecutive cycles → halt new entries (exits still run)
+        # Threshold lowered from 50%→30% because Tradier routinely serves
+        # 40-60% of tickers within the 20s batch timeout.
         # Grace period: first 15 min after market open (data sources ramp up slowly)
         if not hasattr(self, '_low_coverage_count'):
             self._low_coverage_count = 0
@@ -1417,9 +1419,9 @@ class RealTimeMonitor:
             _minutes_since_open = (_now_et.hour - 9) * 60 + (_now_et.minute - 30)
             _in_grace = _minutes_since_open < 15  # first 15 min = low coverage normal
 
-            if coverage < 0.50 and not _in_grace:
+            if coverage < 0.30 and not _in_grace:
                 self._low_coverage_count += 1
-                if self._low_coverage_count >= 2 and not self._data_circuit_open:
+                if self._low_coverage_count >= 3 and not self._data_circuit_open:
                     self._data_circuit_open = True
                     log.critical(
                         "[DataQuality] CIRCUIT BREAKER: %.0f%% coverage for %d cycles — "

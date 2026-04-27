@@ -196,8 +196,23 @@ class TradierBroker:
                     ))
 
                     # Submit standalone stop-loss order for crash protection
-                    if p.stop_price and p.stop_price > 0:
-                        self._submit_stop_order(ticker, filled_qty, p.stop_price)
+                    # V10: Ensure stop is ALWAYS below fill price.
+                    # Signal stop is computed from expected entry, but actual fill
+                    # can be lower (limit order improvement). If stop > fill,
+                    # broker fires stop immediately = instant loss.
+                    _stop = p.stop_price
+                    if _stop and _stop > 0:
+                        if _stop >= fill_price:
+                            # Stop above entry — force it below by min(0.3% of price, ATR*0.5)
+                            _min_offset = fill_price * 0.003
+                            _atr_offset = (p.atr_value * 0.5) if p.atr_value else _min_offset
+                            _stop = fill_price - max(_min_offset, _atr_offset)
+                            log.warning(
+                                "[TradierBroker] STOP ADJUSTED for %s: signal_stop=$%.2f > "
+                                "fill=$%.2f — lowered to $%.2f (%.2f%% below entry)",
+                                ticker, p.stop_price, fill_price, _stop,
+                                (fill_price - _stop) / fill_price * 100)
+                        self._submit_stop_order(ticker, filled_qty, _stop)
 
                     return
 

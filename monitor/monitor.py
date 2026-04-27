@@ -1406,13 +1406,18 @@ class RealTimeMonitor:
 
         # V10: Data coverage circuit breaker
         # <50% for 2 consecutive cycles → halt new entries (exits still run)
+        # Grace period: first 15 min after market open (data sources ramp up slowly)
         if not hasattr(self, '_low_coverage_count'):
             self._low_coverage_count = 0
             self._data_circuit_open = False
 
         if self.tickers:
             coverage = len(new_bars) / len(self.tickers)
-            if coverage < 0.50:
+            _now_et = datetime.now(ET)
+            _minutes_since_open = (_now_et.hour - 9) * 60 + (_now_et.minute - 30)
+            _in_grace = _minutes_since_open < 15  # first 15 min = low coverage normal
+
+            if coverage < 0.50 and not _in_grace:
                 self._low_coverage_count += 1
                 if self._low_coverage_count >= 2 and not self._data_circuit_open:
                     self._data_circuit_open = True

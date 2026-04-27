@@ -140,11 +140,21 @@ class SessionWatchdog:
         self._session_report = []
         self._updates_sent = set()             # hours already sent
 
-        # V10: HotfixManager DISABLED — auto code edits are too dangerous for live trading.
-        # The watchdog detects crashes, diagnoses root cause, fixes infrastructure
-        # (corrupt files, locks, cache), restarts processes, and alerts the operator.
-        # Code fixes require human judgment.
-        self._hotfix_mgr = None
+        # V10: HotfixManager replaced by Claude Fix Agent.
+        # Claude analyzes crashes and creates GitHub PRs — never auto-applies.
+        # Human reviews and merges the PR. Safe for live trading.
+        self._claude_agent = None
+        if enable_healing:
+            try:
+                from scripts.claude_fix_agent import ClaudeFixAgent
+                self._claude_agent = ClaudeFixAgent()
+                if self._claude_agent._enabled:
+                    log.info("[Watchdog] Claude Fix Agent active — will create PRs for crashes")
+                else:
+                    log.info("[Watchdog] Claude Fix Agent disabled (no ANTHROPIC_API_KEY/GITHUB_TOKEN)")
+                    self._claude_agent = None
+            except Exception as e:
+                log.warning("[Watchdog] Claude Fix Agent init failed: %s", e)
 
     def run(self, dry_run: bool = False):
         """Main loop — run checks every interval until market close."""
@@ -1013,27 +1023,31 @@ class SessionWatchdog:
                 self._record_heal(f"Auto-fixed {engine} crash", "SUCCESS — supervisor will restart")
                 crash_count = 0
             else:
-                # Try email-based hotfix for code errors
-                if self._hotfix_mgr and error_type in (
-                    'NameError', 'AttributeError', 'TypeError',
-                    'ImportError', 'ModuleNotFoundError', 'KeyError',
-                    'IndexError', 'ValueError', 'ZeroDivisionError',
-                    'StopIteration', 'FileNotFoundError',
-                ):
-                    full_tb = '\n'.join(traceback_lines)
-                    proposal = self._hotfix_mgr.propose_fix_from_traceback(full_tb)
-                    if proposal:
+                crash_count += 1
+                self._prev_crash_count[engine] = crash_count
+
+                if crash_count >= 3:
+                    # V10: Invoke Claude Fix Agent to create a PR
+                    pr_url = None
+                    if self._claude_agent:
+                        full_tb = '\n'.join(traceback_lines)
+                        try:
+                            pr_url = self._claude_agent.propose_fix(engine, full_tb)
+                        except Exception as ce:
+                            log.warning("[HEAL] Claude Fix Agent failed: %s", ce)
+
+                    if pr_url:
                         self._record_heal(
-                            f"Hotfix proposed for {engine}: {proposal.explanation}",
-                            "AWAITING EMAIL APPROVAL",
+                            f"Claude Fix Agent created PR for {engine}",
+                            f"PR: {pr_url}",
                         )
-                        fixed = True  # don't count as unresolved crash
-
-                if not fixed:
-                    crash_count += 1
-                    self._prev_crash_count[engine] = crash_count
-
-                    if crash_count >= 3:
+                        self._send_alert(HealthCheck(
+                            'claude_fix', 'WARNING',
+                            f'{engine} crashed {crash_count}x. '
+                            f'Claude created fix PR: {pr_url} — review and merge if safe.',
+                            'WARNING',
+                        ))
+                    else:
                         self._record_heal(
                             f"{engine} crashed {crash_count}x — unfixable",
                             f"ALERT SENT\nLast error: {error_text[:200]}",

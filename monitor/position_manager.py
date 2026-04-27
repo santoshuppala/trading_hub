@@ -196,13 +196,14 @@ class PositionManager:
                         ),
                     ))
 
-                    # V9: Shadow FillLedger — synthetic SELL for phantom
+                    # V10: Shadow FillLedger — synthetic SELL for phantom
+                    # Use entry_price as fallback; real exit price captured
+                    # by live_reconcile's broker query when position disappears.
                     if self._ledger is not None:
                         try:
                             import uuid as _uuid
                             qty = float(pos.get('quantity', 0))
                             if qty > QTY_EPSILON:
-                                # Use entry_price as estimated fill (E1: never $0)
                                 est_price = pos.get('entry_price', 0)
                                 phantom_lot = FillLot(
                                     lot_id=str(_uuid.uuid4()),
@@ -216,6 +217,9 @@ class PositionManager:
                                     synthetic=True,
                                 )
                                 self._ledger.append(phantom_lot)
+                                log.warning("[PositionManager] Phantom SELL for %s at entry $%.2f "
+                                            "(real exit price captured by live_reconcile)",
+                                            ticker, est_price)
                         except Exception as le:
                             log.warning("[PositionManager] Shadow phantom SELL failed: %s", le)
 

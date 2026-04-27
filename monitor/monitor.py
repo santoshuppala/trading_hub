@@ -1091,6 +1091,66 @@ class RealTimeMonitor:
 
     # ── Live reconciliation (periodic, lightweight) ────────────────────────
 
+    def _get_phantom_exit_price(self, ticker: str, broker: str, entry_price: float) -> float:
+        """V10: Query broker for the actual exit fill price of a phantom position.
+
+        When a position disappears from broker (stop fired externally),
+        we need the real fill price — not entry price — for accurate P&L.
+        """
+        try:
+            if broker in ('tradier', 'tradier_reconciled'):
+                import requests
+                t_token = os.getenv('TRADIER_SANDBOX_TOKEN', '') or os.getenv('TRADIER_TOKEN', '')
+                t_acct = os.getenv('TRADIER_ACCOUNT_ID', '')
+                t_sandbox = os.getenv('TRADIER_SANDBOX', 'true').lower() == 'true'
+                t_base = 'https://sandbox.tradier.com' if t_sandbox else 'https://api.tradier.com'
+                if t_token and t_acct:
+                    resp = requests.get(
+                        f'{t_base}/v1/accounts/{t_acct}/orders',
+                        headers={'Authorization': f'Bearer {t_token}', 'Accept': 'application/json'},
+                        params={'filter': 'filled'},
+                        timeout=5)
+                    if resp.ok:
+                        orders = resp.json().get('orders', {})
+                        if orders and orders != 'null':
+                            order_list = orders.get('order', [])
+                            if isinstance(order_list, dict):
+                                order_list = [order_list]
+                            # Find the most recent filled SELL for this ticker
+                            for o in reversed(order_list):
+                                if (o.get('symbol') == ticker
+                                        and o.get('side') == 'sell'
+                                        and o.get('status') == 'filled'):
+                                    fill_price = float(o.get('avg_fill_price', 0))
+                                    if fill_price > 0:
+                                        log.info("[live-reconcile] Found broker exit for %s: $%.2f",
+                                                 ticker, fill_price)
+                                        return fill_price
+
+            elif broker in ('alpaca', 'alpaca_reconciled'):
+                tc = getattr(self, '_trading_client', None)
+                if tc:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    from alpaca.trading.enums import QueryOrderStatus, OrderSide
+                    orders = tc.get_orders(filter=GetOrdersRequest(
+                        status=QueryOrderStatus.CLOSED,
+                        symbols=[ticker],
+                        side=OrderSide.SELL,
+                        limit=5))
+                    for o in orders:
+                        if str(o.filled_avg_price):
+                            fill_price = float(o.filled_avg_price)
+                            if fill_price > 0:
+                                log.info("[live-reconcile] Found broker exit for %s: $%.2f",
+                                         ticker, fill_price)
+                                return fill_price
+
+        except Exception as e:
+            log.warning("[live-reconcile] Broker exit price lookup failed for %s: %s", ticker, e)
+
+        # Fallback: entry price (P&L = $0, better than wrong number)
+        return entry_price
+
     def _live_reconcile(self) -> None:
         """V8: Periodic lightweight reconciliation during trading hours.
 
@@ -1177,11 +1237,19 @@ class RealTimeMonitor:
                 strategy = pos.get('strategy', 'unknown')
                 pos_broker = pos.get('_broker', 'unknown')
 
-                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
-                            "Closing (entry=$%.2f qty=%d strategy=%s)",
-                            ticker, entry_price, qty, strategy)
+                # V10: Query broker for actual exit fill price (stop may have fired)
+                exit_price = entry_price  # fallback: break-even
+                try:
+                    exit_price = self._get_phantom_exit_price(ticker, pos_broker, entry_price)
+                except Exception as ep_exc:
+                    log.warning("[live-reconcile] Could not get exit price for %s: %s", ticker, ep_exc)
 
-                # V10: Record SELL lot in FillLedger (close the stale open lots)
+                pnl = round((exit_price - entry_price) * qty, 2)
+                log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
+                            "Closing (entry=$%.2f exit=$%.2f qty=%d pnl=$%.2f strategy=%s)",
+                            ticker, entry_price, exit_price, qty, pnl, strategy)
+
+                # V10: Record SELL lot in FillLedger with REAL exit price
                 if hasattr(self, '_fill_ledger') and self._fill_ledger:
                     try:
                         from monitor.fill_lot import FillLot
@@ -1191,7 +1259,7 @@ class RealTimeMonitor:
                             ticker=ticker,
                             side='SELL',
                             qty=float(qty),
-                            fill_price=entry_price,  # break-even (no exit price known)
+                            fill_price=exit_price,
                             timestamp=datetime.now(ET),
                             order_id=f'live_reconcile_phantom',
                             broker=pos_broker,
@@ -1201,7 +1269,7 @@ class RealTimeMonitor:
                         matches = self._fill_ledger.append(sell_lot)
                         ledger_pnl = sum(m.realized_pnl for m in matches) if matches else 0
                         log.info("[live-reconcile] FillLedger SELL: %s %s@$%.2f → %d matches, pnl=$%.2f",
-                                 ticker, qty, entry_price, len(matches) if matches else 0, ledger_pnl)
+                                 ticker, qty, exit_price, len(matches) if matches else 0, ledger_pnl)
                     except Exception as e:
                         log.warning("[live-reconcile] FillLedger phantom SELL failed for %s: %s", ticker, e)
 
@@ -1216,11 +1284,14 @@ class RealTimeMonitor:
                             ticker=ticker,
                             action='CLOSED',
                             position=None,
-                            pnl=0.0,
+                            pnl=pnl,
                             close_detail={
                                 'strategy': strategy,
                                 'broker': pos_broker,
                                 'reason': 'phantom_live_reconcile',
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'qty': qty,
                             },
                         ),
                     ))

@@ -222,18 +222,18 @@ def main():
     from scripts._db_helper import init_satellite_db
     db_cleanup = init_satellite_db(monitor._bus, process_name='core')
 
-    # ── V9: FillLedger (shadow mode — parallel tracking) ─────────────────
+    # ── FillLedger (P&L authority — lot-based FIFO matching) ─────────────
     fill_ledger = None
     try:
         from monitor.fill_ledger import FillLedger
         fill_ledger = FillLedger()  # uses config.FILL_LEDGER_PATH
         fill_ledger.load()
         monitor.set_fill_ledger(fill_ledger)
-        log.info("FillLedger attached (shadow mode) | lots=%d open=%d daily_pnl=$%.2f",
+        log.info("FillLedger attached | lots=%d open=%d daily_pnl=$%.2f",
                  fill_ledger.lot_count, fill_ledger.open_position_count,
                  fill_ledger.daily_realized_pnl())
     except Exception as exc:
-        log.warning("FillLedger init failed (non-fatal, shadow mode skipped): %s", exc)
+        log.warning("FillLedger init failed (non-fatal): %s", exc)
 
     # ── V9: BrokerRegistry (extensible broker collection) ────────────────
     broker_registry = None
@@ -618,7 +618,7 @@ def main():
 
 
     _v9_status = {
-        'FillLedger (shadow)':     'ON' if fill_ledger else 'OFF',
+        'FillLedger':              'ON' if fill_ledger else 'OFF',
         'BrokerRegistry':          f'ON ({len(broker_registry)} brokers)' if broker_registry else 'OFF',
         'EquityTracker':           'ON' if getattr(monitor, '_equity_tracker', None) else 'OFF',
         'Tradier Streaming':       'ON' if tradier_stream and getattr(tradier_stream, '_running', False) else 'OFF (REST fallback)',

@@ -117,7 +117,17 @@ class RiskAdapter:
         """
         tag = f"[RiskAdapter][{ticker}][{strategy_name}][T{tier}]"
 
-        # ── Check 0: cross-layer dedup (READ-ONLY pre-flight) ──────────────────
+        # ── Check 0a: V10 WAL dedup — block if pending BUY already active ────
+        # Prevents SNAP/RIOT duplicate entries (ORB + sr_flip both fire for same ticker)
+        try:
+            from monitor.order_wal import wal
+            if wal.has_pending_order(ticker, 'BUY'):
+                log.info("%s BLOCKED: WAL dedup — pending BUY already active", tag)
+                return
+        except Exception:
+            pass  # WAL unavailable — proceed without dedup
+
+        # ── Check 0b: cross-layer dedup (READ-ONLY pre-flight) ────────────────
         # V7: Satellite does NOT write to registry. Core's RegistryGate acquires.
         # This is a fast read-only check to avoid sending unnecessary ORDER_REQs.
         from monitor.position_registry import registry

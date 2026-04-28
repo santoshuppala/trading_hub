@@ -192,6 +192,13 @@ class OrderWAL:
         # In-memory index: client_id → latest state (for fast lookups)
         self._order_states: Dict[str, str] = {}
 
+        # V10: In-memory ticker index for dedup gate
+        # {(ticker, side): client_id} for non-terminal orders only
+        self._active_orders: Dict[tuple, str] = {}
+        # {(ticker, side): monotonic_time} for orders that reached terminal
+        # Used to enforce minimum gap between orders for same ticker
+        self._last_terminal: Dict[tuple, float] = {}
+
         # Lazy init: don't open file until first write or read.
         # Prevents test imports from creating WAL files in production data/.
 
@@ -219,9 +226,11 @@ class OrderWAL:
         self._replay_file(path)
 
     def _replay_file(self, path: str):
-        """Replay WAL file to rebuild in-memory state index."""
+        """Replay WAL file to rebuild in-memory state + ticker index."""
         if not os.path.exists(path):
             return
+        # Temporary: collect ticker+side per client_id
+        _cid_ticker: Dict[str, tuple] = {}  # cid → (ticker, side)
         try:
             with open(path, 'r') as f:
                 for line in f:
@@ -234,12 +243,29 @@ class OrderWAL:
                         if seq > self._seq:
                             self._seq = seq
                         cid = entry.get('client_id', '')
+                        state = entry.get('state', '')
                         if cid:
-                            self._order_states[cid] = entry.get('state', '')
+                            self._order_states[cid] = state
+                            # Track ticker+side from INTENT entries
+                            ticker = entry.get('ticker')
+                            side = entry.get('side')
+                            if ticker and side:
+                                _cid_ticker[cid] = (ticker, side.upper())
                     except json.JSONDecodeError:
                         continue
         except Exception as exc:
             log.warning("[OrderWAL] Failed to replay %s: %s", path, exc)
+
+        # V10: Rebuild active_orders index from replayed state
+        self._active_orders.clear()
+        for cid, state in self._order_states.items():
+            key = _cid_ticker.get(cid)
+            if not key:
+                continue
+            if state not in {s.value for s in TERMINAL_STATES}:
+                self._active_orders[key] = cid
+            else:
+                self._last_terminal[key] = time.time()
 
     # ── Core write ────────────────────────────────────────────────────
 
@@ -288,12 +314,58 @@ class OrderWAL:
             # Update in-memory index
             self._order_states[cid] = entry.state
 
+            # V10: Update ticker-based active orders index
+            # INTENT has ticker+side. Later states (FILLED, RECORDED) don't.
+            # Look up the key from active_orders by client_id.
+            ticker = entry.ticker or ''
+            side = (entry.side or '').upper()
+            key = None
+            if ticker and side:
+                key = (ticker, side)
+            else:
+                # Find key by client_id (for FILLED/RECORDED that lack ticker)
+                for k, v in self._active_orders.items():
+                    if v == cid:
+                        key = k
+                        break
+
+            if key:
+                if entry.state in {s.value for s in TERMINAL_STATES}:
+                    self._active_orders.pop(key, None)
+                    self._last_terminal[key] = time.monotonic()
+                else:
+                    self._active_orders[key] = cid
+
     # ── Public API: state transitions ─────────────────────────────────
 
     @staticmethod
     def new_client_id() -> str:
         """Generate a new unique client ID for an order."""
         return str(uuid.uuid4())
+
+    def has_pending_order(self, ticker: str, side: str = 'BUY') -> bool:
+        """V10: Check if there's already an active (non-terminal) order for this ticker+side.
+
+        This is the DEDUP GATE. Call before intent() to prevent duplicate orders.
+        Fast: O(1) dict lookup, no file I/O.
+        Crash-safe: rebuilt from WAL file on restart via _replay_file.
+
+        Args:
+            ticker: stock symbol
+            side: 'BUY' or 'SELL'
+
+        Returns True if there's a pending INTENT/SUBMITTED/ACKED/PARTIAL order.
+        """
+        with self._lock:
+            self._ensure_initialized()
+            key = (ticker, side.upper())
+            if key in self._active_orders:
+                cid = self._active_orders[key]
+                state = self._order_states.get(cid, '')
+                log.debug("[OrderWAL] Dedup check: %s %s → active (cid=%s state=%s)",
+                          ticker, side, cid[:8], state)
+                return True
+            return False
 
     def intent(self, client_id: str, *, ticker: str, side: str, qty: float,
                price: float, reason: str = '', **extra) -> None:

@@ -163,7 +163,15 @@ class RiskEngine:
     def _handle_buy(self, p: SignalPayload, event: Event) -> None:
         ticker = p.ticker
 
-        # 0. Cross-layer dedup (READ-ONLY pre-flight)
+        # 0a. V10: WAL dedup — block if there's already a pending BUY for this ticker
+        # This prevents SNAP/RIOT-style duplicate entries where multiple signals
+        # fire for the same ticker and create accidental short positions.
+        if wal.has_pending_order(ticker, 'BUY'):
+            self._block(ticker, p.action,
+                        "WAL dedup: pending BUY order already active", event)
+            return
+
+        # 0b. Cross-layer dedup (READ-ONLY pre-flight)
         # V7: Core's RegistryGate handles the actual acquire when ORDER_REQ
         # reaches the bus. This is a fast pre-flight to avoid unnecessary work.
         from .position_registry import registry

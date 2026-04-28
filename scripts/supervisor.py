@@ -734,6 +734,20 @@ def main():
                             )
 
             write_status(managers)
+
+            # V10: Periodic heartbeat log — prevents outer watchdog from
+            # killing us as "zombie" due to log staleness. Outer watchdog
+            # checks if supervisor.log was written in last 5 min.
+            # Without this, supervisor goes silent during normal operation
+            # and watchdog restarts it every ~7 minutes.
+            if not hasattr(main, '_last_heartbeat'):
+                main._last_heartbeat = 0.0
+            _now_mono = time.monotonic()
+            if _now_mono - main._last_heartbeat > 120:  # every 2 min
+                main._last_heartbeat = _now_mono
+                _pids = {n: m.process.pid if m.process else '?' for n, m in managers.items()}
+                log.info("[supervisor] heartbeat | processes=%s | all healthy", _pids)
+
             time.sleep(30)  # Check every 30 seconds
 
     except KeyboardInterrupt:

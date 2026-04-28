@@ -181,6 +181,54 @@ class BarBuilder:
         """
         self._hot_tickers = set(tickers)
 
+    # ── Snapshot / Single-Ticker Seeding ────────────────────────────
+
+    def seed(self, ticker: str, df: pd.DataFrame, min_bars: int = 15) -> bool:
+        """Seed a single ticker's history from a DataFrame (e.g. snapshot).
+
+        Enables bar emission immediately if enough tickers are seeded.
+        REST will later replace this with fuller data — snapshot just
+        removes the first-minute latency gap.
+
+        Returns True if seeded successfully.
+        """
+        if df is None or len(df) < min_bars:
+            return False
+
+        bars = []
+        for _, row in df.iterrows():
+            o = float(row.get('open', row.get('o', 0)))
+            h = float(row.get('high', row.get('h', 0)))
+            l = float(row.get('low', row.get('l', 0)))
+            c = float(row.get('close', row.get('c', 0)))
+            v = int(row.get('volume', row.get('v', 0)))
+            if c <= 0:
+                continue
+            bars.append({'open': o, 'high': h, 'low': l, 'close': c, 'volume': v})
+
+        if len(bars) < min_bars:
+            return False
+
+        with self._lock:
+            self._history[ticker] = bars[-self._max_history:]
+            self._seeded_tickers.add(ticker)
+
+            # Enable bar emission immediately — snapshot provides enough
+            # history for ProSetupEngine detectors (RSI=14, ATR=14).
+            # Safety: TickDetector requires 2+ live BARs before acting
+            # on levels, so hybrid snapshot+live BARs are safe to emit —
+            # they feed ProSetupEngine to build live bar count, but
+            # TickDetector won't fire real signals until data-ready.
+            # REST will correct/replace snapshot bars later.
+            if not self._seeded and len(self._seeded_tickers) >= 10:
+                self._seeded = True
+                self._emit_bars = True
+                log.info("[BarBuilder] Snapshot-seeded %d tickers — "
+                         "emit_bars ENABLED (TickDetector needs 2 live BARs)",
+                         len(self._seeded_tickers))
+
+        return True
+
     # ── REST History Seeding ─────────────────────────────────────────
 
     def seed_from_cache(self, bars_cache: Dict[str, pd.DataFrame],
@@ -415,7 +463,10 @@ class BarBuilder:
             if len(self._history[ticker]) > self._max_history:
                 self._history[ticker] = self._history[ticker][-self._max_history:]
 
-            # Collect events to emit OUTSIDE lock (prevents deadlock)
+            # Collect events to emit OUTSIDE lock (prevents deadlock).
+            # Emits for ALL seeded tickers — ProSetupEngine needs BAR events
+            # for entry signals on the full universe, not just open positions.
+            # EventBus handles 200 BARs/min fine (8 workers, 500 queue, coalescing).
             if (self._emit_bars and self._bus
                     and ticker in self._seeded_tickers
                     and len(self._history[ticker]) >= 2):

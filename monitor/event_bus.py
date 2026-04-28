@@ -337,6 +337,9 @@ _DEFAULT_ASYNC_CONFIG.update({
     # Options signals — same profile as SIGNAL; low frequency
     EventType.OPTIONS_SIGNAL: {'maxsize': 50, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
     EventType.OPTIONS_CLOSE:  {'maxsize': 50, 'policy': BackpressurePolicy.BLOCK,       'n_workers': 1},
+    # External data snapshots — non-critical, acceptable to drop
+    EventType.NEWS_DATA:      {'maxsize': 20, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
+    EventType.SOCIAL_DATA:    {'maxsize': 20, 'policy': BackpressurePolicy.DROP_OLDEST, 'n_workers': 1},
 })
 
 _DEFAULT_PRIORITY.update({

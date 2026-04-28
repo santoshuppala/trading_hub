@@ -367,9 +367,53 @@ class OrderWAL:
                 return True
             return False
 
+    def check_and_intent(self, client_id: str, *, ticker: str, side: str,
+                          qty: float, price: float, reason: str = '',
+                          **extra) -> bool:
+        """V10: Atomic check + intent — prevents TOCTOU race in ASYNC mode.
+
+        Returns True if intent was recorded (no duplicate).
+        Returns False if a pending order already exists (blocked).
+        The check and write happen under the same lock acquisition.
+        """
+        with self._lock:
+            self._ensure_initialized()
+            key = (ticker, side.upper())
+            if key in self._active_orders:
+                cid = self._active_orders[key]
+                state = self._order_states.get(cid, '')
+                log.info("[OrderWAL] DEDUP BLOCKED: %s %s (existing cid=%s state=%s)",
+                         ticker, side, cid[:8], state)
+                return False
+            # No pending — record intent (still under lock)
+            entry = WALEntry(
+                seq=0, state=OrderState.INTENT.value, client_id=client_id,
+                ts=time.time(), ticker=ticker, side=side, qty=qty, price=price,
+                reason=reason, extra=extra if extra else None,
+            )
+            # Inline write (can't call _write which also acquires lock)
+            today = datetime.now(ET).strftime('%Y%m%d')
+            if today != self._current_date:
+                self._open_file()
+            self._seq += 1
+            entry.seq = self._seq
+            try:
+                line = json.dumps(entry.to_dict(), separators=(',', ':'))
+                self._fd.write(line + '\n')
+                self._fd.flush()
+                os.fsync(self._fd.fileno())
+            except Exception as exc:
+                log.error("[OrderWAL] Write failed: %s", exc)
+                return False
+            self._order_states[client_id] = entry.state
+            self._active_orders[key] = client_id
+            return True
+
     def intent(self, client_id: str, *, ticker: str, side: str, qty: float,
                price: float, reason: str = '', **extra) -> None:
-        """Record intent to place an order. Call BEFORE emitting ORDER_REQ."""
+        """Record intent to place an order. Call BEFORE emitting ORDER_REQ.
+        NOTE: In ASYNC mode, prefer check_and_intent() for atomic dedup.
+        """
         self._write(WALEntry(
             seq=0, state=OrderState.INTENT.value, client_id=client_id,
             ts=time.time(), ticker=ticker, side=side, qty=qty, price=price,

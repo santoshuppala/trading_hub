@@ -197,13 +197,31 @@ class EngineLifecycle:
                 log.info("[%s] Mid-session shutdown: PRESERVING %d open positions "
                          "(broker stops protect them)", self._name, len(positions))
 
-        # 3. EOD report (generate regardless — useful for partial-day analysis)
-        try:
-            self._eod.generate()
-        except Exception:
-            pass
+        # 3. EOD report — only at actual EOD (not mid-session crashes)
+        if is_eod:
+            try:
+                self._eod.generate()
+            except Exception:
+                pass
+        else:
+            log.info("[%s] Mid-session shutdown — skipping EOD report", self._name)
 
         # 4. Final state save (after any closes)
         self._state.save(self._adapter.get_state())
+
+        # 5. V10: Save market snapshot on EVERY shutdown (not just EOD).
+        # Mid-day crash → snapshot has today's bars → faster restart recovery.
+        # EOD → snapshot has full day → tomorrow's cold start.
+        if self._name == 'core':
+            try:
+                from monitor.market_snapshot import save_snapshot
+                engine = getattr(self._adapter, '_engine', None)
+                bars_cache = getattr(engine, '_bars_cache', None) if engine else None
+                if bars_cache:
+                    save_snapshot(bars_cache)
+                else:
+                    log.info("[%s] No bars_cache for snapshot", self._name)
+            except Exception as snap_exc:
+                log.warning("[%s] Snapshot save failed: %s", self._name, snap_exc)
 
         log.info("[%s] Lifecycle shutdown complete", self._name)

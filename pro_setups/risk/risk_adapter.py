@@ -82,6 +82,17 @@ class RiskAdapter:
         self._last_order: Dict[str, float] = {}       # ticker → monotonic timestamp
         self._last_signal: Dict[str, float] = {}      # (ticker, strategy) → monotonic timestamp (dedup)
 
+        # V10: Stopped-today blacklist — if a ticker was stopped out, block
+        # ALL re-entry for the rest of the session. Prevents churn on losers
+        # (EDSA 17 entries, MDB 8 entries from live trading Apr 27).
+        # Resets on process restart (new day = new session).
+        self._stopped_today: Set[str] = set()
+
+        # V10: Startup trade freeze — blocks new BUY orders until data is
+        # trustworthy. Prevents garbage trades from hybrid snapshot+live bars.
+        # Lifts when TickDetector's freeze lifts (shared state via set_tick_detector).
+        self._tick_detector = None  # set by ProSetupEngine after init
+
         # Subscribe at priority=0 (after routing handlers) to track state
         bus.subscribe(EventType.FILL,       self._on_fill,       priority=0)
         bus.subscribe(EventType.POSITION,   self._on_position,   priority=0)
@@ -117,17 +128,25 @@ class RiskAdapter:
         """
         tag = f"[RiskAdapter][{ticker}][{strategy_name}][T{tier}]"
 
-        # ── Check 0a: V10 WAL dedup — block if pending BUY already active ────
-        # Prevents SNAP/RIOT duplicate entries (ORB + sr_flip both fire for same ticker)
-        try:
-            from monitor.order_wal import wal
-            if wal.has_pending_order(ticker, 'BUY'):
-                log.info("%s BLOCKED: WAL dedup — pending BUY already active", tag)
-                return
-        except Exception:
-            pass  # WAL unavailable — proceed without dedup
+        # ── Check 0: Startup trade freeze ────────────────────────────────────
+        # Block all new BUY orders until TickDetector confirms data readiness.
+        # Prevents trades from hybrid snapshot+live bar data during first 2 min.
+        # SELL/exit orders from PositionManager are NOT affected (they bypass this).
+        if self._tick_detector and getattr(self._tick_detector, '_order_freeze', False):
+            log.info("%s FROZEN: startup trade freeze active (waiting for data readiness)", tag)
+            return
 
-        # ── Check 0b: cross-layer dedup (READ-ONLY pre-flight) ────────────────
+        # ── Check 0a: Stopped-today blacklist ─────────────────────────────────
+        # If this ticker was stopped out today, don't re-enter. Period.
+        # Prevents churn on losers (17 entries on same losing ticker).
+        if ticker in self._stopped_today:
+            log.info("%s BLOCKED: stopped out today — blacklisted for session", tag)
+            return
+
+        # ── Check 0b: V10 WAL dedup (full check at intent time, below) ────
+        # Atomic check_and_intent prevents TOCTOU race in ASYNC mode
+
+        # ── Check 0c: cross-layer dedup (READ-ONLY pre-flight) ────────────────
         # V7: Satellite does NOT write to registry. Core's RegistryGate acquires.
         # This is a fast read-only check to avoid sending unnecessary ORDER_REQs.
         from monitor.position_registry import registry
@@ -316,11 +335,15 @@ class RiskAdapter:
         self._last_order[ticker] = now
         self._positions.add(ticker)
 
-        # V10: WAL INTENT — record before submitting order
+        # V10: Atomic WAL dedup + intent (prevents TOCTOU race in ASYNC mode)
         _wal_cid = wal.new_client_id()
-        wal.intent(_wal_cid, ticker=ticker, side=str(payload.side.value),
-                   qty=qty, price=entry_price,
-                   reason=f'pro:{strategy_name}:{tag}')
+        if not wal.check_and_intent(_wal_cid, ticker=ticker,
+                                     side=str(payload.side.value),
+                                     qty=qty, price=entry_price,
+                                     reason=f'pro:{strategy_name}:{tag}'):
+            log.info("%s BLOCKED: WAL dedup — pending BUY already active", tag)
+            self._positions.discard(ticker)
+            return
 
         _order_event = Event(
             type           = EventType.ORDER_REQ,
@@ -348,16 +371,27 @@ class RiskAdapter:
         p = event.payload
         if p.action == PositionAction.CLOSED:
             # V8: Only remove if this was a Pro position (not VWAP).
-            # Without this check, VWAP closing AAPL would remove it from
-            # Pro's _positions even if Pro also holds AAPL.
             cd = getattr(p, 'close_detail', {}) or {}
             strategy = cd.get('strategy', '')
+            reason = cd.get('reason', '')
             if strategy.startswith('pro:') or p.ticker in self._positions:
                 self._positions.discard(p.ticker)
-                log.debug(
-                    "[RiskAdapter][%s] position CLOSED (strategy=%s) — removed from tracking",
-                    p.ticker, strategy,
-                )
+
+                # V10: Stopped-today blacklist — if closed by stop, block
+                # re-entry for rest of session. Reason patterns:
+                #   STOP_LOSS_phase*, TRAIL_STOP_phase*, PHASE0_*,
+                #   phantom_cleanup_broker_stop, external_close
+                _is_stop = any(kw in reason.upper() for kw in
+                               ('STOP', 'PHANTOM', 'EXTERNAL', 'PHASE0'))
+                if _is_stop:
+                    self._stopped_today.add(p.ticker)
+                    log.info("[RiskAdapter][%s] BLACKLISTED for session "
+                             "(closed by %s)", p.ticker, reason)
+                else:
+                    log.debug(
+                        "[RiskAdapter][%s] position CLOSED (strategy=%s reason=%s)",
+                        p.ticker, strategy, reason,
+                    )
 
     def _on_order_fail(self, event: Event) -> None:
         """V8: Clean up _positions and _last_order on BUY ORDER_FAIL.

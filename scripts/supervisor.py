@@ -55,13 +55,18 @@ date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
 os.makedirs(date_dir, exist_ok=True)
 log_file = os.path.join(date_dir, 'supervisor.log')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [supervisor] %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-    ],
-)
+class _ETFormatter(logging.Formatter):
+    _et = ZoneInfo('America/New_York')
+    def formatTime(self, record, datefmt=None):
+        from datetime import datetime as _dt
+        ct = _dt.fromtimestamp(record.created, tz=self._et)
+        if datefmt:
+            return ct.strftime(datefmt)
+        return ct.strftime('%Y-%m-%d %H:%M:%S') + f',{int(record.msecs):03d}'
+
+_handler = logging.FileHandler(log_file)
+_handler.setFormatter(_ETFormatter('%(asctime)s %(levelname)s [supervisor] %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 log = logging.getLogger(__name__)
 
 # V7 P4-2: Config-driven engine registration.

@@ -103,6 +103,8 @@ class TradierStreamClient:
 
         # V10: BarBuilder for real-time bar aggregation (set via set_bar_builder)
         self._bar_builder = None
+        # V10: TickDetector for sub-second entry signals (set via set_tick_detector)
+        self._tick_detector = None
 
         # V9: Cumulative volume cache — {ticker: cvol}
         # Used by RVOLEngine for instant real-time RVOL (no bar accumulation needed)
@@ -196,6 +198,11 @@ class TradierStreamClient:
         """V10: Attach BarBuilder for real-time bar aggregation from trade ticks."""
         self._bar_builder = builder
         log.info("[TradierStream] BarBuilder attached")
+
+    def set_tick_detector(self, detector) -> None:
+        """V10: Attach TickSignalDetector for sub-second entry signals."""
+        self._tick_detector = detector
+        log.info("[TradierStream] TickDetector attached")
 
     def get_cvol(self, ticker: str) -> Optional[int]:
         """Get latest cumulative daily volume from streaming trades.
@@ -394,6 +401,13 @@ class TradierStreamClient:
             # V10: Feed trade tick to BarBuilder for real-time bar aggregation
             if self._bar_builder:
                 self._bar_builder.on_trade(ticker, price, size, cvol, time.time())
+
+            # V10: Feed trade tick to TickDetector for sub-second entry signals
+            if self._tick_detector:
+                try:
+                    self._tick_detector.on_tick(ticker, price, size, cvol, time.time())
+                except Exception:
+                    pass  # never block stream for detector errors
 
             with self._prices_lock:
                 existing = self._prices.get(ticker, {})

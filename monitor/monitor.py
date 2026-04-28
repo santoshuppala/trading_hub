@@ -1551,9 +1551,17 @@ class RealTimeMonitor:
                             or (time.monotonic() - _last_seed) > _reseed_interval)
             if _should_seed:
                 try:
+                    # V10: Adaptive min_bars — don't force 30-bar wait on
+                    # mid-session restart. At 09:52 restart, REST has 22 bars.
+                    # 15 bars is enough for RSI(14) warmup. 30 is ideal but
+                    # waiting 30 min after every restart is worse than using 15.
+                    _now_et = datetime.now(ET)
+                    _mins_since_open = (_now_et.hour - 9) * 60 + (_now_et.minute - 30)
+                    _min_bars = 15 if _mins_since_open < 35 else 30
                     _seeded = _bb.seed_from_cache(
                         self._bars_cache,
                         rvol_cache=getattr(self, '_rvol_cache', None),
+                        min_bars=_min_bars,
                     )
                     self._last_bb_seed_time = time.monotonic()
                     if _seeded > 0:
@@ -1814,7 +1822,8 @@ class RealTimeMonitor:
                                       for t in new_tickers
                                       if t in self._rvol_cache}
                     if new_cache:
-                        _seeded = _bb.seed_from_cache(new_cache, new_rvol_cache)
+                        _seeded = _bb.seed_from_cache(new_cache, new_rvol_cache,
+                                                       min_bars=15)
                         if _seeded:
                             log.info("[stream-sync] BarBuilder seeded %d new tickers",
                                      _seeded)

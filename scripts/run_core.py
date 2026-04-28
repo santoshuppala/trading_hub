@@ -158,6 +158,23 @@ def main():
         except Exception as exc:
             log.warning("RVOL profile seeding failed (non-fatal): %s", exc)
 
+    # ── FillLedger (P&L authority) — load EARLY, before beta seeding ────────
+    # Beta seeding takes ~35s. FillLedger must be ready before any SELL events
+    # fire (which can happen as soon as EventBus starts processing BAR events).
+    # Race condition: without this, SELL at 11:00:51 fails with "no open lots"
+    # because FillLedger doesn't load until 11:01:21 (after beta seeding).
+    fill_ledger = None
+    try:
+        from monitor.fill_ledger import FillLedger
+        fill_ledger = FillLedger()  # uses config.FILL_LEDGER_PATH
+        fill_ledger.load()
+        monitor.set_fill_ledger(fill_ledger)
+        log.info("FillLedger attached | lots=%d open=%d daily_pnl=$%.2f",
+                 fill_ledger.lot_count, fill_ledger.open_position_count,
+                 fill_ledger.daily_realized_pnl())
+    except Exception as exc:
+        log.warning("FillLedger init failed (non-fatal): %s", exc)
+
     # ── V8: Pre-seed beta cache for all tickers ────────────────────────────
     try:
         from monitor.risk_sizing import RiskSizer
@@ -221,19 +238,6 @@ def main():
     # ── DB persistence ────────────────────────────────────────────────────
     from scripts._db_helper import init_satellite_db
     db_cleanup = init_satellite_db(monitor._bus, process_name='core')
-
-    # ── FillLedger (P&L authority — lot-based FIFO matching) ─────────────
-    fill_ledger = None
-    try:
-        from monitor.fill_ledger import FillLedger
-        fill_ledger = FillLedger()  # uses config.FILL_LEDGER_PATH
-        fill_ledger.load()
-        monitor.set_fill_ledger(fill_ledger)
-        log.info("FillLedger attached | lots=%d open=%d daily_pnl=$%.2f",
-                 fill_ledger.lot_count, fill_ledger.open_position_count,
-                 fill_ledger.daily_realized_pnl())
-    except Exception as exc:
-        log.warning("FillLedger init failed (non-fatal): %s", exc)
 
     # ── V9: BrokerRegistry (extensible broker collection) ────────────────
     broker_registry = None

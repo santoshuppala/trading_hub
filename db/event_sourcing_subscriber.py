@@ -554,6 +554,11 @@ class EventSourcingSubscriber:
 
             broker = cd.get('broker') or getattr(event, '_routed_broker', None) or 'unknown'
 
+            # V10: Include lifecycle data (scorer, phases, events) for ML
+            import json as _json
+            _lifecycle = cd.get('lifecycle', {})
+            _lifecycle_json = _json.dumps(_lifecycle) if _lifecycle else None
+
             self._writer.enqueue('completed_trades', {
                 'trade_id':          trade_id,
                 'ticker':            p.ticker,
@@ -569,6 +574,7 @@ class EventSourcingSubscriber:
                 'opened_event_id':   str(getattr(event, 'correlation_id', None) or ''),
                 'closed_event_id':   str(getattr(event, 'event_id', trade_id)),
                 'broker':            broker,
+                'lifecycle_data':    _lifecycle_json,
             })
         except Exception as exc:
             log.warning("_write_completed_trade error: %s", exc)
@@ -873,6 +879,16 @@ class EventSourcingSubscriber:
             pnl_pct = round(pnl / entry_cost * 100, 2) if entry_cost else 0.0
             holding_min = _safe_float(p.get('holding_minutes', 0))
 
+            # V10: Include options lifecycle data for ML
+            import json as _json
+            _opts_lifecycle = {
+                'strategy_type': p.get('strategy_type'),
+                'exit_reason': p.get('reason'),
+                'phase': p.get('phase'),
+                'dte_at_close': p.get('dte_at_entry', 0),
+                'events': p.get('lifecycle_events', []),
+            }
+
             self._writer.enqueue('completed_trades', {
                 'trade_id': str(uuid.uuid4()),
                 'ticker': ticker,
@@ -888,6 +904,7 @@ class EventSourcingSubscriber:
                 'opened_event_id': '',
                 'closed_event_id': str(getattr(event, 'event_id', '')),
                 'broker': 'alpaca_options',
+                'lifecycle_data': _json.dumps(_opts_lifecycle),
             })
 
             log.info(

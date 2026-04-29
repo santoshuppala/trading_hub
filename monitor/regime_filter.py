@@ -166,6 +166,17 @@ class RegimeFilter:
             return  # too soon
         self._last_update = now
 
+        # Data sufficiency check: don't overwrite loaded scores with garbage
+        # from 15 bars after restart. Need at least 30 SPY bars for reliable
+        # variance ratio. If insufficient, keep loaded scores (from state file).
+        spy_df = self._bars_cache.get('SPY')
+        _spy_bars = len(spy_df) if spy_df is not None else 0
+        if _spy_bars < 30 and self._trend_score != 0.5:
+            # We have loaded scores but insufficient data to recompute
+            # Keep loaded scores, just update strategy scores from them
+            self._update_strategy_scores()
+            return
+
         # Compute 3 dimensions from live data
         self._trend_score = self._compute_trend()
         self._vrp_score = self._compute_vrp()
@@ -538,7 +549,15 @@ class RegimeFilter:
                 self._session_vrp = sess.get('vrp', 0.5)
                 self._session_participation = sess.get('participation', 0.5)
                 self._strategy_scores = state.get('per_strategy_scores', {})
-                log.info("[RegimeFilter] Restored from state (age=%ds) — fully operational",
+                # Prevent first update() from overwriting loaded scores with
+                # garbage computed from 15 bars. Set timing vars to now so
+                # update() waits a full 60s before recomputing.
+                _now = time.monotonic()
+                self._last_update = _now
+                self._last_session_update = _now
+                self._last_state_save = _now
+                log.info("[RegimeFilter] Restored from state (age=%ds) — fully operational "
+                         "(next recompute in 60s)",
                          int(age_sec))
 
             elif age_sec < 3600:  # 5-60 min — stale but usable
@@ -547,6 +566,9 @@ class RegimeFilter:
                 self._participation_score = state.get('participation_score', 0.5)
                 self._score_history = deque(state.get('score_history', []), maxlen=30)
                 self._breadth_history = deque(state.get('breadth_history', []), maxlen=10)
+                # Stale state: allow recompute sooner (30s) but not immediately
+                self._last_update = time.monotonic() - _INTRADAY_UPDATE_SEC * 0.5
+                self._last_session_update = time.monotonic() - _SESSION_UPDATE_SEC * 0.5
                 self._confidence_penalty = 0.3
                 log.info("[RegimeFilter] Restored stale state (age=%dm) — reduced confidence",
                          int(age_sec // 60))

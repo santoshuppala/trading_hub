@@ -563,7 +563,10 @@ class TickSignalDetector:
         if _all_levels:
             _min_dist = min(abs(price - l) for l in _all_levels)
             if _min_dist > atr * 0.5:  # more than 0.5 ATR from any level
-                return  # too far — no crossing possible this tick
+                # Bypass: tickers with pending setups must always reach setup check
+                # (EMA9/EMA20 triggers are not in the S/R levels list)
+                if ticker not in self._pending_setups:
+                    return  # too far — no crossing possible this tick
 
         # ── Data-readiness gating ────��───────────────────────────────
         # Requires 2+ live BARs + fresh indicators (not just 1 hybrid bar).

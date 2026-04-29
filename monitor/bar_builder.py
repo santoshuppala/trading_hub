@@ -493,9 +493,17 @@ class BarBuilder:
         history = self._history[ticker]
         df = pd.DataFrame(history)
 
-        # Add index (detectors expect DatetimeIndex or similar)
+        # Build DatetimeIndex from market open + 1-min offsets.
+        # Required for df.resample('5min') in ProSetupEngine (5-min bar computation).
+        # Without this, TrendDetector can't fire (needs 5-min EMA alignment).
         if len(df) > 0:
-            df.index = pd.RangeIndex(len(df))
+            _open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            # If we have more bars than minutes since open, start from earlier
+            _n_bars = len(df)
+            _start = _open if _n_bars <= 390 else _open
+            _idx = pd.date_range(start=_start, periods=_n_bars, freq='1min', tz=ET)
+            # If generated index is longer than bars, trim from end
+            df.index = _idx[-_n_bars:]
 
         # Get RVOL baseline
         rvol_df = self._rvol_baselines.get(ticker)

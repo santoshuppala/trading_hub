@@ -1973,6 +1973,13 @@ class RealTimeMonitor:
         self.running = False
         if self.thread:
             self.thread.join(timeout=10)
+        # V10: Save regime filter state (crash recovery for next startup)
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf:
+            try:
+                _rf._save_state()
+            except Exception:
+                pass
         # V8: Actually email the EOD summary (was hardcoded to None → log only)
         EODSummary.send(self.trade_log, alert_email=self._alert_email)
         self._durable_log.close()   # flush remaining Redpanda messages

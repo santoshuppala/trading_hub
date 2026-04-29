@@ -613,6 +613,9 @@ def main():
         # Wire to RiskAdapter (Pro signals)
         if pro_engine:
             pro_engine._risk_adapter._regime_filter = regime_filter
+        # Wire to RiskEngine (VWAP signals)
+        if hasattr(monitor, '_risk') and monitor._risk:
+            monitor._risk._regime_filter = regime_filter
         # Wire to TickDetector (tick signals)
         if 'tick_detector' in dir():
             tick_detector._regime_filter = regime_filter

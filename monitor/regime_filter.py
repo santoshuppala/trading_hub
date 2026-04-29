@@ -203,6 +203,12 @@ class RegimeFilter:
 
     def is_strategy_allowed(self, strategy_name: str) -> bool:
         """Check if strategy is allowed in current regime."""
+        # Kill check: if ALL strategies below kill threshold → block everything
+        if self._strategy_scores and all(
+            s < _KILL_THRESHOLD for s in self._strategy_scores.values()
+        ):
+            return False  # market is hostile to all strategies
+
         score = self._strategy_scores.get(strategy_name)
         if score is None:
             return True  # unknown strategy → allow (conservative)

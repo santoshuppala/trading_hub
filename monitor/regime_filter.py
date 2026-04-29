@@ -36,9 +36,11 @@ import numpy as np
 log = logging.getLogger(__name__)
 ET = ZoneInfo('America/New_York')
 
-# Paper trading mode: score everything but block nothing (except kill threshold).
-# Set REGIME_PAPER_MODE=false when going live with calibrated thresholds.
-PAPER_TRADING_MODE = os.getenv('REGIME_PAPER_MODE', 'true').lower() in ('true', '1', 'yes')
+# Regime blocking mode for EQUITY strategies (Pro + VWAP + TickDetector).
+# 'false' = ACTIVE (blocks strategies in bad regimes) — default for equities.
+# 'true' = PAPER (scores only, no blocking) — use during initial calibration.
+# Options are NOT affected by this flag — they use hard gates only (earnings + IV rank).
+PAPER_TRADING_MODE = os.getenv('REGIME_PAPER_MODE', 'false').lower() in ('true', '1', 'yes')
 
 # State file for crash recovery
 _STATE_PATH = os.path.join(

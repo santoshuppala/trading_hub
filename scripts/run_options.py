@@ -64,6 +64,13 @@ def main():
     log.info("OPTIONS PROCESS STARTING")
     log.info("=" * 60)
 
+    # V10: Validate SMTP so alerts actually deliver (was missing — Core had it)
+    try:
+        from monitor.alerts import validate_smtp
+        validate_smtp()
+    except Exception:
+        log.warning("SMTP validation skipped — options alerts may not deliver")
+
     bus = EventBus()
     cache_reader = CacheReader()
     dist_registry = DistributedPositionRegistry(global_max=GLOBAL_MAX_POSITIONS)

@@ -1248,6 +1248,7 @@ class RealTimeMonitor:
 
         # ── Compare against local state ───────────────────────────────────
         fixes = 0
+        _fix_details = []  # collect specifics for alert email
 
         # 1. Phantoms — in state but not at any broker
         for ticker in list(self.positions.keys()):
@@ -1269,6 +1270,11 @@ class RealTimeMonitor:
                 log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
                             "Closing (entry=$%.2f exit=$%.2f qty=%d pnl=$%.2f strategy=%s)",
                             ticker, entry_price, exit_price, qty, pnl, strategy)
+                _fix_details.append(
+                    f"PHANTOM {ticker}: closed (was in local state, not at broker). "
+                    f"entry=${entry_price:.2f} exit=${exit_price:.2f} qty={qty} "
+                    f"pnl=${pnl:+.2f} strategy={strategy}"
+                )
 
                 # V10: Record SELL lot in FillLedger with REAL exit price
                 if hasattr(self, '_fill_ledger') and self._fill_ledger:
@@ -1326,6 +1332,10 @@ class RealTimeMonitor:
             if ticker not in self.positions:
                 log.warning("[live-reconcile] ORPHAN %s — %d shares at %s, not in state. Importing.",
                             ticker, bp['qty'], bp['broker'])
+                _fix_details.append(
+                    f"ORPHAN {ticker}: imported {bp['qty']} shares from {bp['broker']} "
+                    f"(was at broker, not in local state). entry=${bp['entry']:.2f}"
+                )
                 # Import with ATR-based defaults (same as startup reconciliation)
                 atr = self._fetch_last_atr(ticker)
                 entry = bp['entry']
@@ -1361,6 +1371,10 @@ class RealTimeMonitor:
                 if local_qty != broker_qty:
                     log.warning("[live-reconcile] QTY MISMATCH %s: state=%d broker=%d. Fixing.",
                                 ticker, local_qty, broker_qty)
+                    _fix_details.append(
+                        f"QTY MISMATCH {ticker}: local={local_qty} → broker={broker_qty} "
+                        f"(adjusted to broker truth)"
+                    )
                     self.positions[ticker]['quantity'] = broker_qty
                     self.positions[ticker]['qty'] = broker_qty
                     if '_broker_qty' in bp:
@@ -1375,6 +1389,10 @@ class RealTimeMonitor:
                 if broker_entry > 0 and local_entry > 0 and broker_entry != local_entry:
                     log.info("[live-reconcile] ENTRY_PRICE sync %s: local=$%.2f → broker=$%.2f",
                              ticker, local_entry, broker_entry)
+                    _fix_details.append(
+                        f"ENTRY PRICE {ticker}: local=${local_entry:.2f} → "
+                        f"broker=${broker_entry:.2f} (adjusted to broker cost basis)"
+                    )
                     self.positions[ticker]['entry_price'] = broker_entry
                     fixes += 1
 
@@ -1387,17 +1405,18 @@ class RealTimeMonitor:
                            list(self.trade_log))
             except Exception:
                 pass
-            # V10: Alert on reconciliation fixes (phantom/orphan = potential P&L issue)
+            # V10: Alert on reconciliation fixes with specifics
             try:
                 from .alerts import send_alert
                 from config import ALERT_EMAIL
                 if ALERT_EMAIL:
+                    _details_str = '\n'.join(f"  • {d}" for d in _fix_details)
                     send_alert(
                         ALERT_EMAIL,
-                        f"RECONCILIATION: {fixes} position fix(es) applied.\n"
-                        f"Local positions: {len(self.positions)}\n"
-                        f"Broker positions: {len(broker_positions)}\n"
-                        f"Check logs for details.",
+                        f"RECONCILIATION: {fixes} position fix(es) applied.\n\n"
+                        f"Fixes:\n{_details_str}\n\n"
+                        f"After fix: {len(self.positions)} local positions, "
+                        f"{len(broker_positions)} broker positions.",
                         severity='WARNING',
                     )
             except Exception:

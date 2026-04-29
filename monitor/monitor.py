@@ -1824,7 +1824,11 @@ class RealTimeMonitor:
             return  # nothing changed
 
         # 1. Update WebSocket subscription (includes new + existing)
-        if _sc and _sc.is_connected:
+        # Call update_tickers even when not connected — it sets _tickers
+        # so the stream thread picks them up on its next loop iteration.
+        # Fixes chicken-and-egg: 0 positions at start → 0 HOT tickers →
+        # stream never connects → tickers never added → stream stays dead.
+        if _sc:
             try:
                 _sc.update_tickers(all_tickers)
             except Exception as exc:

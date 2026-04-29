@@ -813,6 +813,11 @@ class TickSignalDetector:
           - EMA9 reclaim OR EMA20 bounce with momentum
           - Volume confirmation from recent ticks (live, not stale RVOL)
         """
+        # Regime check: skip if strategy not allowed in current market
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf and not _rf.is_strategy_allowed(setup.strategy):
+            return None
+
         # Expiry check
         if now > setup.expires_at:
             del self._pending_setups[ticker]

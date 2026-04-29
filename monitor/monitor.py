@@ -367,6 +367,11 @@ class RealTimeMonitor:
             self._tradier_stream.set_tick_detector(tick_detector)
         log.info("[Monitor] TickDetector attached — sub-second entries enabled")
 
+    def set_regime_filter(self, regime_filter) -> None:
+        """V10: Attach RegimeFilter for strategy-level regime gating."""
+        self._regime_filter = regime_filter
+        log.info("[Monitor] RegimeFilter attached")
+
     # ── V9 (R3): Stale order cleanup ────────────────────────────────────────
 
     def _cleanup_stale_open_orders(self) -> None:
@@ -1648,6 +1653,14 @@ class RealTimeMonitor:
 
         # Tick heartbeat
         self._heartbeat.tick()
+
+        # V10: Update regime filter (every ~60s)
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf:
+            try:
+                _rf.update()
+            except Exception:
+                pass  # regime failure must never block trading
 
         # V8: Pop periodic scans + ticker conviction ranking + live reconciliation
         if not hasattr(self, '_last_pop_scan'):

@@ -127,9 +127,45 @@ class SatelliteEODReport:
         except Exception as exc:
             log.warning("[%s] EOD report generation failed: %s", self._name, exc)
 
+        # V10: Post-session ML analytics — populate ml_signal_context,
+        # ml_trade_outcomes, ml_rejection_log from today's event_store data.
+        # Without this, ML tables don't get populated (was manual-only before).
+        if self._name == 'core':
+            self._run_post_session_analytics()
+
         # V10: Weekly options PF review — auto-triggers on Fridays
         if self._name == 'options':
             self._check_weekly_review()
+
+    def _run_post_session_analytics(self) -> None:
+        """Auto-run ML data population jobs at EOD.
+
+        Populates ml_signal_context, ml_trade_outcomes, ml_rejection_log
+        from today's event_store data. Critical for ML training — without
+        this, signal features are lost daily.
+        """
+        try:
+            from datetime import date
+            from scripts.post_session_analytics import (
+                job_signal_context, job_trade_outcomes, job_rejection_log,
+            )
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            today = date.today()
+
+            sc = job_signal_context(conn, today)
+            to = job_trade_outcomes(conn, today)
+            rl = job_rejection_log(conn, today)
+
+            conn.close()
+            log.info("[%s] Post-session analytics complete: "
+                     "signal_context=%d, trade_outcomes=%d, rejection_log=%d",
+                     self._name, sc, to, rl)
+        except Exception as exc:
+            log.warning("[%s] Post-session analytics failed (non-fatal): %s",
+                        self._name, exc)
 
     def _check_weekly_review(self) -> None:
         """Auto-run weekly PF analysis on Fridays."""

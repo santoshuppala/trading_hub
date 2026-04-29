@@ -296,6 +296,9 @@ def main():
         consumer.stop()
         if db_cleanup:
             db_cleanup()
+        # V10: Give alert worker thread time to deliver queued emails (EOD summary)
+        # Without this, daemon thread dies with main thread before SMTP sends.
+        time.sleep(5)
         log.info("Options process stopped.")
         # V8: Exit code 3 = kill switch halt. Supervisor should NOT restart.
         if _kill_switch_exit:

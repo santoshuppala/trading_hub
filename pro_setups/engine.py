@@ -377,6 +377,31 @@ class ProSetupEngine:
         }
         det_json = json.dumps(det_snap)
 
+        # ── Step 7b: Two-stage strategies → register setup with TickDetector ─
+        # trend_pullback: detect on bar, trigger on tick (eliminates adverse selection)
+        _TWO_STAGE_STRATEGIES = {'trend_pullback'}
+        if (strategy_name in _TWO_STAGE_STRATEGIES
+                and hasattr(self, '_tick_detector') and self._tick_detector):
+            from monitor.tick_detector import PendingSetup
+            _ema9_val = float(precomputed['ema_9'].iloc[-1]) if precomputed.get('ema_9') is not None and len(precomputed['ema_9']) > 0 else entry_price
+            _ema20_val = float(precomputed['ema_21'].iloc[-1]) if precomputed.get('ema_21') is not None and len(precomputed['ema_21']) > 0 else entry_price
+            _setup = PendingSetup(
+                ticker=ticker, strategy=strategy_name, direction=confirmed,
+                ema9=_ema9_val, ema20=_ema20_val,
+                stop_price=stop_price, target_1=target_1, target_2=target_2,
+                atr=atr, rsi=rsi, rvol=rvol, confidence=confidence,
+                created_at=time.monotonic(), expires_at=time.monotonic() + 180.0,
+            )
+            self._tick_detector.register_setup(_setup)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.info(
+                "[ProSetupEngine][%s] SETUP REGISTERED (%s) — awaiting tick confirm | "
+                "ema9=$%.2f ema20=$%.2f stop=$%.2f atr=$%.4f conf=%.0f%% elapsed=%.1fms",
+                ticker, strategy_name, _ema9_val, _ema20_val,
+                stop_price, atr, confidence * 100, elapsed_ms,
+            )
+            return  # DO NOT emit PRO_STRATEGY_SIGNAL — TickDetector will trigger
+
         # ── Step 8: emit PRO_STRATEGY_SIGNAL ─────────────────────────────
         # V10: Capture edge context at signal time
         _regime_str = ''

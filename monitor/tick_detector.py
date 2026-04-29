@@ -46,9 +46,9 @@ _MOMENTUM_WINDOW = 30.0
 class TickSignal:
     """Signal produced by a tick-level detector."""
     ticker: str
-    strategy: str        # sr_flip, orb, momentum_ignition, gap_and_go, liquidity_sweep
+    strategy: str        # sr_flip, orb, momentum_ignition, gap_and_go, liquidity_sweep, trend_pullback
     direction: str       # 'long' or 'short'
-    entry_price: float   # current tick price
+    entry_price: float   # limit price (for stop-limit: the max fill price)
     stop_price: float
     target_1: float
     target_2: float
@@ -56,6 +56,31 @@ class TickSignal:
     rsi: float
     rvol: float
     confidence: float    # 0-1
+    activation_price: float = 0.0  # for stop-limit orders: price that activates the order
+
+
+@dataclass
+class PendingSetup:
+    """Setup registered by bar-level detection, awaiting tick-level trigger.
+
+    Two-stage system: ProSetupEngine detects "setup exists" on bars,
+    TickDetector triggers entry when live tick confirms the bounce.
+    Expires after 3 minutes if no tick confirmation.
+    """
+    ticker: str
+    strategy: str           # 'trend_pullback' (extensible)
+    direction: str          # 'long'
+    ema9: float             # 1-min EMA9 at detection time
+    ema20: float            # 1-min EMA20 at detection time
+    stop_price: float
+    target_1: float
+    target_2: float
+    atr: float
+    rsi: float
+    rvol: float
+    confidence: float
+    created_at: float       # monotonic time
+    expires_at: float       # created_at + 180s (3 minutes)
 
 
 class TickSignalDetector:
@@ -162,6 +187,14 @@ class TickSignalDetector:
         # Level stability: {(ticker, level_rounded): first_seen_monotonic}
         self._level_first_seen: Dict[tuple, float] = {}
 
+        # Two-stage pending setups: {ticker: PendingSetup}
+        # Registered by ProSetupEngine for strategies that need tick confirmation.
+        # Ephemeral: expire after 3 min. One per ticker (latest wins).
+        self._pending_setups: Dict[str, PendingSetup] = {}
+        self._setups_registered = 0
+        self._setups_triggered = 0
+        self._setups_expired = 0
+
         # Level versioning: monotonic counter per ticker, incremented on each
         # update_levels call. Ticks read (levels, version) as a snapshot to
         # detect stale reads when a BAR update races with tick processing.
@@ -264,6 +297,11 @@ class TickSignalDetector:
             self._level_cooldown = {
                 k: v for k, v in self._level_cooldown.items() if v > _cutoff
             }
+            # Prune expired pending setups
+            _expired = [k for k, v in self._pending_setups.items() if v.expires_at < now]
+            for k in _expired:
+                del self._pending_setups[k]
+                self._setups_expired += 1
 
         # ── Store today's close for tomorrow's gap detection ─────────
         close = levels.get('close', levels.get('session_close', 0))
@@ -414,8 +452,11 @@ class TickSignalDetector:
         _overloaded = self._sample_rate > 1
 
         # Adaptive sampling: skip this tick unless it's the Nth
-        # Exception: always process ticks with large price moves (crossings)
-        if _overloaded:
+        # Exceptions (NEVER sample out):
+        #   - Large price moves (potential crossings)
+        #   - Tickers with pending setups (trigger tick is critical)
+        _has_pending_setup = ticker in self._pending_setups
+        if _overloaded and not _has_pending_setup:
             self._sample_counter[ticker] += 1
             prev = self._tick_state[ticker]['prev_price']
             ind_check = self._indicators.get(ticker, {})
@@ -559,6 +600,12 @@ class TickSignalDetector:
         # Sweep: needs trusted support levels — skip if large gap
         if _data_ready and _gap_regime != 'large' and not _overloaded:
             signal = signal or self._check_sweep(ticker, price, prev_price, state, levels, ind, now)
+
+        # ── Two-stage setup trigger (trend_pullback) ─────────────────
+        # Check pending setups AFTER existing detectors (don't override)
+        if not signal and ticker in self._pending_setups:
+            setup = self._pending_setups[ticker]
+            signal = self._check_trend_setup(ticker, price, prev_price, setup, ind, now)
 
         if signal:
             # Context-aware smart stop: scale buffer by current volatility + time of day
@@ -752,6 +799,102 @@ class TickSignalDetector:
 
         return None
 
+    # ── Two-Stage Setup Detector ────────────────────────────────────
+
+    def _check_trend_setup(self, ticker, price, prev_price, setup, ind, now):
+        """Tick-level trigger for trend_pullback pending setups.
+
+        Confirms the pullback bounce is REAL using live tick data:
+          - Price must be above EMA20 (thesis still valid)
+          - Price must not be too far above EMA9 (not chasing)
+          - EMA9 reclaim OR EMA20 bounce with momentum
+          - Volume confirmation from recent ticks (live, not stale RVOL)
+        """
+        # Expiry check
+        if now > setup.expires_at:
+            del self._pending_setups[ticker]
+            self._setups_expired += 1
+            log.debug("[TickDetector] Setup expired: %s (180s, no tick confirmation)",
+                      ticker)
+            return None
+
+        # Thesis validity: price must be ABOVE EMA20
+        if price < setup.ema20:
+            return None  # pullback broke EMA20 → thesis dead
+
+        # Gap-through guard: price not too far above EMA9 (< 0.5 ATR)
+        if price > setup.ema9 + setup.atr * 0.5:
+            return None  # too extended above EMA9, missed the entry
+
+        # ── Trigger condition 1: EMA9 reclaim ────────────────────────
+        # Price crosses above EMA9 from below
+        _ema9_reclaim = (prev_price < setup.ema9 <= price)
+
+        # ── Trigger condition 2: EMA20 bounce with momentum ──────────
+        # Previous tick was near EMA20, this tick shows upward move
+        _near_ema20 = (abs(prev_price - setup.ema20) / setup.ema20 < 0.002
+                       if setup.ema20 > 0 else False)
+        _momentum = (price - prev_price) > setup.atr * 0.01
+        _ema20_bounce = _near_ema20 and _momentum
+
+        if not (_ema9_reclaim or _ema20_bounce):
+            return None  # no trigger this tick
+
+        # ── Volume confirmation (live tick data) ─────────────────────
+        # Recent 30s tick volume must show buying participation
+        state = self._tick_state[ticker]
+        recent_ticks = state['ticks']
+        recent_vol = sum(v for _, _, v in recent_ticks) if recent_ticks else 0
+        avg_bar_vol = self._levels.get(ticker, {}).get('avg_bar_volume', 0)
+        if avg_bar_vol > 0 and recent_vol < avg_bar_vol * 0.3:
+            return None  # no volume participation → fake bounce
+
+        # ── ALL CHECKS PASSED — build signal at LIVE tick price ──────
+        # Recalculate stop/targets from live entry (not stale bar entry)
+        from monitor.smart_stop import compute_stop_buffer
+        _tick_prices = [p for _, p, _ in recent_ticks] if recent_ticks else [price]
+        _tick_range = (max(_tick_prices) - min(_tick_prices)) if len(_tick_prices) >= 2 else setup.atr
+        _buffer = compute_stop_buffer(setup.atr, tick_range=_tick_range)
+
+        # Stop: use structural stop from bar-level, but ensure minimum buffer
+        stop = min(setup.stop_price, price - _buffer)
+        stop = min(stop, price - setup.atr * 0.4)  # absolute minimum
+
+        # Targets from live entry
+        risk = price - stop
+        target_1 = price + risk * 1.0  # 1R
+        target_2 = price + risk * 2.0  # 2R
+
+        # Limit price for stop-limit order: tick_price + 0.1% buffer
+        limit_price = round(price * 1.001, 4)
+        activation_price = round(price, 4)
+
+        # Consume setup
+        del self._pending_setups[ticker]
+        self._setups_triggered += 1
+
+        trigger_type = 'ema9_reclaim' if _ema9_reclaim else 'ema20_bounce'
+        log.info("[TickDetector] SETUP TRIGGERED: %s %s | trigger=%s "
+                 "tick=$%.2f ema9=$%.2f ema20=$%.2f vol=%d/%d",
+                 ticker, setup.strategy, trigger_type,
+                 price, setup.ema9, setup.ema20,
+                 recent_vol, int(avg_bar_vol * 0.3))
+
+        return TickSignal(
+            ticker=ticker,
+            strategy='trend_pullback',
+            direction='long',
+            entry_price=limit_price,
+            stop_price=round(stop, 4),
+            target_1=round(target_1, 4),
+            target_2=round(target_2, 4),
+            atr=setup.atr,
+            rsi=ind.get('rsi', 50),
+            rvol=ind.get('rvol', 0),
+            confidence=setup.confidence,
+            activation_price=activation_price,
+        )
+
     # ── Signal Emission ──────────────────────────────────────────────
 
     def _emit_signal(self, sig: TickSignal) -> None:
@@ -761,7 +904,13 @@ class TickSignalDetector:
             from monitor.events import ProStrategySignalPayload
 
             _tier = 2 if sig.strategy in ('orb', 'gap_and_go') else (
-                1 if sig.strategy == 'sr_flip' else 3)
+                1 if sig.strategy in ('sr_flip', 'trend_pullback') else 3)
+            # For stop-limit orders, include activation_price in detector_signals JSON
+            _det_json = '{"source": "tick_detector"}'
+            if sig.activation_price > 0:
+                _det_json = (f'{{"source": "tick_detector", '
+                             f'"order_type": "stop_limit", '
+                             f'"activation_price": {sig.activation_price}}}')
             payload = ProStrategySignalPayload(
                 ticker=sig.ticker,
                 strategy_name=sig.strategy,
@@ -776,7 +925,7 @@ class TickSignalDetector:
                 rvol=round(sig.rvol, 2),
                 vwap=round(sig.entry_price, 4),  # tick price ≈ VWAP proxy
                 confidence=round(sig.confidence, 2),
-                detector_signals='{"source": "tick_detector"}',
+                detector_signals=_det_json,
             )
 
             self._bus.emit(Event(
@@ -808,6 +957,19 @@ class TickSignalDetector:
             log.info("[TickDetector] FREEZE LIFTED (manual) — %d signals were held",
                      self._signals_frozen)
 
+    def register_setup(self, setup: PendingSetup) -> None:
+        """Register a pending setup for tick-level trigger confirmation.
+
+        Called by ProSetupEngine for two-stage strategies (trend_pullback).
+        No filtering here — all validation happens at trigger time with live data.
+        """
+        self._pending_setups[setup.ticker] = setup
+        self._setups_registered += 1
+        log.info("[TickDetector] SETUP registered: %s %s ema9=$%.2f ema20=$%.2f "
+                 "atr=$%.4f conf=%.0f%% | expires in 180s",
+                 setup.ticker, setup.strategy, setup.ema9, setup.ema20,
+                 setup.atr, setup.confidence * 100)
+
     def stats(self) -> dict:
         regime_counts = defaultdict(int)
         for r in self._gap_regime.values():
@@ -833,5 +995,9 @@ class TickSignalDetector:
                 if (time.monotonic() - self._indicator_updated_at.get(t, 0))
                 > self._INDICATOR_MAX_AGE
             ),
+            'pending_setups': len(self._pending_setups),
+            'setups_registered': self._setups_registered,
+            'setups_triggered': self._setups_triggered,
+            'setups_expired': self._setups_expired,
             'enabled': _FF_ENABLED,
         }

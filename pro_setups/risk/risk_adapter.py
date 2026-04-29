@@ -305,17 +305,34 @@ class RiskAdapter:
 
         # ── Emit ORDER_REQ ────────────────────────────────────────────────────────
         reason  = f"pro:{strategy_name}:T{tier}:long"
+
+        # V10: Two-stage orders carry activation_price for stop-limit BUY
+        _order_type = 'limit'
+        _activation = None
+        if source_event and hasattr(source_event, 'payload'):
+            _det_json = getattr(source_event.payload, 'detector_signals', '{}')
+            if 'stop_limit' in _det_json:
+                import json as _json
+                try:
+                    _det = _json.loads(_det_json)
+                    _order_type = _det.get('order_type', 'limit')
+                    _activation = _det.get('activation_price', None)
+                except Exception:
+                    pass
+
         payload = OrderRequestPayload(
             ticker           = ticker,
             side             = Side.BUY,
             qty              = qty,
             price            = round(entry_price, 2),
             reason           = reason,
-            needs_ask_refresh= True,
+            needs_ask_refresh= (_order_type == 'limit'),  # stop-limit doesn't need refresh
             stop_price       = round(stop_price,  4),
             target_price     = round(target_2,    4),
             atr_value        = round(atr_value,   4),
             layer            = 'pro',  # V7: Core acquires registry
+            order_type       = _order_type,
+            activation_price = _activation,
         )
 
         log.info(

@@ -396,6 +396,9 @@ class OrderRequestPayload:
     # V9: Order mode — how the broker should interpret the order
     order_mode:        str = 'qty'       # 'qty' | 'notional'
     notional:          Optional[float] = None  # dollar amount (when order_mode='notional')
+    # V10: Order type — limit (default) or stop_limit (two-stage entries)
+    order_type:        str = 'limit'     # 'limit' | 'stop_limit'
+    activation_price:  Optional[float] = None  # for stop_limit: price that activates the order
 
     def __post_init__(self):
         _require_ticker(self.ticker)

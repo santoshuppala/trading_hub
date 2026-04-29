@@ -286,19 +286,48 @@ class OptionsEngine:
         if strategy_type is None:
             return
 
-        # Earnings safety check: block credit strategies near earnings
+        # ── Hard gates (block even in paper trading) ─────────────────
+        # These are mathematical certainties, not regime opinions.
+
+        # Gate 1: No selling premium within 5 days of earnings
         if strategy_type in _CREDIT_STRATEGIES:
-            if not self._earnings.is_earnings_safe(p.ticker, min_days=7):
+            if not self._earnings.is_earnings_safe(p.ticker, min_days=5):
                 dte = self._earnings.days_to_earnings(p.ticker)
                 log.info(
-                    "[OptionsEngine] EARNINGS BLOCK %s %s | earnings in %s days",
+                    "[OptionsEngine] HARD GATE: EARNINGS BLOCK %s %s | earnings in %s days "
+                    "(IV crush will destroy credit position)",
                     p.ticker, strategy_type, dte,
                 )
                 return
 
+        # Gate 2: No buying premium at IV rank > 90th percentile
+        if strategy_type in _DEBIT_STRATEGIES and iv_rank > 90:
+            log.info(
+                "[OptionsEngine] HARD GATE: IV RANK TOO HIGH %s %s | iv_rank=%.0f "
+                "(overpaying for options)",
+                p.ticker, strategy_type, iv_rank,
+            )
+            return
+
+        # Gate 3: No selling premium at IV rank < 20th percentile
+        if strategy_type in _CREDIT_STRATEGIES and iv_rank < 20:
+            log.info(
+                "[OptionsEngine] HARD GATE: IV RANK TOO LOW %s %s | iv_rank=%.0f "
+                "(not enough premium to justify risk)",
+                p.ticker, strategy_type, iv_rank,
+            )
+            return
+
+        # ── Regime score tagging (for post-analysis, no blocking) ────
+        _regime_scores = self._load_regime_scores()
+
         log.info(
-            "[OptionsEngine] SIGNAL → %s %s | rvol=%.2f iv=%.2f iv_rank=%.0f",
+            "[OptionsEngine] SIGNAL → %s %s | rvol=%.2f iv=%.2f iv_rank=%.0f "
+            "| regime: trend=%.2f vrp=%.2f breadth=%.2f",
             p.ticker, strategy_type, p.rvol, iv_estimate, iv_rank,
+            _regime_scores.get('trend', 0.5),
+            _regime_scores.get('vrp', 0.5),
+            _regime_scores.get('participation', 0.5),
         )
 
         self._execute_entry(
@@ -1400,6 +1429,26 @@ class OptionsEngine:
             "[OptionsEngine] emitted OPTIONS_SIGNAL | %s %s | $%.2f debit | max_risk $%.2f",
             ticker, strategy_type, trade_spec.net_debit, trade_spec.max_risk,
         )
+
+    def _load_regime_scores(self) -> dict:
+        """Load regime scores from Core's regime_state.json (shared file)."""
+        try:
+            import json
+            _path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'data', 'regime_state.json')
+            if not os.path.exists(_path):
+                return {}
+            with open(_path) as f:
+                state = json.load(f)
+            return {
+                'trend': state.get('trend_score', 0.5),
+                'vrp': state.get('vrp_score', 0.5),
+                'participation': state.get('participation_score', 0.5),
+                'uncertainty': state.get('uncertainty', 0.0),
+            }
+        except Exception:
+            return {}
 
     def _estimate_iv(self, ticker: str, spot_price: float) -> float:
         """Estimate IV from cached chain data only — never make a live API call.

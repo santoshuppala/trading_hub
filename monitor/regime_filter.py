@@ -36,6 +36,10 @@ import numpy as np
 log = logging.getLogger(__name__)
 ET = ZoneInfo('America/New_York')
 
+# Paper trading mode: score everything but block nothing (except kill threshold).
+# Set REGIME_PAPER_MODE=false when going live with calibrated thresholds.
+PAPER_TRADING_MODE = os.getenv('REGIME_PAPER_MODE', 'true').lower() in ('true', '1', 'yes')
+
 # State file for crash recovery
 _STATE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -147,9 +151,10 @@ class RegimeFilter:
         # Try to restore from saved state
         self._load_state()
 
-        log.info("[RegimeFilter] Initialized | trend=%.2f vrp=%.2f participation=%.2f "
-                 "uncertainty=%.2f",
-                 self._trend_score, self._vrp_score,
+        _mode = "PAPER (score only, no blocking)" if PAPER_TRADING_MODE else "LIVE (blocking enabled)"
+        log.info("[RegimeFilter] Initialized | mode=%s | trend=%.2f vrp=%.2f "
+                 "participation=%.2f uncertainty=%.2f",
+                 _mode, self._trend_score, self._vrp_score,
                  self._participation_score, self._uncertainty)
 
     # ── Public API ───────────────────────────────────────────────────────
@@ -203,20 +208,29 @@ class RegimeFilter:
 
     def is_strategy_allowed(self, strategy_name: str) -> bool:
         """Check if strategy is allowed in current regime."""
-        # Kill check: if ALL strategies below kill threshold → block everything
+        # Kill check: ALWAYS applies (even paper) — market genuinely hostile
         if self._strategy_scores and all(
             s < _KILL_THRESHOLD for s in self._strategy_scores.values()
         ):
-            return False  # market is hostile to all strategies
+            return False
 
+        # Paper mode: allow everything (score for data collection, don't block)
+        if PAPER_TRADING_MODE:
+            return True
+
+        # Live mode: enforce calibrated thresholds
         score = self._strategy_scores.get(strategy_name)
         if score is None:
-            return True  # unknown strategy → allow (conservative)
+            return True
         threshold = STRATEGY_MIN_SCORE.get(strategy_name, 0.35)
         return score >= threshold
 
     def get_size_multiplier(self, strategy_name: str) -> float:
         """Position size multiplier for strategy in current regime. 0.25-1.0."""
+        # Paper mode: full size always (show true strategy performance)
+        if PAPER_TRADING_MODE:
+            return 1.0
+
         score = self._strategy_scores.get(strategy_name, 0.5)
         threshold = STRATEGY_MIN_SCORE.get(strategy_name, 0.35)
 

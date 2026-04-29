@@ -906,6 +906,7 @@ class EventSourcingSubscriber:
                 'phase': p.get('phase'),
                 'dte_at_close': p.get('dte_at_entry', 0),
                 'events': p.get('lifecycle_events', []),
+                'regime_at_entry': p.get('regime_at_entry', {}),
             }
             # Inject regime scores at options close time
             try:

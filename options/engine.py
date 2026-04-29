@@ -94,6 +94,8 @@ class OptionsPosition:
     portfolio_theta:  float = 0.0      # net theta (daily decay)
     portfolio_vega:   float = 0.0      # net vega (IV sensitivity)
     greeks_updated_at: float = 0.0    # V10: monotonic timestamp of last Greeks refresh
+    # V10: Regime at entry (for ML — persists to lifecycle_data on close)
+    regime_at_entry:  dict = None      # {trend, vrp, participation, uncertainty, iv_rank}
 
     @property
     def is_credit(self) -> bool:
@@ -1133,6 +1135,9 @@ class OptionsEngine:
             'exit_vega': round(pos.portfolio_vega, 4),
             # ── Full lifecycle journey ────────────────────────────
             'lifecycle': lc_data,
+            # ── V10: Regime at entry (for ML calibration) ─────────
+            'regime_at_entry': pos.regime_at_entry or {},
+            'lifecycle_events': lc_data.get('events', []),
         }
 
         try:
@@ -1281,6 +1286,10 @@ class OptionsEngine:
             current_value=abs(trade_spec.net_debit),
             last_check_time=time.monotonic(),
         )
+
+        # V10: Capture regime at entry for ML persistence
+        pos.regime_at_entry = self._load_regime_scores()
+        pos.regime_at_entry['iv_rank'] = self._iv_tracker.iv_rank(ticker)
 
         try:
             lifecycle = OptionsPositionLifecycle(

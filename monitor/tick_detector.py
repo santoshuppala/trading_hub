@@ -913,12 +913,22 @@ class TickSignalDetector:
 
             _tier = 2 if sig.strategy in ('orb', 'gap_and_go') else (
                 1 if sig.strategy in ('sr_flip', 'trend_pullback') else 3)
-            # For stop-limit orders, include activation_price in detector_signals JSON
-            _det_json = '{"source": "tick_detector"}'
+            # Build detector_signals JSON with regime scores + order type
+            import json as _json
+            _det_dict = {"source": "tick_detector"}
             if sig.activation_price > 0:
-                _det_json = (f'{{"source": "tick_detector", '
-                             f'"order_type": "stop_limit", '
-                             f'"activation_price": {sig.activation_price}}}')
+                _det_dict["order_type"] = "stop_limit"
+                _det_dict["activation_price"] = sig.activation_price
+            # Inject regime scores for DB persistence
+            _rf = getattr(self, '_regime_filter', None)
+            if _rf:
+                _det_dict['regime_trend'] = round(_rf.trend_score, 3)
+                _det_dict['regime_vrp'] = round(_rf.vrp_score, 3)
+                _det_dict['regime_participation'] = round(_rf.participation_score, 3)
+                _det_dict['regime_uncertainty'] = round(_rf.uncertainty, 3)
+                _det_dict['regime_strategy_score'] = round(
+                    _rf.get_strategy_score(sig.strategy), 3)
+            _det_json = _json.dumps(_det_dict)
             payload = ProStrategySignalPayload(
                 ticker=sig.ticker,
                 strategy_name=sig.strategy,

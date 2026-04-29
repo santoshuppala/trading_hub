@@ -554,9 +554,28 @@ class EventSourcingSubscriber:
 
             broker = cd.get('broker') or getattr(event, '_routed_broker', None) or 'unknown'
 
-            # V10: Include lifecycle data (scorer, phases, events) for ML
+            # V10: Include lifecycle data (scorer, phases, events) + regime for ML
             import json as _json
             _lifecycle = cd.get('lifecycle', {})
+            # Inject current regime scores at close time
+            try:
+                import os as _os
+                _regime_path = _os.path.join(
+                    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                    'data', 'regime_state.json')
+                if _os.path.exists(_regime_path):
+                    with open(_regime_path) as _rf:
+                        _rs = _json.load(_rf)
+                    if not _lifecycle:
+                        _lifecycle = {}
+                    _lifecycle['regime_at_close'] = {
+                        'trend': _rs.get('trend_score', 0.5),
+                        'vrp': _rs.get('vrp_score', 0.5),
+                        'participation': _rs.get('participation_score', 0.5),
+                        'uncertainty': _rs.get('uncertainty', 0.0),
+                    }
+            except Exception:
+                pass
             _lifecycle_json = _json.dumps(_lifecycle) if _lifecycle else None
 
             self._writer.enqueue('completed_trades', {
@@ -879,7 +898,7 @@ class EventSourcingSubscriber:
             pnl_pct = round(pnl / entry_cost * 100, 2) if entry_cost else 0.0
             holding_min = _safe_float(p.get('holding_minutes', 0))
 
-            # V10: Include options lifecycle data for ML
+            # V10: Include options lifecycle data + regime for ML
             import json as _json
             _opts_lifecycle = {
                 'strategy_type': p.get('strategy_type'),
@@ -888,6 +907,23 @@ class EventSourcingSubscriber:
                 'dte_at_close': p.get('dte_at_entry', 0),
                 'events': p.get('lifecycle_events', []),
             }
+            # Inject regime scores at options close time
+            try:
+                import os as _os
+                _regime_path = _os.path.join(
+                    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                    'data', 'regime_state.json')
+                if _os.path.exists(_regime_path):
+                    with open(_regime_path) as _rf:
+                        _rs = _json.load(_rf)
+                    _opts_lifecycle['regime_at_close'] = {
+                        'trend': _rs.get('trend_score', 0.5),
+                        'vrp': _rs.get('vrp_score', 0.5),
+                        'participation': _rs.get('participation_score', 0.5),
+                        'uncertainty': _rs.get('uncertainty', 0.0),
+                    }
+            except Exception:
+                pass
 
             self._writer.enqueue('completed_trades', {
                 'trade_id': str(uuid.uuid4()),

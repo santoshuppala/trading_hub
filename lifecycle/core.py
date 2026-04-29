@@ -253,7 +253,19 @@ class EngineLifecycle:
                 log.warning("[%s] Daily report generation failed (non-fatal): %s",
                             self._name, rpt_exc)
 
-        # 8. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
+        # 8. V10: DB retention — delete QuoteReceived older than 3 days.
+        # Ticks are 99% of event_store (16GB). After 3 days, ticks are useless
+        # (1-min bars in market_bars replace them for ML/backtest).
+        # Signals, fills, positions kept forever (tiny).
+        # Only runs at EOD (not on mid-session crash — don't slow restart).
+        if is_eod and self._name == 'core':
+            try:
+                self._run_db_retention()
+            except Exception as ret_exc:
+                log.warning("[%s] DB retention failed (non-fatal): %s",
+                            self._name, ret_exc)
+
+        # 9. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
         # Populates ml_signal_context, ml_trade_outcomes, ml_rejection_log
         # from event_store. On crash at 2 PM → captures data up to 2 PM.
         # Next restart adds more. EOD captures the full day. No data lost.
@@ -425,6 +437,73 @@ class EngineLifecycle:
             writer.writerows(rows)
 
         log.info("[%s] Daily report: %d trades → %s", self._name, len(rows), path)
+
+    def _run_db_retention(self) -> None:
+        """Delete QuoteReceived events older than 3 days.
+
+        QuoteReceived = 2.7M rows/day = ~2-3 GB/day = 99% of event_store.
+        After 3 days, raw ticks are useless (market_bars has 1-min OHLCV).
+        Signals, fills, positions, risk blocks kept forever (tiny).
+
+        Also cleans old log files (> 7 days).
+        """
+        try:
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+
+            # Delete QuoteReceived older than 3 days
+            cur.execute(
+                "DELETE FROM event_store "
+                "WHERE event_type = 'QuoteReceived' "
+                "AND event_time < CURRENT_DATE - INTERVAL '3 days'"
+            )
+            deleted_quotes = cur.rowcount
+
+            # Also clean BarReceived older than 7 days (market_bars replaces these)
+            cur.execute(
+                "DELETE FROM event_store "
+                "WHERE event_type = 'BarReceived' "
+                "AND event_time < CURRENT_DATE - INTERVAL '7 days'"
+            )
+            deleted_bars = cur.rowcount
+
+            # Also clean HeartbeatEmitted older than 3 days
+            cur.execute(
+                "DELETE FROM event_store "
+                "WHERE event_type = 'HeartbeatEmitted' "
+                "AND event_time < CURRENT_DATE - INTERVAL '3 days'"
+            )
+            deleted_hb = cur.rowcount
+
+            conn.commit()
+            conn.close()
+
+            log.info("[%s] DB retention: deleted %d QuoteReceived, %d BarReceived, "
+                     "%d HeartbeatEmitted (older than 3/7/3 days)",
+                     self._name, deleted_quotes, deleted_bars, deleted_hb)
+        except ImportError:
+            pass
+        except Exception as exc:
+            log.warning("[%s] DB retention failed: %s", self._name, exc)
+
+        # Clean old log files (> 7 days)
+        try:
+            import shutil
+            from datetime import date, timedelta
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+            cutoff = (date.today() - timedelta(days=7)).strftime('%Y%m%d')
+            for d in os.listdir(log_dir):
+                if d.isdigit() and len(d) == 8 and d < cutoff:
+                    path = os.path.join(log_dir, d)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                        log.info("[%s] Cleaned old log dir: %s", self._name, d)
+        except Exception as exc:
+            log.warning("[%s] Log cleanup failed: %s", self._name, exc)
 
     def _run_ml_analytics(self) -> None:
         """Populate ML tables from today's event_store data.

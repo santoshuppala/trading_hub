@@ -232,7 +232,20 @@ class EngineLifecycle:
             except Exception as snap_exc:
                 log.warning("[%s] Snapshot save failed: %s", self._name, snap_exc)
 
-        # 6. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
+        # 6. V10: Persist today's bars to market_bars DB (for fast ML queries).
+        # bars_cache in memory → market_bars table. Same data as snapshot but
+        # in DB format for SQL analytics. ON CONFLICT DO NOTHING = safe on restart.
+        if self._name == 'core':
+            try:
+                engine = getattr(self._adapter, '_engine', None)
+                bars_cache = getattr(engine, '_bars_cache', None) if engine else None
+                if bars_cache:
+                    self._persist_market_bars(bars_cache)
+            except Exception as mb_exc:
+                log.warning("[%s] market_bars persist failed (non-fatal): %s",
+                            self._name, mb_exc)
+
+        # 7. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
         # Populates ml_signal_context, ml_trade_outcomes, ml_rejection_log
         # from event_store. On crash at 2 PM → captures data up to 2 PM.
         # Next restart adds more. EOD captures the full day. No data lost.
@@ -242,6 +255,58 @@ class EngineLifecycle:
             log.warning("[%s] ML analytics failed (non-fatal): %s", self._name, ml_exc)
 
         log.info("[%s] Lifecycle shutdown complete", self._name)
+
+    def _persist_market_bars(self, bars_cache: dict) -> None:
+        """Write today's bar data from bars_cache to market_bars DB table.
+
+        Uses INSERT ... ON CONFLICT DO NOTHING (safe on crash + restart).
+        Each shutdown writes whatever bars exist — next restart adds more.
+        Full day captured by EOD shutdown.
+        """
+        try:
+            import psycopg2
+            from config import DATABASE_URL
+            from datetime import date
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            today = date.today()
+            rows_written = 0
+
+            for ticker, df in bars_cache.items():
+                if df is None or df.empty:
+                    continue
+                try:
+                    for idx, row in df.iterrows():
+                        # Extract bar time from index or compute from position
+                        bar_time = idx if hasattr(idx, 'strftime') else None
+                        if bar_time is None:
+                            continue
+
+                        cur.execute(
+                            "INSERT INTO market_bars (ticker, bar_time, open, high, low, close, volume, bar_interval) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                            "ON CONFLICT DO NOTHING",
+                            (ticker, bar_time,
+                             float(row.get('open', row.get('o', 0))),
+                             float(row.get('high', row.get('h', 0))),
+                             float(row.get('low', row.get('l', 0))),
+                             float(row.get('close', row.get('c', 0))),
+                             int(row.get('volume', row.get('v', 0))),
+                             '1min')
+                        )
+                        rows_written += 1
+                except Exception:
+                    continue
+
+            conn.commit()
+            conn.close()
+            log.info("[%s] market_bars: persisted %d bars for %d tickers",
+                     self._name, rows_written, len(bars_cache))
+        except ImportError:
+            pass
+        except Exception as exc:
+            log.warning("[%s] market_bars persist failed: %s", self._name, exc)
 
     def _run_ml_analytics(self) -> None:
         """Populate ML tables from today's event_store data.

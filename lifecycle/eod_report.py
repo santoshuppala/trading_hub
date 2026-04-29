@@ -127,11 +127,8 @@ class SatelliteEODReport:
         except Exception as exc:
             log.warning("[%s] EOD report generation failed: %s", self._name, exc)
 
-        # V10: Post-session ML analytics — populate ml_signal_context,
-        # ml_trade_outcomes, ml_rejection_log from today's event_store data.
-        # Without this, ML tables don't get populated (was manual-only before).
-        if self._name == 'core':
-            self._run_post_session_analytics()
+        # V10: ML analytics moved to lifecycle/core.py shutdown() — runs on
+        # EVERY shutdown (crash, restart, EOD), not just EOD report.
 
         # V10: Weekly options PF review — auto-triggers on Fridays
         if self._name == 'options':

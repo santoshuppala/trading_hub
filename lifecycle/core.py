@@ -114,6 +114,14 @@ class EngineLifecycle:
         # 5. Save reconciled state
         self._state.save(self._adapter.get_state())
 
+        # 6. V10: Backfill ML analytics for missed days (weekends, holidays, crashes).
+        # If yesterday's ml_signal_context is empty, populate it now.
+        # Ensures no trading day's ML data is permanently lost.
+        try:
+            self._backfill_ml_analytics()
+        except Exception as bf_exc:
+            log.warning("[%s] ML backfill check failed (non-fatal): %s", self._name, bf_exc)
+
         log.info("[%s] Lifecycle startup complete", self._name)
 
     # ── tick() — called every loop iteration (10s) ─────────────────────
@@ -224,4 +232,95 @@ class EngineLifecycle:
             except Exception as snap_exc:
                 log.warning("[%s] Snapshot save failed: %s", self._name, snap_exc)
 
+        # 6. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
+        # Populates ml_signal_context, ml_trade_outcomes, ml_rejection_log
+        # from event_store. On crash at 2 PM → captures data up to 2 PM.
+        # Next restart adds more. EOD captures the full day. No data lost.
+        try:
+            self._run_ml_analytics()
+        except Exception as ml_exc:
+            log.warning("[%s] ML analytics failed (non-fatal): %s", self._name, ml_exc)
+
         log.info("[%s] Lifecycle shutdown complete", self._name)
+
+    def _run_ml_analytics(self) -> None:
+        """Populate ML tables from today's event_store data.
+
+        Runs on every shutdown (not just EOD). Idempotent — re-running
+        for the same day updates counts but doesn't duplicate rows
+        (INSERT ON CONFLICT DO NOTHING / upsert pattern in the jobs).
+        """
+        try:
+            from datetime import date
+            from scripts.post_session_analytics import (
+                job_signal_context, job_trade_outcomes, job_rejection_log,
+            )
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            today = date.today()
+
+            sc = job_signal_context(conn, today)
+            to = job_trade_outcomes(conn, today)
+            rl = job_rejection_log(conn, today)
+
+            conn.close()
+            log.info("[%s] ML analytics: signal_context=%d trade_outcomes=%d "
+                     "rejection_log=%d", self._name, sc, to, rl)
+        except ImportError:
+            log.debug("[%s] ML analytics skipped (post_session_analytics not available)",
+                      self._name)
+        except Exception as exc:
+            log.warning("[%s] ML analytics failed: %s", self._name, exc)
+
+    def _backfill_ml_analytics(self) -> None:
+        """On startup, check last 3 trading days for missing ML data. Backfill if needed.
+
+        Catches: weekends, holidays, crashes where shutdown analytics didn't run.
+        Only backfills days that have events in event_store but nothing in ml_signal_context.
+        """
+        try:
+            from datetime import date, timedelta
+            from scripts.post_session_analytics import (
+                job_signal_context, job_trade_outcomes, job_rejection_log,
+            )
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+
+            # Check last 3 days (covers weekends: Fri→Mon)
+            today = date.today()
+            for days_ago in range(1, 4):
+                check_date = today - timedelta(days=days_ago)
+
+                # Skip if no events exist for that day (not a trading day)
+                cur.execute(
+                    "SELECT COUNT(*) FROM event_store "
+                    "WHERE event_time::date = %s AND event_type = 'StrategySignal'",
+                    (check_date,))
+                event_count = cur.fetchone()[0]
+                if event_count == 0:
+                    continue  # no signals that day — skip
+
+                # Check if ML data already exists
+                cur.execute(
+                    "SELECT COUNT(*) FROM ml_signal_context WHERE created_at::date = %s",
+                    (check_date,))
+                ml_count = cur.fetchone()[0]
+
+                if ml_count < event_count * 0.5:  # less than 50% coverage → backfill
+                    log.info("[%s] ML backfill: %s has %d signals but only %d in "
+                             "ml_signal_context — backfilling",
+                             self._name, check_date, event_count, ml_count)
+                    job_signal_context(conn, check_date)
+                    job_trade_outcomes(conn, check_date)
+                    job_rejection_log(conn, check_date)
+
+            conn.close()
+        except ImportError:
+            pass  # post_session_analytics not available
+        except Exception as exc:
+            log.warning("[%s] ML backfill failed: %s", self._name, exc)

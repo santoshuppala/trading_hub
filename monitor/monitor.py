@@ -216,7 +216,12 @@ class RealTimeMonitor:
         # durable_fail_fast=True ensures ORDER_REQ/FILL are NOT delivered to
         # handlers if the Redpanda before-emit hook fails — prevents untracked
         # order execution that would be invisible to CrashRecovery.
-        self._bus = EventBus(durable_fail_fast=True)
+        # V10: ASYNC mode — enables parallel BAR processing (8 workers),
+        # concurrent QUOTE handling (2 workers), while keeping ORDER_REQ/FILL
+        # on single worker with BLOCK policy (strict ordering, never drops).
+        # Previously SYNC — 120 BAR events took 19s sequential. Now 2.4s parallel.
+        from monitor.event_bus import DispatchMode
+        self._bus = EventBus(mode=DispatchMode.ASYNC, durable_fail_fast=True)
 
         # ── Engines (subscription order = handler priority) ────────────────
         #   1. EventLogger   — passive; subscribes last so it sees everything
@@ -345,6 +350,22 @@ class RealTimeMonitor:
         """
         self._bar_builder = bar_builder
         log.info("[Monitor] BarBuilder attached — will seed after first REST fetch")
+
+    def set_tick_detector(self, tick_detector) -> None:
+        """V10: Attach TickSignalDetector for sub-second entry signals.
+
+        The tick detector receives trade ticks from TradierStream and
+        emits PRO_STRATEGY_SIGNAL events when tick-level patterns fire.
+        Levels are updated by ProSetupEngine on each BAR.
+        """
+        self._tick_detector = tick_detector
+        # Wire into ProSetupEngine so it can push levels
+        if hasattr(self, '_pro_engine') and self._pro_engine:
+            self._pro_engine._tick_detector = tick_detector
+        # Wire into TradierStream so it feeds ticks
+        if hasattr(self, '_tradier_stream') and self._tradier_stream:
+            self._tradier_stream.set_tick_detector(tick_detector)
+        log.info("[Monitor] TickDetector attached — sub-second entries enabled")
 
     # ── V9 (R3): Stale order cleanup ────────────────────────────────────────
 
@@ -1227,6 +1248,7 @@ class RealTimeMonitor:
 
         # ── Compare against local state ───────────────────────────────────
         fixes = 0
+        _fix_details = []  # collect specifics for alert email
 
         # 1. Phantoms — in state but not at any broker
         for ticker in list(self.positions.keys()):
@@ -1248,6 +1270,11 @@ class RealTimeMonitor:
                 log.warning("[live-reconcile] PHANTOM %s — in state but not at broker. "
                             "Closing (entry=$%.2f exit=$%.2f qty=%d pnl=$%.2f strategy=%s)",
                             ticker, entry_price, exit_price, qty, pnl, strategy)
+                _fix_details.append(
+                    f"PHANTOM {ticker}: closed (was in local state, not at broker). "
+                    f"entry=${entry_price:.2f} exit=${exit_price:.2f} qty={qty} "
+                    f"pnl=${pnl:+.2f} strategy={strategy}"
+                )
 
                 # V10: Record SELL lot in FillLedger with REAL exit price
                 if hasattr(self, '_fill_ledger') and self._fill_ledger:
@@ -1305,6 +1332,10 @@ class RealTimeMonitor:
             if ticker not in self.positions:
                 log.warning("[live-reconcile] ORPHAN %s — %d shares at %s, not in state. Importing.",
                             ticker, bp['qty'], bp['broker'])
+                _fix_details.append(
+                    f"ORPHAN {ticker}: imported {bp['qty']} shares from {bp['broker']} "
+                    f"(was at broker, not in local state). entry=${bp['entry']:.2f}"
+                )
                 # Import with ATR-based defaults (same as startup reconciliation)
                 atr = self._fetch_last_atr(ticker)
                 entry = bp['entry']
@@ -1340,6 +1371,10 @@ class RealTimeMonitor:
                 if local_qty != broker_qty:
                     log.warning("[live-reconcile] QTY MISMATCH %s: state=%d broker=%d. Fixing.",
                                 ticker, local_qty, broker_qty)
+                    _fix_details.append(
+                        f"QTY MISMATCH {ticker}: local={local_qty} → broker={broker_qty} "
+                        f"(adjusted to broker truth)"
+                    )
                     self.positions[ticker]['quantity'] = broker_qty
                     self.positions[ticker]['qty'] = broker_qty
                     if '_broker_qty' in bp:
@@ -1354,6 +1389,10 @@ class RealTimeMonitor:
                 if broker_entry > 0 and local_entry > 0 and broker_entry != local_entry:
                     log.info("[live-reconcile] ENTRY_PRICE sync %s: local=$%.2f → broker=$%.2f",
                              ticker, local_entry, broker_entry)
+                    _fix_details.append(
+                        f"ENTRY PRICE {ticker}: local=${local_entry:.2f} → "
+                        f"broker=${broker_entry:.2f} (adjusted to broker cost basis)"
+                    )
                     self.positions[ticker]['entry_price'] = broker_entry
                     fixes += 1
 
@@ -1366,17 +1405,18 @@ class RealTimeMonitor:
                            list(self.trade_log))
             except Exception:
                 pass
-            # V10: Alert on reconciliation fixes (phantom/orphan = potential P&L issue)
+            # V10: Alert on reconciliation fixes with specifics
             try:
                 from .alerts import send_alert
                 from config import ALERT_EMAIL
                 if ALERT_EMAIL:
+                    _details_str = '\n'.join(f"  • {d}" for d in _fix_details)
                     send_alert(
                         ALERT_EMAIL,
-                        f"RECONCILIATION: {fixes} position fix(es) applied.\n"
-                        f"Local positions: {len(self.positions)}\n"
-                        f"Broker positions: {len(broker_positions)}\n"
-                        f"Check logs for details.",
+                        f"RECONCILIATION: {fixes} position fix(es) applied.\n\n"
+                        f"Fixes:\n{_details_str}\n\n"
+                        f"After fix: {len(self.positions)} local positions, "
+                        f"{len(broker_positions)} broker positions.",
                         severity='WARNING',
                     )
             except Exception:
@@ -1530,14 +1570,28 @@ class RealTimeMonitor:
                             or (time.monotonic() - _last_seed) > _reseed_interval)
             if _should_seed:
                 try:
+                    # V10: min_bars=15 — minimum for RSI(14) computation.
+                    # REST returns ALL available bars (22 at 09:52, 75 at 10:45,
+                    # 300 at 14:30). seed_from_cache uses all of them.
+                    # min_bars is just the threshold: "is there enough to seed?"
+                    # Old value of 30 forced a 30-min wait on every restart.
                     _seeded = _bb.seed_from_cache(
                         self._bars_cache,
                         rvol_cache=getattr(self, '_rvol_cache', None),
+                        min_bars=15,
                     )
                     self._last_bb_seed_time = time.monotonic()
                     if _seeded > 0:
                         log.info("[Monitor] BarBuilder seeded with %d tickers from REST cache",
                                  _seeded)
+                        # V10: Notify TickDetector that REST-validated data is available.
+                        # This can lift the trade freeze if enough tickers are data-ready.
+                        _td = getattr(self, '_tick_detector', None)
+                        if _td and hasattr(_td, '_order_freeze') and _td._order_freeze:
+                            # Don't lift immediately — let the 2-bar rule + auto-lift
+                            # handle it. But log that REST reseed is done.
+                            log.info("[Monitor] REST reseed complete — TickDetector freeze "
+                                     "will auto-lift when 10+ tickers have 2 live BARs")
                 except Exception as exc:
                     log.warning("[Monitor] BarBuilder seeding failed (non-fatal): %s", exc)
 
@@ -1785,7 +1839,8 @@ class RealTimeMonitor:
                                       for t in new_tickers
                                       if t in self._rvol_cache}
                     if new_cache:
-                        _seeded = _bb.seed_from_cache(new_cache, new_rvol_cache)
+                        _seeded = _bb.seed_from_cache(new_cache, new_rvol_cache,
+                                                       min_bars=15)
                         if _seeded:
                             log.info("[stream-sync] BarBuilder seeded %d new tickers",
                                      _seeded)

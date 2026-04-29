@@ -163,7 +163,10 @@ class RiskEngine:
     def _handle_buy(self, p: SignalPayload, event: Event) -> None:
         ticker = p.ticker
 
-        # 0. Cross-layer dedup (READ-ONLY pre-flight)
+        # 0a. V10: WAL dedup — checked later via atomic check_and_intent
+        # (moved from here to just before ORDER_REQ emit for TOCTOU safety)
+
+        # 0b. Cross-layer dedup (READ-ONLY pre-flight)
         # V7: Core's RegistryGate handles the actual acquire when ORDER_REQ
         # reaches the bus. This is a fast pre-flight to avoid unnecessary work.
         from .position_registry import registry
@@ -341,9 +344,13 @@ class RiskEngine:
             )
 
             # V10: WAL INTENT — record intent before submitting order
+            # V10: Atomic WAL dedup + intent (prevents TOCTOU race in ASYNC mode)
             _wal_cid = wal.new_client_id()
-            wal.intent(_wal_cid, ticker=ticker, side='BUY', qty=qty,
-                       price=effective_entry, reason='VWAP reclaim')
+            if not wal.check_and_intent(_wal_cid, ticker=ticker, side='BUY', qty=qty,
+                                         price=effective_entry, reason='VWAP reclaim'):
+                self._block(ticker, p.action,
+                            "WAL dedup: pending BUY order already active", event)
+                return
 
             _order_event = Event(
                 type=EventType.ORDER_REQ,

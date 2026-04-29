@@ -107,10 +107,13 @@ def _is_market_hours() -> bool:
     except ImportError:
         pass  # calendar not available — proceed with standard hours
 
-    # Standard hours: 9:25 AM to 4:05 PM ET
+    # Standard hours: 9:25 AM to 4:00 PM ET
+    # Core exits at 16:00 (hour >= 16). Watchdog must match — otherwise it
+    # restarts supervisor after EOD, supervisor starts core, core exits again,
+    # watchdog thinks it crashed → 3 pointless restart attempts.
     if now.hour < 9 or (now.hour == 9 and now.minute < 25):
         return False
-    if now.hour > 16 or (now.hour == 16 and now.minute > 5):
+    if now.hour >= 16:
         return False
     return True
 

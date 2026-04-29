@@ -55,13 +55,18 @@ date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
 os.makedirs(date_dir, exist_ok=True)
 log_file = os.path.join(date_dir, 'supervisor.log')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [supervisor] %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-    ],
-)
+class _ETFormatter(logging.Formatter):
+    _et = ZoneInfo('America/New_York')
+    def formatTime(self, record, datefmt=None):
+        from datetime import datetime as _dt
+        ct = _dt.fromtimestamp(record.created, tz=self._et)
+        if datefmt:
+            return ct.strftime(datefmt)
+        return ct.strftime('%Y-%m-%d %H:%M:%S') + f',{int(record.msecs):03d}'
+
+_handler = logging.FileHandler(log_file)
+_handler.setFormatter(_ETFormatter('%(asctime)s %(levelname)s [supervisor] %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 log = logging.getLogger(__name__)
 
 # V7 P4-2: Config-driven engine registration.
@@ -729,6 +734,20 @@ def main():
                             )
 
             write_status(managers)
+
+            # V10: Periodic heartbeat log — prevents outer watchdog from
+            # killing us as "zombie" due to log staleness. Outer watchdog
+            # checks if supervisor.log was written in last 5 min.
+            # Without this, supervisor goes silent during normal operation
+            # and watchdog restarts it every ~7 minutes.
+            if not hasattr(main, '_last_heartbeat'):
+                main._last_heartbeat = 0.0
+            _now_mono = time.monotonic()
+            if _now_mono - main._last_heartbeat > 120:  # every 2 min
+                main._last_heartbeat = _now_mono
+                _pids = {n: m.process.pid if m.process else '?' for n, m in managers.items()}
+                log.info("[supervisor] heartbeat | processes=%s | all healthy", _pids)
+
             time.sleep(30)  # Check every 30 seconds
 
     except KeyboardInterrupt:

@@ -128,16 +128,32 @@ class TradierBroker:
                 # Tradier's 'tag' field (up to 255 chars) is returned with
                 # order status, allowing us to detect duplicate submissions.
                 _tag = self._current_wal_cid or ''
+
+                # V10: Support stop-limit BUY for two-stage entries
+                # Stop-limit: order dormant until activation_price reached,
+                # then fills at limit (price) or better. Eliminates adverse selection.
+                _order_type = getattr(p, 'order_type', 'limit')
+                _activation = getattr(p, 'activation_price', None)
+
                 order_data = {
                     "class": "equity",
                     "symbol": ticker,
                     "side": "buy",
                     "quantity": str(qty),
-                    "type": "limit",
-                    "price": f"{price:.2f}",
                     "duration": "day",
                     "tag": _tag,
                 }
+
+                if _order_type == 'stop_limit' and _activation and _activation > 0:
+                    order_data["type"] = "stop_limit"
+                    order_data["stop"] = f"{_activation:.2f}"
+                    order_data["price"] = f"{price:.2f}"
+                    log.info("[TradierBroker] STOP-LIMIT BUY: %s qty=%d "
+                             "activation=$%.2f limit=$%.2f",
+                             ticker, qty, _activation, price)
+                else:
+                    order_data["type"] = "limit"
+                    order_data["price"] = f"{price:.2f}"
 
                 resp = self._session.post(
                     f"{self._base}/v1/accounts/{self._account}/orders",

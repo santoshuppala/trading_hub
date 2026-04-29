@@ -171,12 +171,27 @@ class AlpacaOptionsBroker:
             reversed_legs = []
             for leg in legs:
                 reversed_side = "sell" if leg.side == "buy" else "buy"
+                # V10: Enforce minimum limit price for closes.
+                # If limit_price is $0 (option worthless/no bid), Alpaca rejects
+                # with "limit price must be > 0". Fix:
+                #   - If closing a long (selling): use max(limit_price, 0.01)
+                #   - This submits at $0.01 minimum — fills if any buyer exists
+                #   - If truly no buyer, order won't fill (acceptable: let expire)
+                _close_price = leg.limit_price
+                if reversed_side == "sell" and _close_price <= 0:
+                    _close_price = 0.01
+                    log.info("[AlpacaOptionsBroker] %s limit=$0 → using $0.01 minimum "
+                             "(option near-worthless)", leg.symbol)
+                elif reversed_side == "buy" and _close_price <= 0:
+                    # Closing a short leg (buying back): use $0.01 as well
+                    _close_price = 0.01
+
                 reversed_legs.append(OptionLeg(
                     symbol=leg.symbol,
                     side=reversed_side,
                     qty=leg.qty,
                     ratio=leg.ratio,
-                    limit_price=leg.limit_price,
+                    limit_price=_close_price,
                 ))
 
             close_spec = OptionsTradeSpec(

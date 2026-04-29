@@ -48,10 +48,9 @@ class _TokenBucket:
 
 
 # V10: Rate limit for Tradier API.
-# Tradier limit is 120 req/min. Each batch fetch does 2 calls/ticker
-# (timesales + history) across 40 workers. Set high enough to not block
-# batch fetches but still prevent hammering on retries.
-# 500/min with burst of 60 covers 253 tickers × 2 calls = 506 within 20s batch.
+# Tradier limit is 120 req/min. First cycle does 2 calls/ticker
+# (timesales + history), subsequent cycles do 1 call/ticker (timesales only,
+# RVOL history cached). 500/min with burst of 60 covers the first cycle.
 _tradier_bucket = _TokenBucket(rate=500, capacity=60)
 
 
@@ -77,6 +76,11 @@ class TradierDataClient(BaseDataClient):
         })
         # V8: Reuse ThreadPoolExecutor across calls (avoids thread creation overhead)
         self._executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+        # V10: Cache RVOL daily history — doesn't change during the day.
+        # Fetched once on first cycle, reused for all subsequent cycles.
+        # Cuts API calls from 390/cycle (timesales + history) to 195 (timesales only).
+        self._rvol_cache: dict = {}
+        self._rvol_fetched = False
 
     # ------------------------------------------------------------------
     # Low-level REST helpers (private)
@@ -212,6 +216,10 @@ class TradierDataClient(BaseDataClient):
         """
         Parallel fetch: today's 1-min bars + 14-day daily history for all tickers.
         rvol_cache contains daily bars (time-fraction RVOL in signals.py).
+
+        V10: RVOL daily history is cached after first fetch — it doesn't change
+        during the trading day. This cuts API calls from 2×N to 1×N per cycle,
+        roughly doubling coverage within the 20s timeout.
         """
         now = datetime.now(ET)
         today_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -220,16 +228,22 @@ class TradierDataClient(BaseDataClient):
             log.info(f"[{now.strftime('%H:%M:%S')} ET] Pre-market — waiting for 9:30 AM ET.")
             return {}, {}
 
-        rvol_start = (now - timedelta(days=14)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        # First cycle: fetch both timesales AND rvol history
+        # Subsequent cycles: timesales only (rvol cached)
+        _need_rvol = not self._rvol_fetched
+        rvol_start = None
+        if _need_rvol:
+            rvol_start = (now - timedelta(days=14)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
 
         bars_cache = {}
-        rvol_cache = {}
 
         def _fetch_one(ticker):
             bars = self._fetch_timesales(ticker, today_open, now)
-            hist = self.get_daily_history(ticker, rvol_start, now)
+            hist = pd.DataFrame()
+            if _need_rvol:
+                hist = self.get_daily_history(ticker, rvol_start, now)
             return ticker, bars, hist
 
         # V8: Reuse persistent executor instead of creating a new one per call
@@ -247,13 +261,20 @@ class TradierDataClient(BaseDataClient):
                 ticker, bars, hist = f.result(timeout=1)
                 if not bars.empty:
                     bars_cache[ticker] = bars
-                if not hist.empty:
-                    rvol_cache[ticker] = hist
+                if _need_rvol and not hist.empty:
+                    self._rvol_cache[ticker] = hist
             except Exception as e:
                 log.error(f"Fetch error for {futures[f]}: {e}")
 
+        # Mark RVOL as fetched once we have reasonable coverage
+        if _need_rvol and len(self._rvol_cache) > len(tickers) * 0.3:
+            self._rvol_fetched = True
+            log.info("[TradierClient] RVOL history cached for %d tickers — "
+                     "subsequent cycles fetch timesales only (1 call/ticker)",
+                     len(self._rvol_cache))
+
         log.info(f"Tradier: fetched bars for {len(bars_cache)}/{len(tickers)} tickers.")
-        return bars_cache, rvol_cache
+        return bars_cache, self._rvol_cache
 
     def get_bars(self, ticker, bars_cache, rvol_cache, calendar_days=2):
         """Return cached bars, falling back to a live fetch."""

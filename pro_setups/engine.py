@@ -237,6 +237,30 @@ class ProSetupEngine:
                 if sig.fired:
                     any_phase1_fired = True
 
+        # V10: Push pre-computed levels to TickDetector regardless of Phase 1 result.
+        # TickDetector needs S/R levels, ORB range, etc. even when no bar-level signal fires.
+        if hasattr(self, '_tick_detector') and self._tick_detector:
+            try:
+                sr_meta = outputs.get('sr', DetectorSignal.no_signal()).metadata
+                orb_meta = outputs.get('orb', DetectorSignal.no_signal()).metadata
+                self._tick_detector.update_levels(ticker, {
+                    'sr_levels': sr_meta.get('near_levels', [])[:10],
+                    'orb_high': orb_meta.get('orb_high', 0),
+                    'orb_low': orb_meta.get('orb_low', 0),
+                    'gap_direction': outputs.get('gap', DetectorSignal.no_signal()).metadata.get('direction'),
+                    'gap_ref': outputs.get('gap', DetectorSignal.no_signal()).metadata.get('prev_close', 0),
+                    'nearest_support': sr_meta.get('level', 0) if sr_meta.get('direction') == 'long' else 0,
+                    'nearest_resistance': sr_meta.get('level', 0) if sr_meta.get('direction') == 'short' else 0,
+                    'session_high': float(df['high'].max()) if len(df) > 0 else 0,
+                    'session_low': float(df['low'].min()) if len(df) > 0 else 0,
+                    'session_open': float(df['open'].iloc[0]) if len(df) > 0 else 0,
+                    'close': float(df['close'].iloc[-1]) if len(df) > 0 else 0,
+                    'avg_bar_volume': float(df['volume'].mean()) if len(df) > 0 else 0,
+                })
+                self._tick_detector.update_indicators(ticker, precomputed or {})
+            except Exception as _td_exc:
+                pass  # never block bar processing for tick detector
+
         if not any_phase1_fired:
             # No Phase 1 detector fired → no setup exists for this ticker
             # Skip Phase 2 entirely (saves ~80% of detector compute)
@@ -280,12 +304,32 @@ class ProSetupEngine:
                 return
             stop_price  = strategy.generate_stop(entry_price, confirmed, atr, df, outputs=outputs)
 
-            # Enforce minimum stop distance (0.3%) as a safety net across ALL strategies
-            min_stop_offset = entry_price * 0.003
-            if confirmed == 'long' and (entry_price - stop_price) < min_stop_offset:
-                stop_price = entry_price - min_stop_offset
-            elif confirmed == 'short' and (stop_price - entry_price) < min_stop_offset:
-                stop_price = entry_price + min_stop_offset
+            # V10: Context-aware smart stop.
+            # Structural stop from strategy is the thesis-invalidation level.
+            # Smart buffer ensures minimum room scaled by:
+            #   - Current volatility (recent range vs ATR)
+            #   - Time of day (open=wide, lunch=tight, close=wide)
+            # Max risk check rejects trades where stop > 2 ATR (bad R:R).
+            from monitor.smart_stop import compute_stop_buffer, should_reject_wide_stop
+
+            _buffer = compute_stop_buffer(atr, df=df)
+
+            if confirmed == 'long':
+                actual_offset = entry_price - stop_price
+                if should_reject_wide_stop(actual_offset, atr):
+                    log.info("[ProSetupEngine][%s] REJECTED: stop too far "
+                             "(%.2f ATR, max 2.0)", ticker, actual_offset / atr)
+                    return
+                if actual_offset < _buffer:
+                    stop_price = entry_price - _buffer
+            elif confirmed == 'short':
+                actual_offset = stop_price - entry_price
+                if should_reject_wide_stop(actual_offset, atr):
+                    log.info("[ProSetupEngine][%s] REJECTED: stop too far "
+                             "(%.2f ATR, max 2.0)", ticker, actual_offset / atr)
+                    return
+                if actual_offset < _buffer:
+                    stop_price = entry_price + _buffer
 
             target_1, target_2 = strategy.generate_exit(entry_price, stop_price, confirmed)
         except Exception as exc:
@@ -332,6 +376,31 @@ class ProSetupEngine:
             if sig.fired
         }
         det_json = json.dumps(det_snap)
+
+        # ── Step 7b: Two-stage strategies → register setup with TickDetector ─
+        # trend_pullback: detect on bar, trigger on tick (eliminates adverse selection)
+        _TWO_STAGE_STRATEGIES = {'trend_pullback'}
+        if (strategy_name in _TWO_STAGE_STRATEGIES
+                and hasattr(self, '_tick_detector') and self._tick_detector):
+            from monitor.tick_detector import PendingSetup
+            _ema9_val = float(precomputed['ema_9'].iloc[-1]) if precomputed.get('ema_9') is not None and len(precomputed['ema_9']) > 0 else entry_price
+            _ema20_val = float(precomputed['ema_21'].iloc[-1]) if precomputed.get('ema_21') is not None and len(precomputed['ema_21']) > 0 else entry_price
+            _setup = PendingSetup(
+                ticker=ticker, strategy=strategy_name, direction=confirmed,
+                ema9=_ema9_val, ema20=_ema20_val,
+                stop_price=stop_price, target_1=target_1, target_2=target_2,
+                atr=atr, rsi=rsi, rvol=rvol, confidence=confidence,
+                created_at=time.monotonic(), expires_at=time.monotonic() + 180.0,
+            )
+            self._tick_detector.register_setup(_setup)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            log.info(
+                "[ProSetupEngine][%s] SETUP REGISTERED (%s) — awaiting tick confirm | "
+                "ema9=$%.2f ema20=$%.2f stop=$%.2f atr=$%.4f conf=%.0f%% elapsed=%.1fms",
+                ticker, strategy_name, _ema9_val, _ema20_val,
+                stop_price, atr, confidence * 100, elapsed_ms,
+            )
+            return  # DO NOT emit PRO_STRATEGY_SIGNAL — TickDetector will trigger
 
         # ── Step 8: emit PRO_STRATEGY_SIGNAL ─────────────────────────────
         # V10: Capture edge context at signal time

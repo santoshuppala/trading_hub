@@ -114,6 +114,14 @@ class EngineLifecycle:
         # 5. Save reconciled state
         self._state.save(self._adapter.get_state())
 
+        # 6. V10: Backfill ML analytics for missed days (weekends, holidays, crashes).
+        # If yesterday's ml_signal_context is empty, populate it now.
+        # Ensures no trading day's ML data is permanently lost.
+        try:
+            self._backfill_ml_analytics()
+        except Exception as bf_exc:
+            log.warning("[%s] ML backfill check failed (non-fatal): %s", self._name, bf_exc)
+
         log.info("[%s] Lifecycle startup complete", self._name)
 
     # ── tick() — called every loop iteration (10s) ─────────────────────
@@ -197,13 +205,187 @@ class EngineLifecycle:
                 log.info("[%s] Mid-session shutdown: PRESERVING %d open positions "
                          "(broker stops protect them)", self._name, len(positions))
 
-        # 3. EOD report (generate regardless — useful for partial-day analysis)
-        try:
-            self._eod.generate()
-        except Exception:
-            pass
+        # 3. EOD report — only at actual EOD (not mid-session crashes)
+        if is_eod:
+            try:
+                self._eod.generate()
+            except Exception:
+                pass
+        else:
+            log.info("[%s] Mid-session shutdown — skipping EOD report", self._name)
 
         # 4. Final state save (after any closes)
         self._state.save(self._adapter.get_state())
 
+        # 5. V10: Save market snapshot on EVERY shutdown (not just EOD).
+        # Mid-day crash → snapshot has today's bars → faster restart recovery.
+        # EOD → snapshot has full day → tomorrow's cold start.
+        if self._name == 'core':
+            try:
+                from monitor.market_snapshot import save_snapshot
+                engine = getattr(self._adapter, '_engine', None)
+                bars_cache = getattr(engine, '_bars_cache', None) if engine else None
+                if bars_cache:
+                    save_snapshot(bars_cache)
+                else:
+                    log.info("[%s] No bars_cache for snapshot", self._name)
+            except Exception as snap_exc:
+                log.warning("[%s] Snapshot save failed: %s", self._name, snap_exc)
+
+        # 6. V10: Persist today's bars to market_bars DB (for fast ML queries).
+        # bars_cache in memory → market_bars table. Same data as snapshot but
+        # in DB format for SQL analytics. ON CONFLICT DO NOTHING = safe on restart.
+        if self._name == 'core':
+            try:
+                engine = getattr(self._adapter, '_engine', None)
+                bars_cache = getattr(engine, '_bars_cache', None) if engine else None
+                if bars_cache:
+                    self._persist_market_bars(bars_cache)
+            except Exception as mb_exc:
+                log.warning("[%s] market_bars persist failed (non-fatal): %s",
+                            self._name, mb_exc)
+
+        # 7. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
+        # Populates ml_signal_context, ml_trade_outcomes, ml_rejection_log
+        # from event_store. On crash at 2 PM → captures data up to 2 PM.
+        # Next restart adds more. EOD captures the full day. No data lost.
+        try:
+            self._run_ml_analytics()
+        except Exception as ml_exc:
+            log.warning("[%s] ML analytics failed (non-fatal): %s", self._name, ml_exc)
+
         log.info("[%s] Lifecycle shutdown complete", self._name)
+
+    def _persist_market_bars(self, bars_cache: dict) -> None:
+        """Write today's bar data from bars_cache to market_bars DB table.
+
+        Uses INSERT ... ON CONFLICT DO NOTHING (safe on crash + restart).
+        Each shutdown writes whatever bars exist — next restart adds more.
+        Full day captured by EOD shutdown.
+        """
+        try:
+            import psycopg2
+            from config import DATABASE_URL
+            from datetime import date
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            today = date.today()
+            rows_written = 0
+
+            for ticker, df in bars_cache.items():
+                if df is None or df.empty:
+                    continue
+                try:
+                    for idx, row in df.iterrows():
+                        # Extract bar time from index or compute from position
+                        bar_time = idx if hasattr(idx, 'strftime') else None
+                        if bar_time is None:
+                            continue
+
+                        cur.execute(
+                            "INSERT INTO market_bars (ticker, bar_time, open, high, low, close, volume, bar_interval) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                            "ON CONFLICT DO NOTHING",
+                            (ticker, bar_time,
+                             float(row.get('open', row.get('o', 0))),
+                             float(row.get('high', row.get('h', 0))),
+                             float(row.get('low', row.get('l', 0))),
+                             float(row.get('close', row.get('c', 0))),
+                             int(row.get('volume', row.get('v', 0))),
+                             '1min')
+                        )
+                        rows_written += 1
+                except Exception:
+                    continue
+
+            conn.commit()
+            conn.close()
+            log.info("[%s] market_bars: persisted %d bars for %d tickers",
+                     self._name, rows_written, len(bars_cache))
+        except ImportError:
+            pass
+        except Exception as exc:
+            log.warning("[%s] market_bars persist failed: %s", self._name, exc)
+
+    def _run_ml_analytics(self) -> None:
+        """Populate ML tables from today's event_store data.
+
+        Runs on every shutdown (not just EOD). Idempotent — re-running
+        for the same day updates counts but doesn't duplicate rows
+        (INSERT ON CONFLICT DO NOTHING / upsert pattern in the jobs).
+        """
+        try:
+            from datetime import date
+            from scripts.post_session_analytics import (
+                job_signal_context, job_trade_outcomes, job_rejection_log,
+            )
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            today = date.today()
+
+            sc = job_signal_context(conn, today)
+            to = job_trade_outcomes(conn, today)
+            rl = job_rejection_log(conn, today)
+
+            conn.close()
+            log.info("[%s] ML analytics: signal_context=%d trade_outcomes=%d "
+                     "rejection_log=%d", self._name, sc, to, rl)
+        except ImportError:
+            log.debug("[%s] ML analytics skipped (post_session_analytics not available)",
+                      self._name)
+        except Exception as exc:
+            log.warning("[%s] ML analytics failed: %s", self._name, exc)
+
+    def _backfill_ml_analytics(self) -> None:
+        """On startup, check last 3 trading days for missing ML data. Backfill if needed.
+
+        Catches: weekends, holidays, crashes where shutdown analytics didn't run.
+        Only backfills days that have events in event_store but nothing in ml_signal_context.
+        """
+        try:
+            from datetime import date, timedelta
+            from scripts.post_session_analytics import (
+                job_signal_context, job_trade_outcomes, job_rejection_log,
+            )
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+
+            # Check last 3 days (covers weekends: Fri→Mon)
+            today = date.today()
+            for days_ago in range(1, 4):
+                check_date = today - timedelta(days=days_ago)
+
+                # Skip if no events exist for that day (not a trading day)
+                cur.execute(
+                    "SELECT COUNT(*) FROM event_store "
+                    "WHERE event_time::date = %s AND event_type = 'StrategySignal'",
+                    (check_date,))
+                event_count = cur.fetchone()[0]
+                if event_count == 0:
+                    continue  # no signals that day — skip
+
+                # Check if ML data already exists
+                cur.execute(
+                    "SELECT COUNT(*) FROM ml_signal_context WHERE created_at::date = %s",
+                    (check_date,))
+                ml_count = cur.fetchone()[0]
+
+                if ml_count < event_count * 0.5:  # less than 50% coverage → backfill
+                    log.info("[%s] ML backfill: %s has %d signals but only %d in "
+                             "ml_signal_context — backfilling",
+                             self._name, check_date, event_count, ml_count)
+                    job_signal_context(conn, check_date)
+                    job_trade_outcomes(conn, check_date)
+                    job_rejection_log(conn, check_date)
+
+            conn.close()
+        except ImportError:
+            pass  # post_session_analytics not available
+        except Exception as exc:
+            log.warning("[%s] ML backfill failed: %s", self._name, exc)

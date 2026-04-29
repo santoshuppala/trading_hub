@@ -36,11 +36,19 @@ os.makedirs(date_dir, exist_ok=True)
 log_file = os.path.join(date_dir, 'options.log')
 
 logging.root.handlers = []
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [options] %(message)s',
-    handlers=[logging.FileHandler(log_file)],
-)
+
+class _ETFormatter(logging.Formatter):
+    _et = ZoneInfo('America/New_York')
+    def formatTime(self, record, datefmt=None):
+        from datetime import datetime as _dt
+        ct = _dt.fromtimestamp(record.created, tz=self._et)
+        if datefmt:
+            return ct.strftime(datefmt)
+        return ct.strftime('%Y-%m-%d %H:%M:%S') + f',{int(record.msecs):03d}'
+
+_handler = logging.FileHandler(log_file)
+_handler.setFormatter(_ETFormatter('%(asctime)s %(levelname)s [options] %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 log = logging.getLogger(__name__)
 
 
@@ -55,6 +63,13 @@ def main():
     log.info("=" * 60)
     log.info("OPTIONS PROCESS STARTING")
     log.info("=" * 60)
+
+    # V10: Validate SMTP so alerts actually deliver (was missing — Core had it)
+    try:
+        from monitor.alerts import validate_smtp
+        validate_smtp()
+    except Exception:
+        log.warning("SMTP validation skipped — options alerts may not deliver")
 
     bus = EventBus()
     cache_reader = CacheReader()
@@ -247,7 +262,14 @@ def main():
             if bars_cache:
                 import pandas as pd
                 bar_events = []
-                for ticker in TICKERS:
+                # V10: Emit BARs for ALL tickers in cache, not just config TICKERS.
+                # Options may hold positions in tickers discovered mid-session
+                # or forwarded via IPC. Without BAR data, exit evaluations stall.
+                _bar_tickers = set(TICKERS)
+                # Add tickers with open options positions
+                if hasattr(options_engine, 'positions') and options_engine.positions:
+                    _bar_tickers |= set(options_engine.positions.keys())
+                for ticker in _bar_tickers:
                     if ticker not in bars_cache:
                         continue
                     df = bars_cache[ticker]
@@ -274,6 +296,9 @@ def main():
         consumer.stop()
         if db_cleanup:
             db_cleanup()
+        # V10: Give alert worker thread time to deliver queued emails (EOD summary)
+        # Without this, daemon thread dies with main thread before SMTP sends.
+        time.sleep(5)
         log.info("Options process stopped.")
         # V8: Exit code 3 = kill switch halt. Supervisor should NOT restart.
         if _kill_switch_exit:

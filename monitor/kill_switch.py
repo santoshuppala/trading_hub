@@ -144,6 +144,30 @@ class PerStrategyKillSwitch:
             self._broker_halted.clear()
         log.info("[KillSwitch] daily reset — all strategies + brokers un-halted")
 
+    def seed_pnl(self, strategy_prefix: str, pnl: float) -> None:
+        """Seed P&L from FillLedger on startup (crash recovery).
+
+        Without this, a crash at -$8K + restart resets P&L to $0 and the
+        system can lose another full daily limit before kill switch fires.
+        FillLedger persists realized P&L across restarts — seed from it.
+        """
+        with self._lock:
+            if strategy_prefix in self._pnl:
+                self._pnl[strategy_prefix] = pnl
+                # Check if already breached
+                if pnl <= self._limits.get(strategy_prefix, 0):
+                    self._halted[strategy_prefix] = True
+                    log.critical("[KillSwitch] SEEDED '%s' at $%.2f — ALREADY BREACHED "
+                                 "limit $%.2f — halted immediately",
+                                 strategy_prefix, pnl,
+                                 self._limits[strategy_prefix])
+                else:
+                    log.info("[KillSwitch] seeded '%s' P&L=$%.2f (limit=$%.2f, "
+                             "headroom=$%.2f)",
+                             strategy_prefix, pnl,
+                             self._limits[strategy_prefix],
+                             pnl - self._limits[strategy_prefix])
+
     @staticmethod
     def _infer_prefix(strategy: str) -> str:
         """Infer strategy prefix from full strategy name."""

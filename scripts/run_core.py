@@ -49,12 +49,21 @@ os.makedirs(date_dir, exist_ok=True)
 log_file = os.path.join(date_dir, 'core.log')
 
 logging.root.handlers = []
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [core] %(message)s',
-    handlers=[logging.FileHandler(log_file)],
-    force=True,
-)
+
+# Force all timestamps to ET (Eastern Time) regardless of system timezone.
+# Trading logs in ET match market hours (9:30-16:00 ET).
+class _ETFormatter(logging.Formatter):
+    _et = ZoneInfo('America/New_York')
+    def formatTime(self, record, datefmt=None):
+        from datetime import datetime as _dt
+        ct = _dt.fromtimestamp(record.created, tz=self._et)
+        if datefmt:
+            return ct.strftime(datefmt)
+        return ct.strftime('%Y-%m-%d %H:%M:%S') + f',{int(record.msecs):03d}'
+
+_handler = logging.FileHandler(log_file)
+_handler.setFormatter(_ETFormatter('%(asctime)s %(levelname)s [core] %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 log = logging.getLogger(__name__)
 
 
@@ -149,6 +158,23 @@ def main():
         except Exception as exc:
             log.warning("RVOL profile seeding failed (non-fatal): %s", exc)
 
+    # ── FillLedger (P&L authority) — load EARLY, before beta seeding ────────
+    # Beta seeding takes ~35s. FillLedger must be ready before any SELL events
+    # fire (which can happen as soon as EventBus starts processing BAR events).
+    # Race condition: without this, SELL at 11:00:51 fails with "no open lots"
+    # because FillLedger doesn't load until 11:01:21 (after beta seeding).
+    fill_ledger = None
+    try:
+        from monitor.fill_ledger import FillLedger
+        fill_ledger = FillLedger()  # uses config.FILL_LEDGER_PATH
+        fill_ledger.load()
+        monitor.set_fill_ledger(fill_ledger)
+        log.info("FillLedger attached | lots=%d open=%d daily_pnl=$%.2f",
+                 fill_ledger.lot_count, fill_ledger.open_position_count,
+                 fill_ledger.daily_realized_pnl())
+    except Exception as exc:
+        log.warning("FillLedger init failed (non-fatal): %s", exc)
+
     # ── V8: Pre-seed beta cache for all tickers ────────────────────────────
     try:
         from monitor.risk_sizing import RiskSizer
@@ -213,19 +239,6 @@ def main():
     from scripts._db_helper import init_satellite_db
     db_cleanup = init_satellite_db(monitor._bus, process_name='core')
 
-    # ── V9: FillLedger (shadow mode — parallel tracking) ─────────────────
-    fill_ledger = None
-    try:
-        from monitor.fill_ledger import FillLedger
-        fill_ledger = FillLedger()  # uses config.FILL_LEDGER_PATH
-        fill_ledger.load()
-        monitor.set_fill_ledger(fill_ledger)
-        log.info("FillLedger attached (shadow mode) | lots=%d open=%d daily_pnl=$%.2f",
-                 fill_ledger.lot_count, fill_ledger.open_position_count,
-                 fill_ledger.daily_realized_pnl())
-    except Exception as exc:
-        log.warning("FillLedger init failed (non-fatal, shadow mode skipped): %s", exc)
-
     # ── V9: BrokerRegistry (extensible broker collection) ────────────────
     broker_registry = None
     try:
@@ -276,6 +289,24 @@ def main():
         alert_email=ALERT_EMAIL,
     )
     kill_switch.reset_day()
+
+    # V10: Seed kill switch P&L from FillLedger (crash recovery).
+    # Without this, crash at -$8K + restart → P&L resets to $0 → system
+    # can lose another full daily limit. FillLedger persists across restarts.
+    if fill_ledger:
+        try:
+            _daily_pnl = fill_ledger.daily_realized_pnl()
+            if _daily_pnl != 0:
+                # Split P&L across strategies based on lot metadata
+                # For now, assign all to 'pro' since VWAP has reclaimed_today guard
+                # and Pro generates most of the P&L volume.
+                # TODO: FillLedger should track P&L per strategy prefix
+                kill_switch.seed_pnl('pro', _daily_pnl)
+                kill_switch.seed_pnl('vwap', _daily_pnl)
+                log.info("Kill switch seeded from FillLedger: daily_pnl=$%.2f", _daily_pnl)
+        except Exception as exc:
+            log.warning("Kill switch seeding failed (non-fatal): %s", exc)
+
     log.info("PerStrategyKillSwitch active | vwap=$%.0f pro=$%.0f",
              MAX_DAILY_LOSS, -2000.0)
 
@@ -526,6 +557,37 @@ def main():
                 except Exception as bb_exc:
                     log.warning("BarBuilder init failed (non-fatal): %s", bb_exc)
 
+                # V10: TickSignalDetector — sub-second entry signals from trade ticks
+                try:
+                    from monitor.tick_detector import TickSignalDetector
+                    tick_detector = TickSignalDetector(
+                        bus=monitor._bus, positions=monitor.positions)
+                    # Wire to TradierStream (tick feed)
+                    tradier_stream.set_tick_detector(tick_detector)
+                    # Wire to ProSetupEngine (level updates on each BAR)
+                    if pro_engine is not None:
+                        pro_engine._tick_detector = tick_detector
+                        # Wire freeze to RiskAdapter so bar-level Pro signals
+                        # are also frozen during startup (not just tick signals)
+                        pro_engine._risk_adapter._tick_detector = tick_detector
+                    log.info("TickDetector active — sub-second entries for "
+                             "sr_flip, orb, momentum, gap_and_go, liquidity_sweep")
+
+                    # V10: Cold-start from previous day's snapshot
+                    try:
+                        from monitor.market_snapshot import load_snapshot, seed_from_snapshot
+                        snap = load_snapshot()
+                        if snap:
+                            seeded = seed_from_snapshot(
+                                bar_builder if 'bar_builder' in dir() else None,
+                                tick_detector, snap)
+                            log.info("Snapshot cold-start: %d tickers seeded before REST", seeded)
+                    except Exception as snap_exc:
+                        log.warning("Snapshot load failed (non-fatal): %s", snap_exc)
+
+                except Exception as td_exc:
+                    log.warning("TickDetector init failed (non-fatal): %s", td_exc)
+
                 log.info("Tradier streaming active | HOT tickers=%d", len(hot_tickers))
             else:
                 log.warning("Tradier streaming unavailable — using REST polling fallback")
@@ -560,7 +622,7 @@ def main():
 
 
     _v9_status = {
-        'FillLedger (shadow)':     'ON' if fill_ledger else 'OFF',
+        'FillLedger':              'ON' if fill_ledger else 'OFF',
         'BrokerRegistry':          f'ON ({len(broker_registry)} brokers)' if broker_registry else 'OFF',
         'EquityTracker':           'ON' if getattr(monitor, '_equity_tracker', None) else 'OFF',
         'Tradier Streaming':       'ON' if tradier_stream and getattr(tradier_stream, '_running', False) else 'OFF (REST fallback)',

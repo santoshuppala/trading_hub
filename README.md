@@ -1,168 +1,396 @@
-# Trading Hub (V10)
+# Trading Hub V10
 
-A real-time algorithmic trading system built on a hybrid streaming + polling architecture. V10 adds phase-based exit lifecycle engines for both equities and options, 47 production hardening fixes, numpy indicator optimization (14x speedup), and full trade journey persistence for ML/PF analysis.
+Production algorithmic trading system. Equities + options. Real money via Tradier and Alpaca. Sub-second tick-level entries, phase-based lifecycle exits, context-aware smart stops, 7-layer signal protection.
 
-> **Disclaimer:** This is for educational purposes only. Trading involves significant risk. Always start with paper trading. Consult a financial advisor before trading with real money.
+> **Disclaimer:** Trading involves significant risk. This system trades with real money. Always validate with paper trading first.
 
 ---
 
-## V10 Changes (April 2026)
+## System Identity
 
-### Equity Exit Engine — Phase-Based Lifecycle
-- 5-phase lifecycle per position (Validation → Protection → Breakeven → Harvest → Runner)
+- **3 coordinated engines** under supervisor: Core (VWAP + Pro), Options, Data Collector
+- **200+ tickers** across mega-cap tech, semis, fintech, crypto-adjacent, energy, healthcare, consumer, ETFs
+- **Sub-second entries** via WebSocket tick detection (5 detectors), 60s bar-level backup (13 detectors)
+- **Phase-based exits** — 5-phase lifecycle per position (Validation → Protection → Breakeven → Harvest → Runner)
+- **Dual broker** — Alpaca (execution + free WebSocket fills) + Tradier (streaming data $10/mo + paper execution)
+- **Event-driven** — ASYNC EventBus with 26 workers, bounded queues, backpressure, coalescing
+
+---
+
+## Architecture
+
+```
+launchd (PID 1)
+  └── Outer Watchdog (market-aware, holiday-aware)
+       └── Supervisor (process manager, preflight checks, fcntl lock)
+            ├── Core Process (VWAP + Pro strategies + Pop scanner)
+            │    ├── TradierStreamClient (WebSocket)
+            │    │    ├── BarBuilder (tick → 1-min OHLCV bars)
+            │    │    └── TickDetector (5 sub-second detectors)
+            │    ├── EventBus (ASYNC, 26 workers, bounded queues)
+            │    ├── ProSetupEngine (13 detectors, 11 strategies, 3 tiers)
+            │    ├── StrategyEngine (VWAP Reclaim)
+            │    ├── ExitEngine (5-phase lifecycle)
+            │    ├── RiskEngine (VWAP) + RiskAdapter (Pro) — 23 risk checks
+            │    ├── SmartRouter → Alpaca + Tradier (lot-aware routing)
+            │    ├── FillLedger (FIFO lot matching, P&L authority)
+            │    ├── PositionManager + Order WAL (crash recovery)
+            │    └── EngineLifecycle (state persistence, kill switch, heartbeat)
+            │
+            ├── Options Process (13 multi-leg strategies, separate Alpaca account)
+            │    ├── OptionsExitEngine (3-phase: OPEN → THETA → CLOSE/ROLL)
+            │    ├── OptionsRiskGate + PortfolioGreeksTracker
+            │    └── IPC consumer (SIGNAL + POP_SIGNAL from Core via Redpanda)
+            │
+            └── Data Collector (10 alt data sources, independent pipeline)
+```
+
+### Data Flow — Two Parallel Paths
+
+```
+PATH A: Sub-second (WebSocket ticks)
+  Tradier WebSocket → trade tick (price, size, cvol)
+    ├── BarBuilder.on_trade() → accumulates per-ticker per-minute
+    │   └── At :00 boundary → BAR event → ProSetupEngine (13 detectors)
+    └── TickDetector.on_tick() → 5 tick-level detectors
+        └── PRO_STRATEGY_SIGNAL → RiskAdapter → ORDER_REQ → Broker
+
+PATH B: REST polling fallback (12s cycle, illiquid tickers only)
+  Tradier REST API → 200 tickers × bars
+    └── BAR event → StrategyEngine (VWAP) + ProSetupEngine
+        └── SIGNAL → RiskEngine → ORDER_REQ → SmartRouter → Broker
+
+EXITS: WebSocket QUOTE → ExitEngine (5-phase lifecycle, is_quote=True) → SELL
+       Reconciler (5 min) → phantom detection → broker query → P&L capture
+
+CROSS-PROCESS (Core → Options):
+  SharedCache: Core writes bars/rvol to JSON, Options reads every 10s
+  Redpanda IPC: Core publishes SIGNAL + POP_SIGNAL + PRO_STRATEGY_SIGNAL
+                Options consumes and injects into local EventBus
+  Discovery: Data Collector publishes new tickers → Core adds to scan universe
+```
+
+---
+
+## Sub-Second Entry System (TickDetector)
+
+5 tick-level detectors fire on live WebSocket ticks instead of waiting for 60s bar close:
+
+| Detector | Trigger | Stop |
+|----------|---------|------|
+| sr_flip | Price crosses S/R level | Below flipped level |
+| orb | Price breaks opening range (first 30 min only) | Below ORB range |
+| momentum_ignition | Volume spike + range expansion in 30s window | Below window low |
+| gap_and_go | New session high in gap direction | Below prior high |
+| liquidity_sweep | Sweep below support then reverse within 30s | Below sweep low |
+
+### 7 Protection Layers
+
+| Layer | What It Prevents |
+|-------|------------------|
+| Trade freeze | Blocks all orders until 10+ tickers have 2 live BARs + fresh indicators |
+| Data readiness | Per-ticker: needs 2+ live BAR cycles, not just snapshot data |
+| Gap regime | 4-tier classification (none/small/medium/large). Large gaps invalidate all S/R levels |
+| Adaptive sampling | Under load (>50 ticks/100ms): sample every Nth tick. Large price moves always processed |
+| Level versioning | Detects BAR/tick race conditions. Discards signals computed against stale levels |
+| Additive confidence | 0.50 x signal + 0.20 x regime + 0.20 x freshness + 0.10 x stability. Prevents collapse |
+| Smart stop | Volatility regime (calm/normal/hot) x time-of-day (open/lunch/close) scaling |
+
+---
+
+## Exit Engine — Phase-Based Lifecycle
+
+| Phase | Name | Behavior |
+|-------|------|----------|
+| 0 | Validation | Per-strategy thesis check. Fail → immediate exit |
+| 1 | Protection | Stop only. No RSI/VWAP exits. Higher-low detection |
+| 2 | Breakeven | Move stop to entry. RSI trail tightens mildly |
+| 3 | Harvest | Confluence-aware partials (33-66%). Structure trail |
+| 4 | Runner | 5-bar swing low + VWAP floor + R floor. Let winners run |
+
+10 per-strategy exit profiles. Trade quality scorer (trend_score + failure_score) logs per-bar for ML calibration.
+
+### Options Exit Engine — Risk-Regime Lifecycle
+
+| Phase | Trigger | Behavior |
+|-------|---------|----------|
+| OPEN | DTE > 21 | Monitor Greeks, IV crush detection |
+| THETA | 21 >= DTE > 10 | Tighten stops, theta decay management |
+| CLOSE/ROLL | DTE <= 10 | Force close or roll if profitable + safe |
+
+Moneyness pressure (continuous 0→1), weighted risk score (delta 1.5x + vega 1.2x + theta 1.0x), strategy-aware fatal signals.
+
+---
+
+## Smart Stop System
+
+Context-aware stop distance scaled by two real-time factors:
+
+**Volatility regime** — recent price range vs ATR:
+```
+Calm (range < 0.5 ATR):  buffer = ATR x 0.3  (tight, less noise)
+Normal (range ≈ 1 ATR):  buffer = ATR x 0.5  (standard)
+Hot (range > 1.5 ATR):   buffer = ATR x 0.8  (wide, survive volatility)
+```
+
+**Time of day** — market volatility pattern:
+```
+9:30-10:00:  x1.5  (opening volatility)
+10:00-11:00: x1.2  (settling)
+11:00-14:00: x0.8  (lunch, tightest)
+14:00-15:00: x1.0  (afternoon)
+15:00-16:00: x1.3  (close volatility)
+```
+
+Bounds: never tighter than 0.25 ATR, never wider than 1.5 ATR. Trades with stop > 2 ATR rejected (bad R:R).
+
+---
+
+## Risk Stack (23 Checks)
+
+| # | Check | Component |
+|---|-------|-----------|
+| 1 | Trade freeze (startup) | TickDetector + RiskAdapter |
+| 2 | Stopped-today blacklist | RiskAdapter |
+| 3 | Max positions (per-strategy) | RiskEngine / RiskAdapter |
+| 4 | Cooldown (300s per ticker) | RiskEngine / RiskAdapter |
+| 5 | Reclaimed-today dedup | RiskEngine |
+| 6 | RVOL threshold | RiskEngine |
+| 7 | RSI range (sentiment-adaptive) | RiskEngine |
+| 8 | Fresh ask quote (streaming) | RiskEngine |
+| 9 | Spread width | RiskEngine |
+| 10 | Price divergence | RiskEngine |
+| 11 | Correlation groups (14) | RiskSizer |
+| 12 | Beta-weighted exposure | RiskSizer |
+| 13 | Beta-adjusted sizing | RiskSizer |
+| 14 | ATR-scaled sizing | RiskSizer |
+| 15 | Confidence threshold (tier) | RiskAdapter |
+| 16 | R:R ratio (tier) | RiskAdapter |
+| 17 | Sector concentration (max 2) | RiskAdapter |
+| 18 | Earnings block (T2/T3) | RiskAdapter |
+| 18b | Alt data conviction boost (0-0.3) | RiskAdapter |
+| 19 | Drawdown halt | PortfolioRiskGate |
+| 20 | Notional cap | PortfolioRiskGate |
+| 21 | Buying power (background refresh) | PortfolioRiskGate |
+| 22 | Per-strategy kill switch | PerStrategyKillSwitch |
+| 23 | WAL atomic dedup (check_and_intent) | Order WAL |
+
+---
+
+## Position Sizing
+
+Risk-based sizing via `RiskSizer`:
+```
+base_qty = floor(trade_budget / ask_price)
+→ adjusted by beta (high beta = smaller size)
+→ adjusted by ATR volatility (high ATR = smaller size)
+→ capped by correlation group exposure (max 2 same-sector)
+→ capped by buying power (real-time background refresh)
+```
+
+Each trade risks a fixed dollar amount, not fixed share count. A $1,000 budget on a $50 stock with 2.0 ATR volatility sizes differently than the same budget on a $10 stock with 0.5 ATR.
+
+---
+
+## Strategies
+
+### VWAP Reclaim (Core)
+Entry: 2-bar VWAP reclaim + RSI 50-70 + RVOL >= 2x + SPY above VWAP.
+Exit: 5-phase lifecycle. Streaming exit detection (<1s).
+
+### Pro Setups (13 detectors, 11 strategies, 3 tiers)
+
+| Tier | Strategies | Characteristics |
+|------|-----------|-----------------|
+| T1 | sr_flip, trend_pullback, vwap_reclaim | Intraday close. Tight stops. |
+| T2 | orb, gap_and_go, inside_bar, flag_pennant | Partial overnight. Medium stops. |
+| T3 | momentum_ignition, fib_confluence, bollinger_squeeze, liquidity_sweep | Partial overnight. Wide stops. |
+
+2-phase detector cascade: Phase 1 (Trend+VWAP+ORB) skips Phase 2 for ~80% of tickers.
+ORB cutoff: 30 bars (30 min from open). No more all-day ORB noise.
+
+### Options (13 strategies)
+Iron condor, iron butterfly, bull/bear call/put spreads, long call/put, calendar, diagonal, straddle, strangle, collar.
+IV rank + earnings calendar + Greeks tracking.
+
+---
+
+## Cold Start, Crash Recovery, Restart Behavior
+
+### Cold Start (system off overnight)
+```
+Snapshot load → BB: 200x40 bars, emit_bars=True
+                TD: levels + indicators (snapshot, NOT data-ready)
+                    order_freeze = True
+Ticks arrive  → Gap classified per ticker on FIRST TICK
+                Adaptive sampling active
+9:31:00       → 1st BB flush, ProSetupEngine → live_bar_count=1
+9:32:00       → 2nd BB flush → DATA READY, FREEZE LIFTED
+                All 5 tick detectors active
+```
+
+### Crash Restart (mid-session)
+```
+Snapshot: today's data (saved at crash). BB emit_bars=True immediately.
+Gap regime: classified from first tick vs prev_close.
+2 BAR flushes → DATA READY (~90s). No artificial 5-min blind timer.
+Positions protected by broker-side stops during 90s gap.
+WAL recovery: checks incomplete orders against broker status.
+```
+
+### State Persistence
+- `bot_state.json` — positions, trade_log, daily P&L. Saved on every state change.
+- `fill_ledger.json` — lot-level fills with FIFO matching. P&L authority.
+- `data/market_snapshot.json` — bars + indicators for cold start. Saved on EVERY shutdown (not just EOD). ~2MB for 200 tickers x 40 bars.
+- `data/order_wal_YYYYMMDD.log` — write-ahead log for order crash recovery.
+
+### Reconciliation (every 5 min)
+3-way sync: local positions vs Alpaca vs Tradier.
+- Positions at broker but not local → import (with broker cost basis as entry)
+- Positions local but not at broker → phantom close (query broker for real exit price)
+- Quantity mismatch → adjust to broker truth
+- Phantom P&L captured via `_get_phantom_exit_price()` (queries broker order history)
+
+### Execution Timing
+- `TRADE_START_TIME = 09:45` — no entries before this (market needs to settle)
+- `FORCE_CLOSE_TIME = 15:00` — force-close positions before EOD
 - `is_quote` parameter isolates QUOTE handler from BAR logic (prevents bars_held corruption, buffer poisoning, false VWAP exits)
-- Trade quality scorer (trend_score + failure_score) logs per-bar for ML training
-- Phase 1 higher-low detection fixed (was using monotonically decreasing running_low)
-- `deque(maxlen=10)` for scorer buffers (O(1) eviction, JSON-safe persistence)
 
-### Options Exit Engine — Risk-Regime Lifecycle (NEW)
-- 3-phase lifecycle: OPEN (DTE>21) → THETA (21≥DTE>10) → CLOSE/ROLL (DTE≤10)
-- Moneyness pressure: continuous 0→1 gradient (not binary threshold)
-- Weighted risk score: delta(1.5) + vega(1.2) + theta(1.0) with strategy-aware fatal signals
-- Credit stop: 2x credit (Phase 1) → 1.5x (Phase 2), tightens with moneyness pressure
-- IV crush exit for debit/vol positions (>15% IV drop from entry)
-- Stall detection: exits debit positions not progressing vs time
-- Roll quality check: profitable + safe distance + IV not adverse
-- Greeks state machine: vega/theta/delta classified as FAVORABLE/ADVERSE/NEUTRAL
-- Full lifecycle journey persisted to DB (OPTIONS_CLOSE event)
-- Orphaned positions auto-rebuilt from broker contracts on restart
-- Per-check snapshots every 2.5 min for PF analysis
+### Email Alerts
+SMTP via Yahoo Mail app password. Severity levels: INFO, WARNING, CRITICAL. CRITICAL bypasses 5-min blackout. Alerts for: kill switch trigger, data pipeline stale >120s, P&L drift >$50, supervisor restart, broker API errors.
 
-### Signals Optimization
-- Numpy fast path for RSI/ATR/VWAP computation (14x faster than pandas)
-- Content-based LRU cache with `OrderedDict` (survives DataFrame recreation)
-- `v_arr.sum()` cache key invalidates on backfill corrections
-- `math.isfinite()` validation catches inf values (not just NaN)
-- Flat-price RSI guard (returns 50.0, not 0.0)
-
-### Production Hardening (47 fixes across 20 files)
-
-| Category | Fixes |
-|----------|-------|
-| Thread safety | Kill switch atomic lock, position dict snapshots, stream client lock, pending order tracking |
-| Order execution | Tradier tag dedup, sell verification, partial fill handling, exponential backoff (3 retries, 1s/2s/4s) |
-| State management | Disk-full protection, write-before-rotate, os.replace cleanup, version monotonic check |
-| Risk controls | Per-broker daily loss limit, pending orders in position count, data coverage circuit breaker |
-| Monitoring | Data staleness alert (120s), stale order cleanup (60s), BarBuilder auto-restart (max 5x) |
-| Resilience | DB write fallback to JSON file, WebSocket reconnect backoff (2s→60s), token bucket rate limiter (100 req/min) |
-| Configuration | RSI/RVOL/timeouts configurable via env vars with safe defaults, feature flag system |
-| Operations | Read-only mode (`READ_ONLY=true`), weekly PF review auto-triggered Fridays |
-
-### PF Analysis & Monitoring
-- `scripts/analyze_options_pf.py` — daily PF breakdown by strategy, exit reason, risk score
-- `scripts/weekly_options_review.py` — weekly calibration with threshold recommendations
-- Auto-triggered every Friday EOD via lifecycle shutdown hook
-- Snapshots capture: spot, pnl, IV, Greeks, risk_score, moneyness_pressure every 2.5 min
-
-### Environment Variables (NEW)
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `READ_ONLY` | false | Block new entries, exits still run |
-| `RISK_RSI_LOW` | 40.0 | RSI lower bound for entries |
-| `RISK_RSI_HIGH` | 75.0 | RSI upper bound for entries |
-| `RISK_MIN_RVOL` | 2.0 | Minimum relative volume |
-| `RISK_MAX_SPREAD_PCT` | 0.002 | Max bid-ask spread |
-| `TRADIER_FILL_TIMEOUT` | 8.0 | Fill poll timeout (seconds) |
-| `TRADIER_MAX_RETRIES` | 3 | Order submission retries |
-| `TRADIER_BACKOFF_BASE` | 1.0 | Retry backoff base (seconds) |
-| `OPT_PROFIT_CREDIT` | 0.50 | Options credit profit target |
-| `OPT_STOP_CREDIT` | 1.00 | Options credit stop (legacy flat) |
-| `OPT_DTE_CLOSE` | 10 | Options DTE close threshold |
-| `BAR_BUILDER_LIVENESS_SEC` | 120 | BarBuilder staleness timeout |
-| `FF_PENDING_ORDER_DEDUP` | true | Feature flag: pending order tracking |
-| `FF_PER_BROKER_KILL` | true | Feature flag: per-broker loss limit |
-| `FF_OPTIONS_LIFECYCLE` | true | Feature flag: options lifecycle engine |
-| `FF_DATA_CIRCUIT_BREAKER` | true | Feature flag: data coverage breaker |
-
----
-
-## Architecture (V9 — Hybrid Streaming + Polling)
-
-3 processes under supervisor. Real-time Tradier WebSocket for exit monitoring, REST polling for entry discovery.
-
-```
-Supervisor (startup cleanup: __pycache__, state validation, deprecated files)
-  |
-  +-- Core (VWAP + Pro 11 strategies + Pop scanner)
-  |     +-- TradierStreamClient (WebSocket, <1s exit detection, prod $10/month)
-  |     +-- 13 detectors (V9: 2-phase cascade, 80% skip at open)
-  |     +-- FillLedger (lot-based P&L, FIFO matching, shadow mode)
-  |     +-- BrokerRegistry (extensible multi-broker)
-  |     +-- EquityTracker (hourly P&L drift detection)
-  |     +-- PortfolioRiskGate (V9: background buying power, <1ms)
-  |     +-- SmartRouter -> Alpaca + Tradier (V9: lot-aware routing)
-  |     +-- FailoverDataClient (Tradier -> Alpaca IEX auto-switch)
-  |     +-- Publishes SIGNAL + POP_SIGNAL to Options via Redpanda
-  |
-  +-- Options (13 multi-leg strategies, separate Alpaca account)
-  |     +-- V9: _halted flag + persisted kill switch state
-  |     +-- tick() before BAR emit (defense-in-depth)
-  |
-  +-- Data Collector (8 alt data sources)
-
-Event Flow:
-  Tradier WebSocket -> QUOTE -> StrategyEngine (exit checks, <1ms)
-  Tradier REST -> BAR -> StrategyEngine/ProSetupEngine -> SIGNAL
-  SIGNAL -> RiskEngine (V9: streaming ask price, 0.02ms) -> ORDER_REQ
-  ORDER_REQ -> PortfolioRiskGate (V9: <1ms buying power) -> SmartRouter
-  SmartRouter -> Broker -> FILL (V9: Alpaca WebSocket <100ms)
-  FILL -> PositionManager -> FillLedger (FIFO lot match) + bot_state.json
-  FILL -> PositionManager -> POSITION -> KillSwitch -> event_store DB
-```
-
-### Key V9 Changes
-
-| Change | V8 | V9 |
-|--------|----|----|
-| Exit detection | 0-60s (REST poll) | <1s (WebSocket streaming) |
-| Ask quote (risk check) | 300-3000ms (REST) | 0.02ms (streaming cache) |
-| Buying power check | 3-10s (inline API) | <1ms (background refresh) |
-| Market open spike | ~10s (all detectors) | <2s (Phase 1 cascade) |
-| Fill confirmation | 0.5-5s (REST poll) | <100ms (Alpaca WebSocket, FREE) |
-| Settlement verify | 1s (blind sleep) | 200-600ms (fast poll) |
-| Position tracking | Mutable dict (single entry_price) | FillLedger (lot-based, FIFO P&L) |
-| P&L calculation | (exit - entry) × qty (wrong after reconcile) | Per-lot FIFO matching (exact) |
-| Entry price on reconcile | 1% drift threshold | Always broker cost basis |
-| Shared cache format | Pickle (fragile) | JSON (human-readable, schema-stable) |
-| Bar persistence | event_store (97% bloat) | market_bars (10x smaller) |
-| Kill switch (options) | Resets on restart | Persisted to disk |
-| Alert blackout | 30 min | 5 min + CRITICAL bypass |
-| Stale orders | Orphaned forever | Cancelled after 60s |
-| Duplicate SELL | Not guarded | Dedup by ticker:order_id |
-| Fill dedup | Buggy set truncation | OrderedDict + 1hr TTL |
-| Data source failure | Full halt | Auto-failover to Alpaca IEX |
-| Fractional shares | Int qty only | Float qty (Alpaca: 0.01 increments) |
+### Key Design Decisions
+- **Data readiness, not wall-clock**: system activates when data is trustworthy, not after arbitrary timer
+- **Trade freeze**: signals observe and log, but no real orders until 10+ tickers verified
+- **Stopped-today blacklist**: ticker stopped out → blocked for rest of session (no 17x churn)
+- **ORB cutoff at 30 min**: both tick-level (from actual 9:30 ET) and bar-level
 
 ---
 
 ## Latency Profile
 
-### Entry Trade
+### Entry (V10 — sub-second path)
+| Stage | Latency |
+|-------|---------|
+| WebSocket tick arrival | ~10-50ms |
+| TickDetector processing | <50μs (with adaptive sampling) |
+| Signal → RiskAdapter | <1ms (EventBus ASYNC) |
+| Risk checks (23 gates) | <5ms |
+| Broker order submission | 50-200ms |
+| Fill confirmation (Alpaca WS) | <100ms |
+| **Total** | **~200-400ms** |
 
-| Stage | Before V9 | After V9 |
-|-------|-----------|----------|
-| Data staleness | 0-73s | <0.5s (streaming) |
-| Strategy analysis | 35ms / 10s spike | 35ms / <2s spike |
-| Risk engine | 500-3000ms | <5ms |
-| Portfolio risk | 3-10s | <5ms |
-| Fill confirmation (Alpaca) | 0.5-5s | <100ms |
-| **Total (Alpaca)** | **8-25s** | **~1-3s** |
+### Exit (streaming)
+| Stage | Latency |
+|-------|---------|
+| QUOTE detection | <1s (WebSocket) |
+| ExitEngine lifecycle eval | <1ms |
+| SELL order | 50-200ms |
+| **Total** | **~1-2s** |
 
-### Exit Trade
+### REST Fallback (illiquid tickers)
+| Stage | Latency |
+|-------|---------|
+| Data staleness | 0-12s (REST cycle) |
+| Bar-level detection | ~35ms |
+| Risk + execution | ~200ms |
+| **Total** | **~1-13s** |
 
-| Stage | Before V9 | After V9 |
-|-------|-----------|----------|
-| Detection | 0-60s | <1s (streaming) |
-| **Total (streaming + Alpaca)** | **1-70s** | **~1-4s** |
+---
 
-### Full Round-Trip
+## EventBus (ASYNC Mode)
 
-| Scenario | Before V9 | After V9 |
-|----------|-----------|----------|
-| Best case | ~10s | **~3s** |
-| Typical | ~2-3 min | **~15-30s** |
-| Worst case | 5+ min | **~1-2 min** |
+26 workers with bounded queues and backpressure:
+
+| Event Type | Workers | Max Queue | Policy |
+|------------|---------|-----------|--------|
+| BAR | 8 | 500 | DROP_OLDEST + coalesce |
+| QUOTE | 2 | 100 | DROP_OLDEST + coalesce |
+| PRO_STRATEGY_SIGNAL | 2 | 100 | DROP_OLDEST |
+| ORDER_REQ | 1 | 100 | BLOCK (never drop) |
+| FILL | 1 | 100 | BLOCK |
+| ORDER_FAIL | 1 | 50 | BLOCK |
+| POSITION | 1 | 50 | BLOCK |
+
+BackpressureMonitor: WARN at 60%, THROTTLE at 80%, ALERT at 90%.
+
+---
+
+## Resilience & Self-Healing
+
+### Data Failover
+`FailoverDataClient` wraps primary (Tradier) and secondary (Alpaca IEX) data sources. If Tradier REST fails 3 consecutive times, auto-switches to Alpaca IEX with CRITICAL alert. Switches back when primary recovers.
+
+### Market Calendar
+`market_calendar.py` — US market holidays 2026-2028, early close days (1 PM ET). Outer watchdog and supervisor skip non-trading days. EngineLifecycle uses it for EOD timing.
+
+### Position Registry
+`DistributedPositionRegistry` — global position counting across all 3 engines (Core VWAP + Pro + Options). `RegistryGate` enforces the 75-position global cap. Lease-based cleanup on crash recovery.
+
+### Equity Tracker
+`EquityTracker` — hourly P&L drift detection. Compares broker account equity vs internal P&L tracking. Alerts if drift > $50 (catches reconciliation errors, phantom fills, missed closes).
+
+### Session Watchdog
+`session_watchdog.py` — self-healing monitoring for all child processes:
+- Health checks: process alive, zombie detection, log staleness, signal rate, position tracking, kill switch state, memory usage
+- Self-healing: corrupt JSON restore from `.prev` backups, stale `.lock` removal, supervisor restart, zombie kill
+- `HotfixManager` (V9, replaced by Claude Fix Agent in V10): auto-applied fixes for common runtime errors during paper trading
+- 7 hourly email status reports during market hours
+
+### Emergency Rollback
+```bash
+./emergency_rollback.sh            # Stop all, revert to v9-baseline tag
+./emergency_rollback.sh --dry-run  # Preview without changes
+```
+
+### Numpy Fast Path
+RSI/ATR/VWAP computed via numpy arrays instead of pandas (14x speedup). Content-based LRU cache with `OrderedDict`. Flat-price RSI guard returns 50.0 (not 0.0). `math.isfinite()` validation catches inf values.
+
+---
+
+## Configuration
+
+### Budgets & Limits
+
+| Setting | Value | Env Override |
+|---------|-------|-------------|
+| VWAP max positions | 5 | MAX_POSITIONS |
+| Pro max positions | 15 | PRO_MAX_POSITIONS |
+| Options max positions | 5 | OPTIONS_MAX_POSITIONS |
+| Global max (all layers) | 75 | GLOBAL_MAX_POSITIONS |
+| VWAP budget per trade | $1,000 | TRADE_BUDGET |
+| Pro budget per trade | $1,000 | PRO_TRADE_BUDGET |
+| Options budget per trade | $2,000 | OPTIONS_TRADE_BUDGET |
+| Options total ceiling | $20,000 | OPTIONS_TOTAL_BUDGET |
+| VWAP kill switch | -$10,000 | MAX_DAILY_LOSS |
+| Pro kill switch | -$2,000 | PRO_MAX_DAILY_LOSS |
+| Options kill switch | -$1,000 | OPTIONS_MAX_DAILY_LOSS |
+| Order cooldown | 300s | ORDER_COOLDOWN |
+| Max intraday drawdown | -$5,000 | MAX_INTRADAY_DRAWDOWN |
+| Max notional exposure | $100,000 | MAX_NOTIONAL_EXPOSURE |
+| Options min DTE | 20 days | OPTIONS_MIN_DTE |
+| Options max DTE | 45 days | OPTIONS_MAX_DTE |
+| Options close DTE | 7 days | OPTIONS_DTE_CLOSE |
+| Trade start time | 09:45 | TRADE_START_TIME |
+| Force close time | 15:00 | FORCE_CLOSE_TIME |
+
+### Key Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| READ_ONLY | false | Block new entries, exits still run |
+| FF_TICK_ENTRIES | true | Enable/disable TickDetector |
+| RISK_RSI_LOW | 40.0 | RSI lower bound for entries |
+| RISK_RSI_HIGH | 75.0 | RSI upper bound |
+| RISK_MIN_RVOL | 2.0 | Minimum relative volume |
+| RISK_MAX_SPREAD_PCT | 0.002 | Max bid-ask spread |
+| BAR_BUILDER_LIVENESS_SEC | 120 | BarBuilder staleness timeout |
+| BROKER_MODE | smart | smart (dual) or alpaca/tradier (single) |
+| DATA_SOURCE | tradier | Data provider |
+| FF_PENDING_ORDER_DEDUP | true | Feature flag: pending order tracking |
+| FF_PER_BROKER_KILL | true | Feature flag: per-broker loss limit |
+| FF_OPTIONS_LIFECYCLE | true | Feature flag: options lifecycle engine |
+| FF_DATA_CIRCUIT_BREAKER | true | Feature flag: data coverage breaker |
 
 ---
 
@@ -170,280 +398,184 @@ Event Flow:
 
 ```
 TRADIER PRODUCTION ($10/month) ── TRADIER_TOKEN
-  Data: WebSocket streaming + REST bars
+  Data: WebSocket streaming + REST bars (200+ tickers)
   Orders: NEVER (data only)
 
 TRADIER SANDBOX (free) ── TRADIER_SANDBOX_TOKEN
   Orders: Paper trading (buy/sell)
-  Data: No streaming
 
 ALPACA PAPER (free) ── APCA_API_KEY_ID
   Orders: Paper trading (buy/sell)
   Fill status: FREE WebSocket trade_updates
-  Data: NOT used (IEX only on free tier)
 ```
-
----
-
-## Data Sources (10 total)
-
-| # | Source | API Key | Data |
-|---|--------|---------|------|
-| 1 | Benzinga | Yes | Headlines, sentiment |
-| 2 | StockTwits | Optional | Social mentions, sentiment |
-| 3 | Fear & Greed | No | Market sentiment index |
-| 4 | Finviz | No | Screener, insider, analyst |
-| 5 | SEC EDGAR | No | Insider filings |
-| 6 | Yahoo Finance | No | Earnings, recommendations |
-| 7 | Polygon.io | Yes | Prev-day movers, options |
-| 8 | Alpha Vantage | Yes | Technicals |
-| 9 | FRED | Yes | Macro indicators (rates, VIX) |
-| 10 | UOF Scanner | Via chain API | Unusual options flow |
-
----
-
-## Risk Stack (20+ Checks)
-
-| # | Check | Component |
-|---|-------|-----------|
-| 1 | Max positions (per-strategy) | RiskEngine/RiskAdapter |
-| 2 | Cooldown (300s per ticker) | RiskEngine/RiskAdapter |
-| 3 | RVOL threshold | RiskEngine |
-| 4 | RSI range (sentiment-adaptive) | RiskEngine |
-| 5 | Fresh ask quote (V9: streaming) | RiskEngine |
-| 6 | Spread width | RiskEngine |
-| 7 | Price divergence | RiskEngine |
-| 8 | Correlation groups (14) | RiskSizer |
-| 9 | Beta-weighted exposure | RiskSizer |
-| 10 | Beta-adjusted sizing | RiskSizer |
-| 11 | ATR-scaled sizing | RiskSizer |
-| 12 | Confidence threshold (tier) | RiskAdapter |
-| 13 | R:R ratio (tier) | RiskAdapter |
-| 14 | Sector concentration | RiskAdapter |
-| 15 | Earnings block (T2/T3) | RiskAdapter |
-| 16 | Drawdown halt | PortfolioRiskGate |
-| 17 | Notional cap | PortfolioRiskGate |
-| 18 | Buying power (V9: background) | PortfolioRiskGate |
-| 19 | Greeks limits | PortfolioRiskGate |
-| 20 | Per-strategy kill switch | PerStrategyKillSwitch |
-| 21 | Cross-layer dedup | RegistryGate |
-| 22 | V9: Bar data validation | StrategyEngine |
-| 23 | V9: Duplicate SELL guard | PositionManager |
-
----
-
-## Strategies
-
-### VWAP Reclaim (Core)
-
-Entry: 2-bar VWAP reclaim + RSI 50-70 + RVOL >= 2x + SPY above VWAP.
-Exit: Trailing stop, target (2x ATR), partial at 1x ATR, RSI > 75, VWAP breakdown, EOD close.
-V9: Streaming exit detection (<1s).
-
-### Pro Setups (13 detectors, 11 strategies, 3 tiers)
-
-V9 multi-timeframe: 5 detectors use 5-min bars (SR, InsideBar, Flag, Fib, Trend), 8 stay on 1-min.
-
-| Tier | Strategies | Stop | EOD |
-|------|-----------|------|-----|
-| T1 | sr_flip, trend_pullback, vwap_reclaim | 0.4-0.5 ATR | Full close |
-| T2 | orb, gap_and_go, inside_bar, flag_pennant | 1.5-2.0 ATR | Partial sell |
-| T3 | momentum_ignition, fib_confluence, bollinger_squeeze, liquidity_sweep | 2.0-2.5 ATR | Partial sell |
-
-V9: 2-phase detector cascade. Phase 1 (Trend+VWAP+ORB, 1.5ms) skips Phase 2 for ~80% of tickers.
-
-### Options (13 strategies, separate process)
-
-Iron condor, iron butterfly, bull/bear call/put spreads, long call/put, calendar, diagonal, straddle, strangle, collar.
-V9: Kill switch persisted to disk, _halted flag prevents churn on kill switch trigger.
 
 ---
 
 ## Quick Start
 
-### 1. Install
-
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+# 1. Install
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-pip install websocket-client  # V9: for streaming
-```
 
-Python 3.10+ required.
+# 2. Configure .env
+cp .env.example .env
+# Fill in: TRADIER_TOKEN, TRADIER_SANDBOX_TOKEN, TRADIER_ACCOUNT_ID,
+#          APCA_API_KEY_ID, APCA_API_SECRET_KEY,
+#          APCA_OPTIONS_KEY, APCA_OPTIONS_SECRET (if options),
+#          DATABASE_URL, REDPANDA_BROKERS, ALERT_EMAIL_TO
 
-### 2. Configure `.env`
-
-```env
-# Tradier (data streaming + paper trading)
-TRADIER_TOKEN=your_production_token         # $10/month — streaming + data
-TRADIER_SANDBOX_TOKEN=your_sandbox_token    # free — paper trading
-TRADIER_ACCOUNT_ID=your_account_id
-TRADIER_SANDBOX=true
-
-# Alpaca (paper trading + free fill WebSocket)
-APCA_API_KEY_ID=your_key
-APCA_API_SECRET_KEY=your_secret
-APCA_API_BASE_URL=https://paper-api.alpaca.markets
-
-# Execution mode
-BROKER_MODE=smart
-MONITOR_MODE=supervisor
-DATA_SOURCE=tradier
-
-# Database
-DB_ENABLED=true
-DATABASE_URL=postgresql://trading:trading@localhost:5432/tradinghub
-REDPANDA_BROKERS=127.0.0.1:9092
-```
-
-### 3. Start infrastructure
-
-```bash
+# 3. Infrastructure
 cd docker && docker compose up -d    # TimescaleDB + Redpanda
-python -m db.migrations.run          # schema migrations
-psql $DATABASE_URL < db/schema_v9_fill_ledger.sql  # V9 tables
-```
+python -m db.migrations.run
 
-### 4. Run
-
-```bash
+# 4. Run
 bash start_monitor.sh
+
+# 5. Cron (auto-start weekdays)
+# 0 6 * * 1-5 /path/to/trading_hub/start_monitor.sh >> /path/to/logs/cron.log 2>&1
 ```
 
-### 5. Cron
+Python 3.10+ required. macOS/Linux.
 
-```
-0 6 * * 1-5 /path/to/trading_hub/start_monitor.sh >> /path/to/logs/cron.log 2>&1
-```
+### Required .env Keys
+
+| Key | Required | Purpose |
+|-----|----------|---------|
+| TRADIER_TOKEN | Yes | Production streaming data ($10/mo) |
+| TRADIER_SANDBOX_TOKEN | Yes | Paper trading execution |
+| TRADIER_ACCOUNT_ID | Yes | Tradier account for orders |
+| APCA_API_KEY_ID | Yes | Alpaca paper trading |
+| APCA_API_SECRET_KEY | Yes | Alpaca paper trading |
+| APCA_OPTIONS_KEY | Options only | Separate Alpaca options account |
+| APCA_OPTIONS_SECRET | Options only | Separate Alpaca options account |
+| DATABASE_URL | Yes | PostgreSQL connection string |
+| REDPANDA_BROKERS | Yes | Redpanda IPC (default: 127.0.0.1:9092) |
+| ALERT_EMAIL_TO | Optional | Yahoo Mail for alerts |
+| ALERT_EMAIL_FROM | Optional | Sender address |
+| ALERT_EMAIL_APP_PASSWORD | Optional | Yahoo app password |
 
 ---
 
 ## Database
 
-| Table | Purpose | V9 |
-|-------|---------|-----|
-| `event_store` | Immutable event log | BarReceived writes stopped |
-| `market_bars` | V9: Lean bar table (10x smaller) | NEW |
-| `fill_lots` | V9: Lot-level position data | NEW |
-| `lot_matches` | V9: FIFO P&L audit trail | NEW |
-| `completed_trades` | Trade summaries | qty: NUMERIC(12,6) |
-| `data_source_snapshots` | Alt data from 8 sources | unchanged |
+| Table | Purpose |
+|-------|---------|
+| event_store | Immutable event log (SIGNAL, FILL, POSITION, ORDER_FAIL) |
+| market_bars | Lean bar table (1-min OHLCV, 10x smaller than event_store) |
+| fill_lots | Lot-level position data |
+| lot_matches | FIFO P&L audit trail |
+| completed_trades | Trade summaries with lifecycle data |
+| data_source_snapshots | Alt data from 10 sources |
 
 ---
 
-## V9 Docs
+## Data Sources (10)
 
-- `docs/V9_Trading_Hub/01_ARCHITECTURE_OVERVIEW.md` — system identity + process map
-- `docs/V9_Trading_Hub/02_DATA_PIPELINE.md` — streaming + polling + EventBus
-- `docs/V9_Trading_Hub/03_STRATEGY_AND_RISK.md` — detectors + risk checks + latency
-- `docs/V9_Trading_Hub/04_ORDER_EXECUTION.md` — brokers + fills + FillLedger
-- `docs/V9_Trading_Hub/05_LATENCY_PROFILE.md` — measured benchmarks + before/after
-- `docs/V9_Trading_Hub/06_SAFETY_AND_RECONCILIATION.md` — kill switch + reconciliation + guards
-- `docs/V9_Trading_Hub/07_MULTI_TIMEFRAME_DETECTORS.md` — 5-min bars for SR/Trend/Fib/Flag/InsideBar + activation timeline
-- `docs/V9_Trading_Hub/08_DATABASE_AND_OPERATIONS.md` — schema, analytics queries, startup sequence, RVOL optimization
-- `docs/V9_Trading_Hub/09_WATCHDOG_AND_SELF_HEALING.md` — session watchdog, self-healing, HotfixManager
-- `docs/V9_Trading_Hub/10_BACKTESTING.md` — backtest engine, data pipeline, strategies, results
-- `docs/V9_Trading_Hub/11_EVOLUTION_AND_ROADMAP.md` — V1-V9 timeline, system metrics, future roadmap
-- `docs/V9_Trading_Hub/12_FUTURE_ENHANCEMENTS.md` — complete roadmap: profitability filter, ranking wiring, data upgrades, sector rotation, hedging
-- `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md` — 9 foundation fixes + V10 exit engine: Order WAL, reconciliation, FillLedger authority, phase-based exits, trade analysis
-
-### Previous versions
-- `docs/V8_trading_hub/` — V8 architecture (reference)
-- `docs/V7_trading_hub/` — V7 design docs
-- `docs/V6_trading_hub/` — V6 design docs
+| # | Source | Data |
+|---|--------|------|
+| 1 | Tradier | Streaming ticks, REST bars, Level-1 quotes |
+| 2 | Alpaca | WebSocket fill updates, order execution |
+| 3 | Benzinga | Headlines, sentiment |
+| 4 | Finviz | Screener, insider, analyst targets |
+| 5 | SEC EDGAR | Insider filings |
+| 6 | Yahoo Finance | Earnings, recommendations |
+| 7 | Polygon.io | Previous-day movers, options |
+| 8 | Alpha Vantage | Technicals |
+| 9 | FRED | Macro indicators (rates, VIX) |
+| 10 | Fear & Greed | Market sentiment index |
 
 ---
 
-## Requirements
+## File Structure
 
-- Python 3.10+
-- Docker (TimescaleDB 2.26+ / PostgreSQL 16 + Redpanda)
-- Tradier account ($10/month for streaming, sandbox free for paper trading)
-- Alpaca account (paper trading free, WebSocket fills free)
-- Yahoo Mail app password for alerts (optional)
-- macOS/Linux
+```
+trading_hub/
+├── monitor/              # Core real-time trading layer (51 files)
+│   ├── monitor.py        # Event orchestrator
+│   ├── event_bus.py      # ASYNC priority dispatch (26 workers)
+│   ├── tick_detector.py  # Sub-second entry detection (5 detectors)
+│   ├── bar_builder.py    # WebSocket tick → 1-min OHLCV bars
+│   ├── smart_stop.py     # Context-aware stop distance
+│   ├── market_snapshot.py # Cold-start persistence
+│   ├── exit_engine.py    # 5-phase lifecycle exits
+│   ├── risk_engine.py    # VWAP risk gate (7 checks)
+│   ├── strategy_engine.py # VWAP Reclaim strategy
+│   ├── position_manager.py # Position state machine
+│   ├── fill_ledger.py    # FIFO lot matching, P&L authority
+│   ├── order_wal.py      # Write-ahead log, crash recovery
+│   ├── smart_router.py   # Alpaca + Tradier lot-aware routing
+│   ├── tradier_broker.py # Tradier execution + stop management
+│   ├── brokers.py        # Alpaca execution + bracket orders
+│   ├── tradier_stream.py # WebSocket streaming client
+│   └── ...               # alerts, metrics, registry, kill switch, etc.
+│
+├── pro_setups/           # Pro technical strategies
+│   ├── engine.py         # 13 detectors, classifier, smart stops
+│   ├── detectors/        # ORB, S/R, gap, momentum, VWAP, trend, etc.
+│   ├── strategies/       # 11 strategy implementations
+│   ├── router/           # Signal → RiskAdapter routing
+│   └── risk/             # Independent risk gate + stopped-today blacklist
+│
+├── options/              # Options trading (separate account)
+│   ├── engine.py         # Entry/exit with Greeks tracking
+│   ├── options_exit_engine.py # 3-phase risk-regime lifecycle
+│   ├── strategies/       # 13 multi-leg strategy types
+│   └── ...               # chain, broker, risk, IV tracker
+│
+├── lifecycle/            # Engine lifecycle management
+│   ├── core.py           # Startup/shutdown/tick orchestration
+│   ├── reconciler.py     # Broker ↔ local position sync
+│   ├── kill_switch.py    # Daily loss halt
+│   └── ...               # heartbeat, EOD report, state persistence
+│
+├── scripts/              # Run scripts and tools
+│   ├── run_core.py       # Main trading loop (ET logging)
+│   ├── run_options.py    # Options engine launcher
+│   ├── supervisor.py     # Multi-engine process manager
+│   ├── outer_watchdog.py # launchd-integrated watchdog
+│   └── ...               # preflight, analytics, backfill
+│
+├── data_sources/         # Alternative data collection (10 sources)
+├── backtests/            # Backtesting framework (event-replay harness)
+│   └── run_backtest.py   # Run: --data tradier --save-to-db --csv
+├── dashboards/           # Streamlit analysis dashboards
+│   ├── backtest_dashboard.py    # Port 8502: backtest results viewer
+│   └── trade_analysis_dashboard.py # Port 8503: live trade analysis
+├── db/                   # Database migrations and schema
+├── docker/               # TimescaleDB + Redpanda compose
+└── config.py             # All settings, paths, credentials
+```
 
 ---
 
 ## Backtesting
 
-V9 includes a full backtesting framework with a Tradier + DB data pipeline.
-
-- **Data pipeline (Option C)**: Fetch 1m/5m bars from Tradier API, persist to `market_bars` DB table, future loads read from DB instantly (no API calls).
-- **Dual timeframe**: 1-minute bars for recent 20 days, 5-minute bars for full 40-day window. `BarDataLoader` supports yfinance, Tradier, and DB sources.
+Event-replay harness with Tradier + DB data pipeline:
+- **Data**: Fetch 1m/5m bars from Tradier API, persist to `market_bars` DB table. Future loads read from DB (no API calls).
+- **Dual timeframe**: 1-minute bars (recent 20 days) + 5-minute bars (full 40-day window).
 - **Backfill**: `python scripts/backfill_bars.py` populates DB from Tradier history.
 - **Run**: `python backtests/run_backtest.py --data tradier --save-to-db --csv`
-- **Dashboard**: `streamlit run dashboards/backtest_dashboard.py` (port 8502) — interactive results viewer with per-strategy breakdown.
+- **Dashboards**: `streamlit run dashboards/backtest_dashboard.py` (port 8502), `streamlit run dashboards/trade_analysis_dashboard.py` (port 8503)
+
+### Analytics
+- `scripts/post_session_analytics.py` — daily trade analysis, P&L breakdown
+- `scripts/analyze_options_pf.py` — options PF by strategy, exit reason, risk score
+- `scripts/weekly_options_review.py` — weekly calibration with threshold recommendations (auto-triggered Fridays)
+- `reports/daily_analysis/trade_analysis_YYYYMMDD.csv` — per-trade detail export
 
 ---
 
-## Session Watchdog
+## Production Hardening (V10)
 
-`scripts/session_watchdog.py` provides self-healing monitoring for 3 child processes under Supervisor (Core, Options, DataCollector).
+47 fixes across 20 files:
 
-- **Health checks**: Process alive, zombie detection (log staleness), log error scanning, signal rate monitoring, position tracking, kill switch state, fill ledger integrity, data freshness, memory usage, gap_and_go detection.
-- **Self-healing**: Corrupt JSON restore from `.prev` backups, stale `.lock` file removal, `__pycache__` clearing, supervisor restart, zombie process kill.
-- **HotfixManager**: Auto-applies fixes for common runtime errors (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError, ZeroDivisionError) during paper trading. Creates `.bak` backups, syntax-checks before write, max 5 fixes per session, protected files list.
-- **Email updates**: 7 hourly status reports during market hours (9:30 AM - 4:00 PM ET).
-- **Resilient loop**: `_run_one_cycle()` with cycle-level try/except. Escalates after 10 consecutive errors.
-
----
-
-## Emergency Rollback
-
-`emergency_rollback.sh` reverts the entire codebase to the V9 baseline (`v9-baseline` tag, commit `b838c04`) — the last tested, stable production run.
-
-```bash
-./emergency_rollback.sh            # Stop all processes, revert code, clear pycache
-./emergency_rollback.sh --dry-run  # Preview without changes
-```
-
-Stops all trading processes, stashes uncommitted work, checks out baseline code, clears `__pycache__`, and verifies key files. Does NOT auto-restart — run `start_monitor.sh` manually after verifying.
-
----
-
-## V10 Foundation Hardening (April 22, 2026)
-
-The April 22 session exposed 20 systemic issues including $50 P&L drift, options engine blind all day, and 3 concurrent supervisors. All 9 foundation fixes implemented same-day:
-
-| Fix | What |
-|---|---|
-| **Order WAL** | Write-ahead log tracks every order INTENT→SUBMITTED→FILLED→RECORDED. Covers core + options. 0.04ms overhead. |
-| **Continuous Reconciliation** | Broker vs local comparison every 5 min (was 10/30/60). Alert on divergence. |
-| **FillLedger P&L Authority** | `daily_pnl` + `open_positions` persisted in fill_ledger.json v2. Single P&L source. |
-| **State Path Constants** | 6 paths in config.py. Zero hardcoded paths in production code. |
-| **Test Isolation** | `conftest.py` autouse fixture. Tests write to tmp_path, never production. |
-| **Supervisor Lock** | `fcntl.flock` prevents duplicate supervisors. |
-| **Startup Preflight** | 10 checks (SMTP, brokers, state, IPC, DB) before trading starts. |
-| **Error Escalation** | 19 critical `log.debug` → `log.warning`. No more silent failures. |
-| **Race Condition** | `list(dict)` snapshot prevents `dict changed size during iteration` crash. |
-
-Also fixed: 5 backtest simulator bugs, edge context data capture (4 signal paths + DB), IPC signal forwarding, email P&L/trades, watchdog health checks. See `docs/V9_Trading_Hub/13_FOUNDATION_FIXES.md`.
-
-## V10 Exit Engine (April 23, 2026)
-
-April 23 analysis revealed the system captured -8% of $984 available profit. Entries were valid — exits were destroying value (78 trades held <10 seconds, RSI/VWAP panic exits killed winners).
-
-Complete exit engine redesign: `monitor/exit_engine.py`
-
-| Phase | Purpose | Key Behavior |
-|---|---|---|
-| **Phase 0** | Entry validation | Per-strategy thesis check (SR held? ORB held? Volume confirming?) |
-| **Phase 1** | Protection | Stop only. No RSI/VWAP exits. Higher low detection. |
-| **Phase 2** | Breakeven | Stop to entry (cushion for structure). RSI tightens trail mildly. |
-| **Phase 3** | Profit harvest | Confluence-aware partials (33-66%). Structure trail. RSI tightens normally. |
-| **Phase 4** | Runner | 5-bar swing low + VWAP floor + R floor. Let winners run. |
-
-10 per-strategy exit profiles. Impulse vs structure classification. All lifecycle decisions captured to DB (`position_events.close_detail.lifecycle`).
-
-**Trade analysis:** `reports/daily_analysis/trade_analysis_YYYYMMDD.csv` + Streamlit dashboard at `dashboards/trade_analysis_dashboard.py` (port 8503).
-
----
-
-## First Production Run (April 20, 2026)
-
-The system ran its first production session on April 20. All 4 processes started and stayed alive for the full session. No trades were executed due to a `gap_and_go` low-coverage crash that caused the strategy engine to halt early. The root cause was identified and fixed:
-
-- `gap_and_go` threshold raised from 0.5% to 1.5% with added volume confirmation, trend alignment, VWAP requirement, and tighter continuation filters (70/30).
-- Backtesting confirmed the fix: trades dropped from 34K to 20K, win rate improved from 30.6% to 38.7%, P&L swung from -$587 to +$568, profit factor improved from 0.96 to 1.06.
+| Category | Key Fixes |
+|----------|-----------|
+| Thread safety | Atomic kill switch lock, dict snapshots, stream client lock, pending order tracking |
+| Order execution | Stop-above-entry fix, Tradier tag dedup, sell verification, exponential backoff |
+| State management | Disk-full protection, atomic writes, version monotonic check |
+| Risk controls | Per-broker daily loss, data coverage circuit breaker (30%/3 cycles), trade freeze |
+| Data quality | Indicator freshness tracking, gap regime classification, level stability (2-bar minimum) |
+| Monitoring | Data staleness alert (120s), stale order cleanup (60s), BarBuilder auto-restart |
+| Operations | READ_ONLY mode, ET timestamps, stopped-today blacklist, ORB 30-min cutoff |

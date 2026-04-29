@@ -985,9 +985,20 @@ class OptionsEngine:
             pos.current_pnl, pos.holding_minutes, pos.dte,
         )
 
+        # V10: Skip broker close for worthless options near expiry.
+        # Not worth $0.65 commission to close a $0 option with DTE <= 3.
+        # Let it expire worthless — same P&L outcome, saves commission.
+        _skip_broker = (pos.dte <= 3
+                        and pos.spec.max_risk > 0
+                        and pos.current_pnl <= -(pos.spec.max_risk * 0.95))
+        if _skip_broker:
+            log.info("[OptionsEngine] SKIP BROKER CLOSE %s — near-worthless "
+                     "(pnl=$%.2f, dte=%d, max_risk=$%.2f). Letting expire.",
+                     ticker, pos.current_pnl, pos.dte, pos.spec.max_risk)
+
         # Execute close via broker
         success = True
-        if self._broker:
+        if self._broker and not _skip_broker:
             success = self._broker.close_position(ticker, pos.spec.legs)
 
         if success:

@@ -301,6 +301,17 @@ class RiskEngine:
                 self._block(ticker, p.action, beta_reason, event)
                 return
 
+            # ── Smart stop validation — reject if stop too wide ────────────
+            _atr = getattr(p, 'atr_value', 0) or 0
+            _stop = getattr(p, 'stop_price', 0) or 0
+            if _atr > 0 and _stop > 0 and ask_price > 0:
+                _stop_dist = ask_price - _stop
+                if _stop_dist > _atr * 3.0:
+                    self._block(ticker, p.action,
+                                f"stop too wide ({_stop_dist/_atr:.1f} ATR, max 3.0) "
+                                f"entry=${ask_price:.2f} stop=${_stop:.2f}", event)
+                    return
+
             # ── All checks passed — size and submit ──────────────────────────
             effective_entry = ask_price * (1 + SLIPPAGE_PCT)
             qty = max(1, int(self._trade_budget / effective_entry))

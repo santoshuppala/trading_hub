@@ -29,7 +29,12 @@ class TrendDetector(BaseDetector):
     """
     name:          str = 'trend'
     MIN_BARS:      int = 20       # V10.2: EMA20 on 1-min fallback (was 52)
-    _MIN_5M_BARS:  int = 4        # V10.2: 4 five-min bars = 20 min (was 12)
+    _MIN_5M_BARS:  int = 10       # V10.2: 10 five-min bars = 50 min = 10:20 AM
+                                  # EMA9 needs 9 periods to stabilize (have 10 ✓)
+                                  # EMA20 starting to stabilize (10 of 20 periods)
+                                  # Structural confirmation: 9 comparisons (meaningful)
+                                  # Was 4 (too early, EMAs meaningless)
+                                  # Was 12 (too late, misses best window)
     _LOOKBACK:     int = 20
     _MIN_STR:      float = 0.45   # 45% of bars must show trending structure
 

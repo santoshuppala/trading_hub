@@ -227,9 +227,9 @@ class ProSetupEngine:
                 precomputed['df_5min'] = df_5min
 
                 # Precompute 5-min indicators for detectors that use them
-                # V10.2: lowered from 10 to 4 (TrendDetector needs EMA20 on 5-min,
-                # valid with 4 bars = 20 min from open = 9:50 AM)
-                if len(df_5min) >= 4:
+                # V10.2: 10 bars (50 min from open = 10:20 AM). EMA9 reliable at
+                # 9 periods, EMA20 starting to stabilize, structure has 9 comparisons.
+                if len(df_5min) >= 10:
                     from .detectors._compute import compute_ema
                     precomputed['ema_9_5m'] = compute_ema(df_5min['close'], 9)
                     precomputed['ema_21_5m'] = compute_ema(df_5min['close'], 21)

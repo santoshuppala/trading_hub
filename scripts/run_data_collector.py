@@ -70,6 +70,9 @@ def main():
     publisher = EventPublisher(source_name='data_collector')
     TOPIC_DISCOVERY = 'th-discovery'
 
+    # ── V10: DB-based discovery persistence (flag set after DB init below) ──
+    _discovery_state = {'db_ready': False}
+
     # ── Shared alt-data cache (read by Core, Pop, Options) ─────────────
     ALT_CACHE_PATH = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -92,7 +95,8 @@ def main():
             asyncio.run_coroutine_threadsafe(init_db(DATABASE_URL), _db_loop).result(timeout=15)
             _db_writer = init_writer(_db_loop)
             asyncio.run_coroutine_threadsafe(_db_writer.start(), _db_loop).result(timeout=5)
-            log.info("DB persistence initialized (pool + writer, no event subscriber)")
+            _discovery_state['db_ready'] = True  # V10: enable DB-based discovery persistence
+            log.info("DB persistence initialized (pool + writer + discovery)")
             def _db_cleanup():
                 try:
                     asyncio.run_coroutine_threadsafe(_db_writer.stop(), _db_loop).result(timeout=5)
@@ -132,8 +136,10 @@ def main():
     def _discover_from_news():
         """V8: Discover tickers from MARKET-WIDE Benzinga headlines.
         1 API call → extracts all mentioned tickers from recent headlines.
-        Best used during pre-market to find overnight movers."""
+        Best used during pre-market to find overnight movers.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         tickers = set()
+        meta_list = []
         try:
             if hasattr(_collect_and_cache, '_api_state') and _collect_and_cache._api_state.get('benz'):
                 benz = _collect_and_cache._api_state['benz']
@@ -141,34 +147,55 @@ def main():
                 for ticker, info in trending.items():
                     if ticker not in TICKERS and len(ticker) <= 5 and ticker.isalpha():
                         tickers.add(ticker)
+                        meta_list.append({
+                            'ticker': ticker,
+                            'source': 'benzinga_news',
+                            'metadata': {
+                                'reason': 'headline_mentions',
+                                'mention_count': info.get('count', 0) if isinstance(info, dict) else 0,
+                                'window_hours': 4.0,
+                            },
+                        })
                 if tickers:
                     log.info("[Discovery] Benzinga news: %d tickers mentioned in headlines: %s",
                              len(tickers), sorted(tickers)[:10])
         except Exception as exc:
             log.debug("[Discovery] Benzinga news discovery failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _discover_from_social_trending():
-        """V8: Discover tickers from StockTwits trending. 1 API call → top 30."""
+        """V8: Discover tickers from StockTwits trending. 1 API call → top 30.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         tickers = set()
+        meta_list = []
         try:
             if hasattr(_collect_and_cache, '_api_state') and _collect_and_cache._api_state.get('st'):
                 st = _collect_and_cache._api_state['st']
                 trending = st.discover_trending()
-                for ticker in trending:
+                for i, ticker in enumerate(trending):
                     if ticker not in TICKERS and len(ticker) <= 5 and ticker.isalpha():
                         tickers.add(ticker)
+                        meta_list.append({
+                            'ticker': ticker,
+                            'source': 'stocktwits',
+                            'metadata': {
+                                'reason': 'trending',
+                                'trending_rank': i + 1,
+                            },
+                        })
                 if tickers:
                     log.info("[Discovery] StockTwits trending: %d new tickers: %s",
                              len(tickers), sorted(tickers)[:10])
         except Exception as exc:
             log.debug("[Discovery] StockTwits trending failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _discover_from_finviz_intraday():
         """V8: Scrape Finviz for intraday movers — top gainers, unusual volume.
-        1 page scrape, polite. Returns tickers with strong intraday moves."""
+        1 page scrape, polite. Returns tickers with strong intraday moves.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         tickers = set()
+        meta_list = []
         try:
             finviz = collector._sources.get('finviz')
             if finviz and hasattr(finviz, 'top_gainers'):
@@ -177,55 +204,95 @@ def main():
                     for g in gainers:
                         sym = g.get('ticker', g.get('symbol', ''))
                         if sym and len(sym) <= 5 and sym.isalpha():
-                            tickers.add(sym.upper())
+                            sym = sym.upper()
+                            tickers.add(sym)
+                            meta_list.append({
+                                'ticker': sym,
+                                'source': 'finviz_intraday',
+                                'metadata': {
+                                    'reason': 'top_gainer',
+                                    'change_pct': float(g.get('change_pct', g.get('changePct', 0)) or 0),
+                                    'volume': int(g.get('volume', 0) or 0),
+                                },
+                            })
                     log.info("[Discovery] Finviz gainers: %d tickers", len(tickers))
             elif finviz and hasattr(finviz, 'screener_scan'):
-                # Fallback: use screener with volume filter
                 results = finviz.screener_scan(
                     signal='unusual_volume', limit=10)
                 if results:
                     for r in results:
                         sym = r.get('ticker', r.get('symbol', ''))
                         if sym and len(sym) <= 5 and sym.isalpha():
-                            tickers.add(sym.upper())
+                            sym = sym.upper()
+                            tickers.add(sym)
+                            meta_list.append({
+                                'ticker': sym,
+                                'source': 'finviz_intraday',
+                                'metadata': {
+                                    'reason': 'unusual_volume',
+                                    'volume': int(r.get('volume', 0) or 0),
+                                },
+                            })
                     log.info("[Discovery] Finviz unusual vol: %d tickers", len(tickers))
         except Exception as exc:
             log.debug("[Discovery] Finviz intraday failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _discover_from_yahoo_intraday():
         """V8: Check Yahoo for intraday upgrades/downgrades/earnings surprises.
-        Free, no rate limit. Returns tickers with significant analyst actions."""
+        Free, no rate limit. Returns tickers with significant analyst actions.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         tickers = set()
+        meta_list = []
         try:
             yahoo = collector._sources.get('yahoo')
             if yahoo:
-                # Check for upgrades/downgrades today
                 if hasattr(yahoo, 'analyst_actions'):
                     actions = yahoo.analyst_actions()
                     if actions:
                         for a in actions[:15]:
                             sym = a.get('ticker', a.get('symbol', ''))
                             if sym and len(sym) <= 5 and sym.isalpha():
-                                tickers.add(sym.upper())
+                                sym = sym.upper()
+                                tickers.add(sym)
+                                meta_list.append({
+                                    'ticker': sym,
+                                    'source': 'yahoo_intraday',
+                                    'metadata': {
+                                        'reason': 'analyst_action',
+                                        'action_type': a.get('action', a.get('type', 'unknown')),
+                                        'firm': a.get('firm', ''),
+                                    },
+                                })
                         log.info("[Discovery] Yahoo analyst actions: %d tickers", len(tickers))
 
-                # Also re-check earnings (companies report intraday)
                 if hasattr(yahoo, 'earnings_calendar'):
                     calendar = yahoo.earnings_calendar()
                     if calendar:
                         for entry in calendar[:10]:
                             sym = entry.get('ticker', entry.get('symbol', ''))
                             if sym and len(sym) <= 5 and sym.isalpha():
-                                tickers.add(sym.upper())
+                                sym = sym.upper()
+                                if sym not in tickers:
+                                    tickers.add(sym)
+                                    meta_list.append({
+                                        'ticker': sym,
+                                        'source': 'yahoo_intraday',
+                                        'metadata': {
+                                            'reason': 'earnings_report',
+                                            'earnings_date': str(entry.get('date', '')),
+                                        },
+                                    })
         except Exception as exc:
             log.debug("[Discovery] Yahoo intraday failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _discover_from_polygon_intraday():
         """V8: Check Polygon for intraday volume spikes.
-        Uses snapshot endpoint (1 call). Returns tickers with unusual intraday activity."""
+        Uses snapshot endpoint (1 call). Returns tickers with unusual intraday activity.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         tickers = set()
+        meta_list = []
         try:
             polygon = collector._sources.get('polygon')
             if polygon and hasattr(polygon, 'gainers_losers'):
@@ -233,22 +300,33 @@ def main():
                 if movers:
                     for m in movers[:15]:
                         sym = m.get('ticker', m.get('symbol', ''))
-                        change = abs(float(m.get('change_pct', m.get('todaysChangePerc', 0))))
-                        if sym and change > 3.0 and len(sym) <= 5:
-                            tickers.add(sym.upper())
+                        change_pct = abs(float(m.get('change_pct', m.get('todaysChangePerc', 0))))
+                        if sym and change_pct > 3.0 and len(sym) <= 5:
+                            sym = sym.upper()
+                            tickers.add(sym)
+                            meta_list.append({
+                                'ticker': sym,
+                                'source': 'polygon_intraday',
+                                'metadata': {
+                                    'reason': 'intraday_mover',
+                                    'change_pct': round(change_pct, 2),
+                                    'volume': int(m.get('volume', 0) or 0),
+                                },
+                            })
                     log.info("[Discovery] Polygon intraday movers: %d tickers (>3%%)", len(tickers))
         except Exception as exc:
             log.debug("[Discovery] Polygon intraday failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _discover_from_polygon_movers():
-        """Discover tickers with big previous-day moves NOT in watchlist."""
+        """Discover tickers with big previous-day moves NOT in watchlist.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         polygon = collector._sources.get('polygon')
         if not polygon:
-            return set()
+            return set(), []
         tickers = set()
+        meta_list = []
         try:
-            # Check a broad set of common high-volume tickers
             scan_candidates = [
                 'CRWV', 'SMCI', 'IONQ', 'RGTI', 'QUBT', 'LUNR', 'RKLB',
                 'APP', 'ALAB', 'VRT', 'OKLO', 'SMR', 'NNE', 'VST', 'CEG',
@@ -262,6 +340,16 @@ def main():
                     prev = polygon.previous_close(ticker)
                     if prev and abs(prev.change_pct) > 3.0 and prev.volume > 500000:
                         tickers.add(ticker)
+                        meta_list.append({
+                            'ticker': ticker,
+                            'source': 'polygon_movers',
+                            'metadata': {
+                                'reason': 'prev_day_mover',
+                                'change_pct': round(abs(prev.change_pct), 2),
+                                'volume': int(prev.volume),
+                                'date': str(getattr(prev, 'date', '')),
+                            },
+                        })
                 except Exception:
                     pass
             if tickers:
@@ -269,26 +357,38 @@ def main():
                          len(tickers), sorted(tickers)[:10])
         except Exception as exc:
             log.debug("[Discovery] Polygon discovery failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _discover_from_yahoo_earnings():
-        """Discover tickers with upcoming earnings."""
+        """Discover tickers with upcoming earnings.
+        V10: Returns (set, list_of_meta_dicts) for DB persistence."""
         source = collector._sources.get('yahoo')
         if not source:
-            return set()
+            return set(), []
         tickers = set()
+        meta_list = []
         try:
             calendar = source.earnings_calendar()
             if calendar:
                 for entry in calendar[:30]:
                     ticker = entry.get('ticker') or entry.get('symbol', '')
                     if ticker and len(ticker) <= 5 and ticker.isalpha():
-                        tickers.add(ticker.upper())
+                        ticker = ticker.upper()
+                        tickers.add(ticker)
+                        meta_list.append({
+                            'ticker': ticker,
+                            'source': 'yahoo_earnings',
+                            'metadata': {
+                                'reason': 'upcoming_earnings',
+                                'earnings_date': str(entry.get('date', entry.get('earnings_date', ''))),
+                                'eps_estimate': float(entry.get('eps_estimate', 0) or 0),
+                            },
+                        })
                 log.info("[Discovery] Yahoo earnings calendar: %d tickers this week",
                          len(tickers))
         except Exception as exc:
             log.debug("[Discovery] Yahoo earnings failed: %s", exc)
-        return tickers
+        return tickers, meta_list
 
     def _collect_and_cache(tickers):
         """Run full collection cycle and write to shared cache."""
@@ -458,10 +558,22 @@ def main():
                 if uof_results:
                     cache_data['unusual_options_flow'] = {
                         r['ticker']: r for r in uof_results}
-                    # Bullish unusual flow → add to discovery
+                    # Bullish unusual flow → add to discovery + persist to DB
+                    uof_meta = []
                     for r in uof_results:
                         if r.get('signal') == 'bullish' and r.get('confidence', 0) > 0.5:
                             discovered_tickers.add(r['ticker'])
+                            uof_meta.append({
+                                'ticker': r['ticker'],
+                                'source': 'unusual_options_flow',
+                                'metadata': {
+                                    'reason': 'bullish_flow',
+                                    'signal': r.get('signal'),
+                                    'confidence': round(r.get('confidence', 0), 3),
+                                    'volume_oi_ratio': round(r.get('volume_oi_ratio', 0), 2),
+                                },
+                            })
+                    _persist_discoveries_to_db(uof_meta)
                     log.info("[Collector] Unusual options flow: %d tickers with activity",
                              len(uof_results))
             except Exception as exc:
@@ -586,6 +698,28 @@ def main():
         log.info("[Discovery] Published %d new tickers to %s: %s",
                  len(new_tickers), TOPIC_DISCOVERY,
                  sorted(new_tickers)[:10])
+
+    def _persist_discoveries_to_db(tickers_with_meta):
+        """V10: Persist discovered tickers to DB with source-specific metadata.
+
+        Parameters
+        ----------
+        tickers_with_meta : list of dict
+            Each dict: {'ticker': str, 'source': str, 'metadata': dict}
+        """
+        if not _discovery_state['db_ready'] or not tickers_with_meta:
+            return
+        try:
+            import asyncio as _aio
+            from db.discovery import record_discoveries_batch
+            written = _aio.run_coroutine_threadsafe(
+                record_discoveries_batch(tickers_with_meta),
+                _db_loop,
+            ).result(timeout=10)
+            if written:
+                log.info("[Discovery DB] Persisted %d discoveries to DB", written)
+        except Exception as exc:
+            log.warning("[Discovery DB] Batch persist failed: %s", exc)
 
     def _persist_to_db(cache_data):
         """V8: Write ALL data source snapshots to data_source_snapshots table.
@@ -764,19 +898,25 @@ def main():
                 except Exception as exc:
                     log.warning("Session start collection failed: %s", exc)
 
-                # V8: Pre-market discovery burst — find new tickers from ALL sources
-                # These 2 calls use market-wide endpoints (1 API call each)
-                # to discover tickers we're NOT tracking but SHOULD be
-                news_tickers = _discover_from_news()          # 1 Benzinga call
-                social_tickers = _discover_from_social_trending()  # 1 StockTwits call
-                discovered_tickers.update(news_tickers)
-                discovered_tickers.update(social_tickers)
+                # V8/V10: Pre-market discovery burst — find new tickers from ALL sources
+                # Each function returns (set, meta_list) for DB persistence
+                all_meta = []
 
-                # Existing discovery sources
-                earnings_tickers = _discover_from_yahoo_earnings()
+                news_tickers, news_meta = _discover_from_news()
+                discovered_tickers.update(news_tickers)
+                all_meta.extend(news_meta)
+
+                social_tickers, social_meta = _discover_from_social_trending()
+                discovered_tickers.update(social_tickers)
+                all_meta.extend(social_meta)
+
+                earnings_tickers, earnings_meta = _discover_from_yahoo_earnings()
                 discovered_tickers.update(earnings_tickers)
-                polygon_tickers = _discover_from_polygon_movers()
+                all_meta.extend(earnings_meta)
+
+                polygon_tickers, polygon_meta = _discover_from_polygon_movers()
                 discovered_tickers.update(polygon_tickers)
+                all_meta.extend(polygon_meta)
 
                 log.info("[Discovery] PRE-MARKET total: %d new tickers "
                          "(news=%d social=%d earnings=%d polygon=%d)",
@@ -784,10 +924,14 @@ def main():
                          len(social_tickers), len(earnings_tickers),
                          len(polygon_tickers))
 
+                # V10: Persist all discoveries to DB (single source of truth)
+                _persist_discoveries_to_db(all_meta)
+
                 # Full collection
                 cache_data = _collect_and_cache(TICKERS)
                 _persist_to_db(cache_data)
 
+                # Keep Kafka publish for backward compat (Options process may consume)
                 if discovered_tickers:
                     new = discovered_tickers - set(TICKERS)
                     if new:
@@ -817,21 +961,31 @@ def main():
                 log.info("Discovery refresh (%s)",
                          'TRADING' if _is_trading else 'PRE-MARKET')
                 new_tickers = set()
+                all_meta = []
 
                 # Always: news + social trending (1 API call each, cheap)
-                new_tickers.update(_discover_from_news())
-                new_tickers.update(_discover_from_social_trending())
+                _nt, _nm = _discover_from_news()
+                new_tickers.update(_nt); all_meta.extend(_nm)
+                _nt, _nm = _discover_from_social_trending()
+                new_tickers.update(_nt); all_meta.extend(_nm)
 
                 # Always: earnings + prev-day movers
-                new_tickers.update(_discover_from_yahoo_earnings())
-                new_tickers.update(_discover_from_polygon_movers())
+                _nt, _nm = _discover_from_yahoo_earnings()
+                new_tickers.update(_nt); all_meta.extend(_nm)
+                _nt, _nm = _discover_from_polygon_movers()
+                new_tickers.update(_nt); all_meta.extend(_nm)
 
                 # V8: During trading hours — also scan for intraday movers
-                # These are free/cheap and catch stocks moving NOW
                 if _is_trading:
-                    new_tickers.update(_discover_from_finviz_intraday())
-                    new_tickers.update(_discover_from_yahoo_intraday())
-                    new_tickers.update(_discover_from_polygon_intraday())
+                    _nt, _nm = _discover_from_finviz_intraday()
+                    new_tickers.update(_nt); all_meta.extend(_nm)
+                    _nt, _nm = _discover_from_yahoo_intraday()
+                    new_tickers.update(_nt); all_meta.extend(_nm)
+                    _nt, _nm = _discover_from_polygon_intraday()
+                    new_tickers.update(_nt); all_meta.extend(_nm)
+
+                # V10: Always persist ALL discoveries to DB (upsert handles dedup)
+                _persist_discoveries_to_db(all_meta)
 
                 truly_new = new_tickers - discovered_tickers - set(TICKERS)
                 if truly_new:

@@ -252,6 +252,7 @@ class SessionWatchdog:
         results.append(self._check_v10_options_lifecycle())
         results.append(self._check_v10_pending_tickers())
         results.append(self._check_v10_bar_builder())
+        results.append(self._check_v10_discovery_db())
         return [r for r in results if r is not None]
 
     # ── Individual checks ─────────────────────────────────────────────────
@@ -826,6 +827,115 @@ class SessionWatchdog:
                 f'{restarts} restarts (0 = healthy)')
         except Exception as e:
             return HealthCheck('v10_bar_builder', 'OK', f'Check skipped: {e}')
+
+    def _check_v10_discovery_db(self) -> HealthCheck:
+        """V10: Check discovery DB pipeline — data_collector writing, Core polling."""
+        today = datetime.now().strftime('%Y%m%d')
+        now = datetime.now(ET)
+
+        # Only check during market hours (discoveries happen 9:30-16:00)
+        if now.hour < 10:
+            return HealthCheck('v10_discovery_db', 'OK', 'Pre-market — skipping')
+
+        issues = []
+        db_count = 0
+        db_sources = set()
+
+        # 1. Check DB for today's discoveries
+        try:
+            import psycopg2
+            dsn = os.getenv('DATABASE_URL',
+                            'postgresql://trading:trading_secret@localhost:5432/tradinghub')
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            cur = conn.cursor()
+
+            # Count today's discoveries
+            cur.execute("""
+                SELECT COUNT(*), COUNT(DISTINCT source)
+                FROM trading.discovered_tickers
+                WHERE session_date = CURRENT_DATE
+            """)
+            row = cur.fetchone()
+            db_count = row[0] or 0
+            source_count = row[1] or 0
+
+            # Get source breakdown
+            cur.execute("""
+                SELECT source, COUNT(*) as cnt
+                FROM trading.discovered_tickers
+                WHERE session_date = CURRENT_DATE
+                GROUP BY source ORDER BY cnt DESC
+            """)
+            db_sources = {r[0]: r[1] for r in cur.fetchall()}
+
+            # Check freshness: most recent discovery timestamp
+            cur.execute("""
+                SELECT MAX(ts) FROM trading.discovered_tickers
+                WHERE session_date = CURRENT_DATE
+            """)
+            latest = cur.fetchone()[0]
+
+            conn.close()
+
+            if db_count == 0 and now.hour >= 10:
+                issues.append('NO discoveries in DB today')
+            elif latest:
+                age_min = (now - latest.astimezone(ET)).total_seconds() / 60
+                if age_min > 45 and now.hour < 16:
+                    issues.append(f'stale: last discovery {age_min:.0f}min ago')
+
+        except ImportError:
+            # psycopg2 not available — fall through to log-based check
+            pass
+        except Exception as exc:
+            issues.append(f'DB query failed: {exc}')
+
+        # 2. Check Core log for DB poll activity
+        core_log = os.path.join(PROJECT_ROOT, 'logs', today, 'core.log')
+        core_restored = 0
+        core_added = 0
+        try:
+            if os.path.exists(core_log):
+                result = subprocess.run(
+                    ['/usr/bin/grep', '-c', 'Restored.*discovered tickers from DB', core_log],
+                    capture_output=True, text=True, timeout=5)
+                core_restored = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+                result2 = subprocess.run(
+                    ['/usr/bin/grep', '-c', r'\[Discovery\] Added', core_log],
+                    capture_output=True, text=True, timeout=5)
+                core_added = int(result2.stdout.strip()) if result2.returncode == 0 else 0
+
+                if core_restored == 0 and core_added == 0 and now.hour >= 10:
+                    issues.append('Core has 0 DB restores and 0 discovery adds')
+        except Exception:
+            pass
+
+        # 3. Check data_collector log for DB persist activity
+        dc_log = os.path.join(PROJECT_ROOT, 'logs', today, 'data_collector.log')
+        dc_persisted = 0
+        try:
+            if os.path.exists(dc_log):
+                result = subprocess.run(
+                    ['/usr/bin/grep', '-c', 'Discovery DB.*Persisted', dc_log],
+                    capture_output=True, text=True, timeout=5)
+                dc_persisted = int(result.stdout.strip()) if result.returncode == 0 else 0
+        except Exception:
+            pass
+
+        # Build result
+        source_str = ', '.join(f'{s}={c}' for s, c in list(db_sources.items())[:4])
+        msg = (f'DB: {db_count} tickers ({source_str}) | '
+               f'Core: restored={core_restored} added={core_added} | '
+               f'collector: {dc_persisted} persists')
+
+        if issues:
+            self.issues_found['discovery_db'] += 1
+            severity = 'CRITICAL' if 'NO discoveries' in ' '.join(issues) else 'WARNING'
+            return HealthCheck('v10_discovery_db', 'WARN',
+                               f'{msg} | ISSUES: {"; ".join(issues)}', severity)
+
+        return HealthCheck('v10_discovery_db', 'OK', msg)
 
     # ── Self-Healing ──────────────────────────────────────────────────────
 

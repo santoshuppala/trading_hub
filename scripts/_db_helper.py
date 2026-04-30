@@ -87,7 +87,7 @@ def init_satellite_db(bus, process_name: str = 'satellite'):
 
         log.info("[%s] DB layer ready — events will be persisted to event_store", process_name)
 
-        # Return cleanup function
+        # Return cleanup function (with .loop attribute for V10 DB polling)
         def _cleanup():
             try:
                 flush_future = asyncio.run_coroutine_threadsafe(db_writer.stop(), db_loop)
@@ -100,6 +100,7 @@ def init_satellite_db(bus, process_name: str = 'satellite'):
             except Exception as exc:
                 log.warning("[%s] DB cleanup error: %s", process_name, exc)
 
+        _cleanup.loop = db_loop  # V10: exposed for discovery DB polling
         return _cleanup
 
     except Exception as exc:

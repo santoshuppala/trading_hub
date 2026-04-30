@@ -119,10 +119,43 @@ class MomentumScreener:
                     f"{', '.join(added[:20])}"
                 )
                 log.info(f"[Momentum] Total scan list: {len(new_tickers)} tickers")
+
+                # V10: Persist to discovered_tickers DB table
+                self._persist_to_db(added, spy_ret=None)
         else:
             new_tickers = list(current_tickers)
 
         return new_tickers, now
+
+    def _persist_to_db(self, tickers, spy_ret=None):
+        """V10: Write discovered tickers to DB with source metadata."""
+        try:
+            from db.writer import get_writer
+            writer = get_writer()
+            if not writer:
+                return
+
+            import json
+            now = datetime.now(ET)
+            session_date = now.strftime('%Y-%m-%d')
+
+            for ticker in tickers:
+                metadata = json.dumps({
+                    'reason': 'relative_strength',
+                    'spy_5d_return': round(spy_ret, 4) if spy_ret else None,
+                }, default=str)
+                writer.enqueue('discovered_tickers', {
+                    'ts': now,
+                    'ticker': ticker,
+                    'source': 'momentum_screener',
+                    'discovery_data': metadata,
+                    'metadata': metadata,
+                    'session_date': session_date,
+                    'last_seen': now,
+                    'ingested_at': now,
+                })
+        except Exception as exc:
+            log.debug("[Screener] DB persist failed: %s", exc)
 
     def _fetch_momentum_candidates(self, base_tickers):
         """

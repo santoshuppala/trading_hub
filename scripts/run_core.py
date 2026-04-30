@@ -41,37 +41,16 @@ from config import (
     PRO_MAX_POSITIONS, PRO_TRADE_BUDGET, PRO_ORDER_COOLDOWN,
 )
 
-# Logging
-log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
-os.makedirs(log_dir, exist_ok=True)
-date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
-os.makedirs(date_dir, exist_ok=True)
-log_file = os.path.join(date_dir, 'core.log')
-
-logging.root.handlers = []
-
-# Force all timestamps to ET (Eastern Time) regardless of system timezone.
-# Trading logs in ET match market hours (9:30-16:00 ET).
-class _ETFormatter(logging.Formatter):
-    _et = ZoneInfo('America/New_York')
-    def formatTime(self, record, datefmt=None):
-        from datetime import datetime as _dt
-        ct = _dt.fromtimestamp(record.created, tz=self._et)
-        if datefmt:
-            return ct.strftime(datefmt)
-        return ct.strftime('%Y-%m-%d %H:%M:%S') + f',{int(record.msecs):03d}'
-
-_handler = logging.FileHandler(log_file)
-_handler.setFormatter(_ETFormatter('%(asctime)s %(levelname)s [core] %(message)s'))
-logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
-log = logging.getLogger(__name__)
+# Logging — V10: shared ET formatter (all 6 processes use same format)
+from scripts._log_setup import setup_logging
+log = setup_logging('core')
 
 
 def main():
     from monitor import RealTimeMonitor
     from monitor.shared_cache import CacheWriter
-    from monitor.ipc import (EventPublisher, EventConsumer,
-                              TOPIC_SIGNALS, TOPIC_POP, TOPIC_DISCOVERY)
+    from monitor.ipc import (EventPublisher,
+                              TOPIC_SIGNALS, TOPIC_POP)
     from monitor.distributed_registry import DistributedPositionRegistry
     from monitor.event_bus import EventType, Event
 
@@ -469,50 +448,55 @@ def main():
     except Exception:
         pass
 
-    # ── V8: Discovery ticker consumer (single, replaces Pro + Pop) ────────
+    # ── V10: Discovery ticker restore from DB (replaces Kafka + JSON cache) ──
     _ticker_set = set(monitor.tickers)
+    _discovery_last_check = datetime.now(ET)
 
-    # V9: Restore discovered tickers from alt_data_cache (survive restart)
+    # Restore today's discovered tickers from DB (crash/restart safe)
     try:
-        import json as _json
-        _cache_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                   'data', 'alt_data_cache.json')
-        if os.path.exists(_cache_path):
-            with open(_cache_path) as _f:
-                _cached = _json.load(_f)
-            _restored = _cached.get('discovered_tickers', [])
+        import asyncio as _aio
+        from db.discovery import get_today_tickers
+        _db_loop = getattr(db_cleanup, 'loop', None) if db_cleanup else None
+        if _db_loop:
+            _today_discoveries = _aio.run_coroutine_threadsafe(
+                get_today_tickers(), _db_loop,
+            ).result(timeout=10)
             _added = 0
-            for t in _restored:
+            for d in _today_discoveries:
+                t = d.get('ticker', '') if isinstance(d, dict) else str(d)
                 if t and t not in _ticker_set:
                     monitor.tickers.append(t)
                     _ticker_set.add(t)
                     _added += 1
             if _added:
-                log.info("[Discovery] Restored %d discovered tickers from cache (%d total)",
+                log.info("[Discovery] Restored %d discovered tickers from DB (%d total)",
                          _added, len(monitor.tickers))
+        else:
+            log.info("[Discovery] DB loop not available — will poll on next cycle")
     except Exception as exc:
-        log.warning("[Discovery] Cache restore failed (non-fatal): %s", exc)
+        log.warning("[Discovery] DB restore failed (non-fatal): %s", exc)
 
-    def _on_discovery(key, payload):
-        ticker = payload.get('ticker', '')
-        if ticker and ticker not in _ticker_set:
-            monitor.tickers.append(ticker)
-            _ticker_set.add(ticker)
-            log.info("[Discovery] Added %s to scan universe (%d total)",
-                     ticker, len(monitor.tickers))
-
-    discovery_consumer = None
-    try:
-        discovery_consumer = EventConsumer(
-            group_id='core-discovery-consumer',
-            topics=[TOPIC_DISCOVERY],
-            source_name='core',
-        )
-        discovery_consumer.on(TOPIC_DISCOVERY, _on_discovery)
-        discovery_consumer.start()
-        log.info("Discovery consumer started")
-    except Exception as exc:
-        log.warning("Discovery consumer failed (non-fatal): %s", exc)
+    def _poll_discovery_db():
+        """V10: Poll DB for newly discovered tickers (called every 60s from bar cycle)."""
+        nonlocal _discovery_last_check
+        _db_loop = getattr(db_cleanup, 'loop', None) if db_cleanup else None
+        if not _db_loop:
+            return
+        try:
+            import asyncio as _aio
+            from db.discovery import get_new_since
+            new_tickers = _aio.run_coroutine_threadsafe(
+                get_new_since(_discovery_last_check), _db_loop,
+            ).result(timeout=5)
+            _discovery_last_check = datetime.now(ET)
+            for t in new_tickers:
+                if t and t not in _ticker_set:
+                    monitor.tickers.append(t)
+                    _ticker_set.add(t)
+                    log.info("[Discovery] Added %s to scan universe (%d total)",
+                             t, len(monitor.tickers))
+        except Exception as exc:
+            log.debug("[Discovery] DB poll failed (non-fatal): %s", exc)
 
     # ── V9 (L1): Tradier WebSocket streaming (PRODUCTION token for data) ──
     tradier_stream = None
@@ -622,6 +606,78 @@ def main():
         log.info("RegimeFilter active — 3-dimension scoring (trend/vrp/participation)")
     except Exception as exc:
         log.warning("RegimeFilter init failed (non-fatal): %s", exc)
+
+    # ── V10: Pre-market gap scanner ─────────────────────────────────────
+    # Scan all tickers for 5%+ gaps before market open using Tradier batch
+    # quotes. Adds gappers to universe + persists to discovery DB.
+    # Runs once per startup, only pre-market (before 9:35 ET).
+    try:
+        _scan_time = datetime.now(ET)
+        if _scan_time.hour < 10 or (_scan_time.hour == 9 and _scan_time.minute < 35):
+            _data = monitor._data
+            # Use underlying Tradier client for get_quotes (FailoverClient wraps it)
+            _client = getattr(_data, '_primary', _data) if hasattr(_data, '_primary') else _data
+            if hasattr(_client, 'get_quotes'):
+                log.info("[GapScan] Pre-market gap scan starting (%d tickers)...",
+                         len(monitor.tickers))
+                _quotes = _client.get_quotes(monitor.tickers)
+                _gap_tickers = []
+                _gap_meta = []
+                for sym, q in _quotes.items():
+                    try:
+                        _last = float(q.get('last', 0) or 0)
+                        _prev = float(q.get('prevclose', q.get('close', 0)) or 0)
+                        if _prev > 0 and _last > 0:
+                            _gap_pct = ((_last - _prev) / _prev) * 100
+                            if abs(_gap_pct) >= 5.0:
+                                _gap_tickers.append(sym)
+                                _gap_meta.append({
+                                    'ticker': sym,
+                                    'source': 'premarket_gap_scan',
+                                    'metadata': {
+                                        'reason': 'premarket_gap',
+                                        'gap_pct': round(_gap_pct, 2),
+                                        'prev_close': _prev,
+                                        'premarket_price': _last,
+                                        'premarket_volume': int(q.get('volume', 0) or 0),
+                                    },
+                                })
+                    except (ValueError, TypeError):
+                        continue
+
+                if _gap_tickers:
+                    # Add to scan universe
+                    _added_gaps = []
+                    for t in _gap_tickers:
+                        if t not in _ticker_set:
+                            monitor.tickers.append(t)
+                            _ticker_set.add(t)
+                            _added_gaps.append(t)
+                    log.info("[GapScan] Found %d gappers (5%%+): %s | %d new to universe",
+                             len(_gap_tickers),
+                             ', '.join(f'{m["ticker"]}({m["metadata"]["gap_pct"]:+.1f}%%)'
+                                       for m in _gap_meta[:10]),
+                             len(_added_gaps))
+
+                    # Persist to discovery DB
+                    _db_loop = getattr(db_cleanup, 'loop', None) if db_cleanup else None
+                    if _db_loop and _gap_meta:
+                        try:
+                            import asyncio as _aio
+                            from db.discovery import record_discoveries_batch
+                            _aio.run_coroutine_threadsafe(
+                                record_discoveries_batch(_gap_meta), _db_loop,
+                            ).result(timeout=10)
+                        except Exception as _exc:
+                            log.debug("[GapScan] DB persist failed: %s", _exc)
+                else:
+                    log.info("[GapScan] No 5%%+ gaps found pre-market")
+            else:
+                log.debug("[GapScan] Data client has no get_quotes — skipping")
+        else:
+            log.debug("[GapScan] Past 9:35 — skipping pre-market scan")
+    except Exception as exc:
+        log.warning("[GapScan] Pre-market gap scan failed (non-fatal): %s", exc)
 
     # ── Start monitor ─────────────────────────────────────────────────────
     monitor.start()
@@ -773,6 +829,7 @@ def main():
         log.warning("[WAL] Recovery failed (non-fatal): %s", exc)
 
     # ── Main loop ─────────────────────────────────────────────────────────
+    _last_discovery_poll = time.monotonic()
     try:
         while True:
             now = datetime.now(ET)
@@ -787,6 +844,11 @@ def main():
                 except RuntimeError:
                     pass  # dict changed size during iteration — retry next cycle
 
+            # V10: Poll DB for new discovered tickers every 60s
+            if time.monotonic() - _last_discovery_poll >= 60:
+                _poll_discovery_db()
+                _last_discovery_poll = time.monotonic()
+
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Core process interrupted.")
@@ -798,12 +860,10 @@ def main():
             except Exception:
                 pass
         monitor.stop()
-        if discovery_consumer:
-            discovery_consumer.stop()
         publisher.stop()
         if db_cleanup:
             db_cleanup()
-        log.info("V9 Core process stopped.")
+        log.info("V10 Core process stopped.")
 
 
 if __name__ == '__main__':

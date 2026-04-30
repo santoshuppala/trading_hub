@@ -952,6 +952,502 @@ def job_daily_regime(conn, target_date: date) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Job 6: P&L Attribution — Alpha/Beta Decomposition
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _compute_intraday_beta(cur, ticker: str, target_date: date) -> Tuple[float, float, int, bool]:
+    """Compute realized intraday beta from 1-min return regression vs SPY.
+
+    Returns (beta, r_squared, n_bars, fallback_used).
+
+    Quality gate: n ≥ 30 AND r² ≥ 0.15.
+    Fallback chain: intraday regression → 5-day rolling → Yahoo static → 1.0.
+    """
+    import numpy as np
+
+    # Check cache first
+    cur.execute("""
+        SELECT intraday_beta, r_squared, n_bars, fallback_used
+        FROM trading.ml_intraday_beta
+        WHERE ticker = %s AND session_date = %s
+    """, (ticker, target_date))
+    cached = cur.fetchone()
+    if cached:
+        return (float(cached['intraday_beta']), float(cached['r_squared'] or 0),
+                int(cached['n_bars'] or 0), bool(cached['fallback_used']))
+
+    day_start, day_end = _date_range(target_date)
+
+    # Fetch ticker + SPY 1-min bars for the day
+    cur.execute("""
+        SELECT bar_time, close FROM trading.market_bars
+        WHERE ticker = %s AND bar_time >= %s AND bar_time < %s
+        ORDER BY bar_time
+    """, (ticker, day_start, day_end))
+    stock_bars = cur.fetchall()
+
+    cur.execute("""
+        SELECT bar_time, close FROM trading.market_bars
+        WHERE ticker = 'SPY' AND bar_time >= %s AND bar_time < %s
+        ORDER BY bar_time
+    """, (day_start, day_end))
+    spy_bars = cur.fetchall()
+
+    if not stock_bars or not spy_bars:
+        beta, r2, n, fallback = 1.0, 0.0, 0, True
+        _cache_beta(cur, ticker, target_date, beta, r2, n, fallback)
+        return beta, r2, n, fallback
+
+    # Align on bar_time (inner join)
+    spy_map = {r['bar_time']: float(r['close']) for r in spy_bars}
+    aligned = []
+    for sb in stock_bars:
+        bt = sb['bar_time']
+        if bt in spy_map:
+            aligned.append((float(sb['close']), spy_map[bt]))
+
+    n = len(aligned)
+    if n < 30:
+        # Try 5-day rolling intraday beta
+        beta, r2, n, fallback = _compute_rolling_intraday_beta(cur, ticker, target_date)
+        _cache_beta(cur, ticker, target_date, beta, r2, n, fallback)
+        return beta, r2, n, fallback
+
+    # Compute 1-min log returns
+    stock_prices = np.array([a[0] for a in aligned])
+    spy_prices = np.array([a[1] for a in aligned])
+
+    stock_returns = np.diff(np.log(stock_prices))
+    spy_returns = np.diff(np.log(spy_prices))
+
+    # Remove any NaN/Inf
+    valid = np.isfinite(stock_returns) & np.isfinite(spy_returns)
+    stock_returns = stock_returns[valid]
+    spy_returns = spy_returns[valid]
+
+    if len(spy_returns) < 30:
+        beta, r2, n, fallback = _compute_rolling_intraday_beta(cur, ticker, target_date)
+        _cache_beta(cur, ticker, target_date, beta, r2, n, fallback)
+        return beta, r2, n, fallback
+
+    # OLS: stock_return = alpha + beta * spy_return
+    spy_var = np.var(spy_returns)
+    if spy_var < 1e-12:
+        beta, r2, n_out, fallback = 1.0, 0.0, len(spy_returns), True
+        _cache_beta(cur, ticker, target_date, beta, r2, n_out, fallback)
+        return beta, r2, n_out, fallback
+
+    cov = np.cov(stock_returns, spy_returns, ddof=1)
+    beta = float(cov[0, 1] / cov[1, 1])
+    # R²
+    ss_res = np.sum((stock_returns - (np.mean(stock_returns) + beta * (spy_returns - np.mean(spy_returns)))) ** 2)
+    ss_tot = np.sum((stock_returns - np.mean(stock_returns)) ** 2)
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
+    n_out = len(spy_returns)
+
+    # Quality gate: r² ≥ 0.15
+    if r2 < 0.15:
+        fallback_beta, fallback_r2, fallback_n, _ = _compute_rolling_intraday_beta(cur, ticker, target_date)
+        if fallback_r2 >= 0.15:
+            _cache_beta(cur, ticker, target_date, fallback_beta, fallback_r2, fallback_n, True)
+            return fallback_beta, fallback_r2, fallback_n, True
+        # Use static beta as last resort
+        static_beta = _get_static_beta(ticker)
+        _cache_beta(cur, ticker, target_date, static_beta, r2, n_out, True)
+        return static_beta, r2, n_out, True
+
+    _cache_beta(cur, ticker, target_date, beta, r2, n_out, False)
+    return beta, r2, n_out, False
+
+
+def _compute_rolling_intraday_beta(cur, ticker: str, target_date: date) -> Tuple[float, float, int, bool]:
+    """Fallback: compute intraday beta from last 5 trading days' 1-min bars."""
+    import numpy as np
+
+    start = target_date - timedelta(days=8)  # 8 calendar days ≈ 5 trading days
+    end_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
+    start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+
+    cur.execute("""
+        SELECT bar_time, close FROM trading.market_bars
+        WHERE ticker = %s AND bar_time >= %s AND bar_time < %s
+        ORDER BY bar_time
+    """, (ticker, start_dt, end_dt))
+    stock_bars = cur.fetchall()
+
+    cur.execute("""
+        SELECT bar_time, close FROM trading.market_bars
+        WHERE ticker = 'SPY' AND bar_time >= %s AND bar_time < %s
+        ORDER BY bar_time
+    """, (start_dt, end_dt))
+    spy_bars = cur.fetchall()
+
+    spy_map = {r['bar_time']: float(r['close']) for r in spy_bars}
+    aligned = [(float(sb['close']), spy_map[sb['bar_time']])
+               for sb in stock_bars if sb['bar_time'] in spy_map]
+
+    if len(aligned) < 60:
+        static_beta = _get_static_beta(ticker)
+        return static_beta, 0.0, len(aligned), True
+
+    stock_prices = np.array([a[0] for a in aligned])
+    spy_prices = np.array([a[1] for a in aligned])
+    stock_returns = np.diff(np.log(stock_prices))
+    spy_returns = np.diff(np.log(spy_prices))
+    valid = np.isfinite(stock_returns) & np.isfinite(spy_returns)
+    stock_returns, spy_returns = stock_returns[valid], spy_returns[valid]
+
+    if len(spy_returns) < 60:
+        return _get_static_beta(ticker), 0.0, len(spy_returns), True
+
+    cov = np.cov(stock_returns, spy_returns, ddof=1)
+    beta = float(cov[0, 1] / cov[1, 1]) if cov[1, 1] > 1e-12 else 1.0
+    ss_res = np.sum((stock_returns - (np.mean(stock_returns) + beta * (spy_returns - np.mean(spy_returns)))) ** 2)
+    ss_tot = np.sum((stock_returns - np.mean(stock_returns)) ** 2)
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
+
+    return beta, r2, len(spy_returns), r2 < 0.15
+
+
+def _get_static_beta(ticker: str) -> float:
+    """Last-resort: Yahoo Finance static beta or hardcoded defaults."""
+    _STATIC = {
+        'TQQQ': 3.0, 'SQQQ': -3.0, 'SOXL': 3.0, 'SOXS': -3.0,
+        'SPY': 1.0, 'QQQ': 1.0, 'IWM': 1.0, 'DIA': 1.0,
+    }
+    if ticker in _STATIC:
+        return _STATIC[ticker]
+    try:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from monitor.risk_sizing import RiskSizer
+        sizer = RiskSizer.__new__(RiskSizer)
+        sizer._beta_cache = {}
+        return sizer.get_beta(ticker)
+    except Exception:
+        return 1.0
+
+
+def _cache_beta(cur, ticker, session_date, beta, r2, n_bars, fallback):
+    """Upsert into ml_intraday_beta cache."""
+    cur.execute("""
+        INSERT INTO trading.ml_intraday_beta
+            (ticker, session_date, intraday_beta, r_squared, n_bars, fallback_used)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (ticker, session_date)
+        DO UPDATE SET intraday_beta = EXCLUDED.intraday_beta,
+                      r_squared = EXCLUDED.r_squared,
+                      n_bars = EXCLUDED.n_bars,
+                      fallback_used = EXCLUDED.fallback_used
+    """, (ticker, session_date, beta, r2, n_bars, fallback))
+    cur.connection.commit()
+
+
+def _classify_session_phase(entry_time) -> str:
+    """Classify a timestamp into trading session phase."""
+    try:
+        from zoneinfo import ZoneInfo
+        et = entry_time.astimezone(ZoneInfo('America/New_York'))
+    except Exception:
+        et = entry_time
+
+    h, m = et.hour, et.minute
+    if h == 9 and m >= 30:
+        return 'open'
+    elif h == 10 or (h == 11 and m < 30):
+        return 'morning'
+    elif (h == 11 and m >= 30) or h in (12, 13):
+        return 'midday'
+    elif h == 14 or (h == 15 and m < 30):
+        return 'afternoon'
+    elif (h == 15 and m >= 30) or h >= 16:
+        return 'close'
+    return 'premarket'
+
+
+def job_pnl_attribution(conn, target_date: date) -> int:
+    """Job 6: Compute per-trade alpha/beta decomposition.
+
+    For each completed trade on target_date:
+    1. Compute realized intraday beta (1-min regression vs SPY)
+    2. Decompose P&L into beta (market) and alpha (skill)
+    3. Attribute slippage costs
+    4. Tag with session phase and regime context
+    5. Compute statistical significance per strategy (n ≥ 20 threshold)
+    """
+    import numpy as np
+
+    log.info("Job 6: ml_pnl_attribution — starting for %s", target_date)
+    t0 = time.monotonic()
+    day_start, day_end = _date_range(target_date)
+
+    cur = conn.cursor()
+
+    # Step 1: Fetch completed trades for the day
+    cur.execute("""
+        SELECT trade_id, ticker, strategy, qty, entry_price, exit_price,
+               pnl, entry_time, exit_time, duration_seconds, lifecycle_data
+        FROM trading.completed_trades
+        WHERE exit_time >= %s AND exit_time < %s
+        ORDER BY exit_time
+    """, (day_start, day_end))
+    trades = cur.fetchall()
+
+    if not trades:
+        log.info("  No completed trades for %s", target_date)
+        return 0
+
+    # Step 2: Fetch SPY bars for the full day (for SPY return lookups)
+    cur.execute("""
+        SELECT bar_time, close FROM trading.market_bars
+        WHERE ticker = 'SPY' AND bar_time >= %s AND bar_time < %s
+        ORDER BY bar_time
+    """, (day_start, day_end))
+    spy_bars = cur.fetchall()
+    spy_times = [r['bar_time'] for r in spy_bars]
+    spy_closes = [float(r['close']) for r in spy_bars]
+
+    if not spy_bars:
+        log.warning("  No SPY bars in market_bars for %s — attribution will use "
+                     "beta=fallback, spy_return=0. Fix: verify BarBuilder DatetimeIndex "
+                     "and _persist_market_bars on next shutdown.", target_date)
+
+    def _spy_close_at(ts):
+        """Find SPY close price nearest to timestamp."""
+        if not spy_times or ts is None:
+            return None
+        import bisect
+        # market_bars.bar_time is naive (timestamp without time zone)
+        # entry_time/exit_time may be timezone-aware — strip tzinfo for comparison
+        try:
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+            idx = bisect.bisect_right(spy_times, ts) - 1
+            idx = max(0, min(idx, len(spy_closes) - 1))
+            return spy_closes[idx]
+        except TypeError:
+            return spy_closes[0] if spy_closes else None
+
+    # Step 3: Compute per-trade attribution
+    rows = []
+    strategy_alphas = {}  # strategy → list of alpha_returns (for significance)
+
+    for trade in trades:
+        ticker = trade['ticker']
+        entry_price = _safe_float(trade['entry_price'])
+        exit_price = _safe_float(trade['exit_price'])
+        pnl = _safe_float(trade['pnl']) or 0.0
+        qty = int(trade['qty'] or 1)
+        strategy = trade['strategy'] or 'unknown'
+        trade_id = trade['trade_id'] or ''
+        duration_sec = int(trade['duration_seconds'] or 0)
+
+        if not entry_price or entry_price == 0:
+            continue
+
+        # Parse exit_time (always full ISO timestamp)
+        exit_time_raw = trade['exit_time'] or ''
+        exit_time = None
+        if exit_time_raw:
+            try:
+                exit_time = datetime.fromisoformat(exit_time_raw.replace('Z', '+00:00'))
+            except Exception:
+                try:
+                    from dateutil.parser import parse as _dtparse
+                    exit_time = _dtparse(exit_time_raw)
+                except Exception:
+                    pass
+
+        # Parse entry_time (may be bare "HH:MM:SS" or full ISO or empty)
+        entry_time_raw = trade['entry_time'] or ''
+        entry_time = None
+        if entry_time_raw:
+            try:
+                if len(entry_time_raw) <= 8 and ':' in entry_time_raw:
+                    # Bare time like "11:36:06" is in ET — combine with exit_time's date
+                    if exit_time:
+                        from zoneinfo import ZoneInfo as _ZI
+                        _et_tz = _ZI('America/New_York')
+                        parts = entry_time_raw.split(':')
+                        h, m = int(parts[0]), int(parts[1])
+                        s = int(parts[2]) if len(parts) > 2 else 0
+                        # Build datetime in ET, then keep timezone-aware
+                        _exit_et = exit_time.astimezone(_et_tz)
+                        entry_time = _exit_et.replace(hour=h, minute=m, second=s, microsecond=0)
+                else:
+                    entry_time = datetime.fromisoformat(entry_time_raw.replace('Z', '+00:00'))
+            except Exception:
+                pass
+
+        # Fallback: if no entry_time, estimate from duration
+        if entry_time is None and exit_time and duration_sec > 0:
+            entry_time = exit_time - timedelta(seconds=duration_sec)
+
+        if entry_time is None or exit_time is None:
+            continue
+
+        # Trade return
+        trade_return = (exit_price - entry_price) / entry_price if exit_price else 0.0
+
+        # SPY return over holding period
+        spy_entry = _spy_close_at(entry_time)
+        spy_exit = _spy_close_at(exit_time)
+        spy_return = ((spy_exit - spy_entry) / spy_entry) if spy_entry and spy_exit and spy_entry != 0 else 0.0
+
+        # Intraday beta
+        beta, r2, n_bars, fallback = _compute_intraday_beta(cur, ticker, target_date)
+
+        # Attribution
+        notional = entry_price * qty
+        beta_pnl = beta * spy_return * notional
+        alpha_pnl = pnl - beta_pnl
+        alpha_return = trade_return - beta * spy_return
+
+        # Slippage cost (from lifecycle_data if available)
+        lc = {}
+        if trade['lifecycle_data']:
+            lc = _parse_json(trade['lifecycle_data'])
+        signal_price = _safe_float(lc.get('signal_price') or lc.get('entry_signal_price'))
+        fill_price = entry_price
+        slippage_cost = abs(signal_price - fill_price) * qty if signal_price else 0.0
+
+        gross_alpha_pnl = alpha_pnl + slippage_cost
+        net_alpha_pnl = alpha_pnl
+
+        # Session phase
+        session_phase = _classify_session_phase(entry_time)
+
+        # Regime context from lifecycle_data (prefer entry, fall back to close)
+        regime_entry = lc.get('regime_at_entry') or lc.get('regime_at_close') or {}
+        if isinstance(regime_entry, str):
+            try:
+                regime_entry = _parse_json(regime_entry)
+            except Exception:
+                regime_entry = {}
+        regime_trend = _safe_float(regime_entry.get('trend'))
+        regime_vrp = _safe_float(regime_entry.get('vrp'))
+        regime_participation = _safe_float(regime_entry.get('participation'))
+
+        # Collect for significance test
+        strategy_alphas.setdefault(strategy, []).append(alpha_return)
+
+        rows.append({
+            'session_date': target_date,
+            'trade_id': trade_id,
+            'ticker': ticker,
+            'strategy': strategy,
+            'qty': qty,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'realized_pnl': round(pnl, 4),
+            'trade_return': round(trade_return, 6),
+            'spy_return': round(spy_return, 6),
+            'intraday_beta': round(beta, 4),
+            'beta_pnl': round(beta_pnl, 4),
+            'alpha_pnl': round(alpha_pnl, 4),
+            'alpha_return': round(alpha_return, 6),
+            'slippage_cost': round(slippage_cost, 4),
+            'gross_alpha_pnl': round(gross_alpha_pnl, 4),
+            'net_alpha_pnl': round(net_alpha_pnl, 4),
+            'session_phase': session_phase,
+            'regime_trend': regime_trend,
+            'regime_vrp': regime_vrp,
+            'regime_participation': regime_participation,
+            'alpha_t_stat': None,  # filled below
+            'alpha_p_value': None,
+            'entry_time': entry_time,
+            'exit_time': exit_time,
+            'duration_sec': duration_sec,
+        })
+
+    # Step 4: Per-strategy significance (rolling 20-day window)
+    # Fetch historical alpha_returns per strategy from DB
+    strategy_significance = {}
+    for strategy in strategy_alphas:
+        # Get historical alphas from last 20 trading days
+        cur.execute("""
+            SELECT alpha_return FROM trading.ml_pnl_attribution
+            WHERE strategy = %s AND session_date >= %s AND session_date < %s
+            ORDER BY session_date, entry_time
+        """, (strategy, target_date - timedelta(days=30), target_date))
+        historical = [float(r['alpha_return']) for r in cur.fetchall()
+                      if r['alpha_return'] is not None]
+        # Combine with today's
+        all_alphas = historical + strategy_alphas[strategy]
+
+        if len(all_alphas) >= 20:
+            arr = np.array(all_alphas)
+            mean_a = np.mean(arr)
+            std_a = np.std(arr, ddof=1)
+            n_a = len(arr)
+            if std_a > 1e-10:
+                t_stat = float(mean_a / (std_a / np.sqrt(n_a)))
+                # Two-tailed p-value from t-distribution
+                try:
+                    from scipy.stats import t as t_dist
+                    p_value = float(t_dist.sf(abs(t_stat), df=n_a - 1) * 2)
+                except ImportError:
+                    # Approximate with normal for large n
+                    from math import erfc, sqrt
+                    p_value = float(erfc(abs(t_stat) / sqrt(2)))
+                strategy_significance[strategy] = (round(t_stat, 4), round(p_value, 4))
+            else:
+                strategy_significance[strategy] = (0.0, 1.0)
+        # else: leave as None (ACCUMULATING)
+
+    # Stamp significance on rows
+    for row in rows:
+        sig = strategy_significance.get(row['strategy'])
+        if sig:
+            row['alpha_t_stat'] = sig[0]
+            row['alpha_p_value'] = sig[1]
+
+    # Step 5: Upsert into ml_pnl_attribution
+    inserted = 0
+    for row in rows:
+        cur.execute("""
+            INSERT INTO trading.ml_pnl_attribution (
+                session_date, trade_id, ticker, strategy, qty,
+                entry_price, exit_price, realized_pnl,
+                trade_return, spy_return, intraday_beta,
+                beta_pnl, alpha_pnl, alpha_return,
+                slippage_cost, gross_alpha_pnl, net_alpha_pnl,
+                session_phase, regime_trend, regime_vrp, regime_participation,
+                alpha_t_stat, alpha_p_value,
+                entry_time, exit_time, duration_sec
+            ) VALUES (
+                %(session_date)s, %(trade_id)s, %(ticker)s, %(strategy)s, %(qty)s,
+                %(entry_price)s, %(exit_price)s, %(realized_pnl)s,
+                %(trade_return)s, %(spy_return)s, %(intraday_beta)s,
+                %(beta_pnl)s, %(alpha_pnl)s, %(alpha_return)s,
+                %(slippage_cost)s, %(gross_alpha_pnl)s, %(net_alpha_pnl)s,
+                %(session_phase)s, %(regime_trend)s, %(regime_vrp)s, %(regime_participation)s,
+                %(alpha_t_stat)s, %(alpha_p_value)s,
+                %(entry_time)s, %(exit_time)s, %(duration_sec)s
+            )
+            ON CONFLICT (session_date, trade_id) DO UPDATE SET
+                alpha_pnl = EXCLUDED.alpha_pnl,
+                beta_pnl = EXCLUDED.beta_pnl,
+                intraday_beta = EXCLUDED.intraday_beta,
+                alpha_t_stat = EXCLUDED.alpha_t_stat,
+                alpha_p_value = EXCLUDED.alpha_p_value
+        """, row)
+        inserted += 1
+
+    conn.commit()
+
+    # Summary
+    total_alpha = sum(r['alpha_pnl'] for r in rows)
+    total_beta = sum(r['beta_pnl'] for r in rows)
+    total_pnl = sum(r['realized_pnl'] for r in rows)
+    elapsed = time.monotonic() - t0
+
+    log.info("  Job 6 complete: %d trades, P&L=$%.2f (alpha=$%.2f + beta=$%.2f), %.1fs",
+             inserted, total_pnl, total_alpha, total_beta, elapsed)
+    return inserted
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -971,6 +1467,7 @@ def run_all_jobs(target_date: date) -> Dict[str, int]:
         results["rejection_log"] = job_rejection_log(conn, target_date)
         results["iv_history"] = job_iv_history(conn, target_date)
         results["daily_regime"] = job_daily_regime(conn, target_date)
+        results["pnl_attribution"] = job_pnl_attribution(conn, target_date)
     except Exception:
         conn.rollback()
         log.exception("Fatal error during analytics for %s", target_date)
@@ -1056,6 +1553,7 @@ Examples:
                     "rejection_log": job_rejection_log,
                     "iv_history": job_iv_history,
                     "daily_regime": job_daily_regime,
+                    "pnl_attribution": job_pnl_attribution,
                 }[args.job]
                 count = job_fn(conn, target_date)
                 grand_total[args.job] = grand_total.get(args.job, 0) + count

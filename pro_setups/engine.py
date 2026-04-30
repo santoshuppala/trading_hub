@@ -316,17 +316,23 @@ class ProSetupEngine:
 
             if confirmed == 'long':
                 actual_offset = entry_price - stop_price
-                if should_reject_wide_stop(actual_offset, atr):
+                if should_reject_wide_stop(actual_offset, atr, strategy_name):
+                    from monitor.smart_stop import _STRATEGY_MAX_RISK_ATR, _DEFAULT_MAX_RISK_ATR
+                    _max = _STRATEGY_MAX_RISK_ATR.get(strategy_name, _DEFAULT_MAX_RISK_ATR)
                     log.info("[ProSetupEngine][%s] REJECTED: stop too far "
-                             "(%.2f ATR, max 2.0)", ticker, actual_offset / atr)
+                             "(%.2f ATR, max %.1f for %s)", ticker,
+                             actual_offset / atr, _max, strategy_name)
                     return
                 if actual_offset < _buffer:
                     stop_price = entry_price - _buffer
             elif confirmed == 'short':
                 actual_offset = stop_price - entry_price
-                if should_reject_wide_stop(actual_offset, atr):
+                if should_reject_wide_stop(actual_offset, atr, strategy_name):
+                    from monitor.smart_stop import _STRATEGY_MAX_RISK_ATR, _DEFAULT_MAX_RISK_ATR
+                    _max = _STRATEGY_MAX_RISK_ATR.get(strategy_name, _DEFAULT_MAX_RISK_ATR)
                     log.info("[ProSetupEngine][%s] REJECTED: stop too far "
-                             "(%.2f ATR, max 2.0)", ticker, actual_offset / atr)
+                             "(%.2f ATR, max %.1f for %s)", ticker,
+                             actual_offset / atr, _max, strategy_name)
                     return
                 if actual_offset < _buffer:
                     stop_price = entry_price + _buffer

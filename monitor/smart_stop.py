@@ -67,7 +67,27 @@ _TIME_SCALARS = {
 # ── Absolute bounds ──────────────────────────────────────────────────
 _MIN_BUFFER_ATR = 0.25   # never tighter than 0.25 ATR (even calm + lunch)
 _MAX_BUFFER_ATR = 1.5    # never wider than 1.5 ATR (even hot + open)
-_MAX_RISK_ATR = 2.0      # reject trade if structural stop > 2 ATR away
+_DEFAULT_MAX_RISK_ATR = 2.0  # default reject threshold
+
+# V10: Per-strategy max risk ATR.
+# Different strategies have structurally different stop distances.
+# gap_and_go: gap reference can be 3-4 ATR from entry (wide gap = wide stop)
+# trend_pullback: EMA20 can be 2-3 ATR away in strong trends
+# orb: breakout range can be 2-3 ATR on volatile days
+# mean_reversion: very tight stops by nature
+_STRATEGY_MAX_RISK_ATR = {
+    'gap_and_go':       4.0,   # gap reference is naturally far
+    'trend_pullback':   3.0,   # EMA20 in trending stocks
+    'orb':              3.0,   # opening range can be wide
+    'flag_pennant':     2.5,   # pattern support can be far
+    'inside_bar':       2.5,   # prior bar range
+    'vwap_reclaim':     2.0,   # tight thesis
+    'ema_crossover':    2.0,   # standard
+    'breakout':         2.5,   # breakout base can be wide
+    'sr_flip':          2.0,   # level-based
+    'mean_reversion':   1.5,   # tight by design
+    'volume_spike':     2.0,   # standard
+}
 
 
 def _volatility_scalar(recent_range: float, atr: float) -> float:
@@ -161,12 +181,18 @@ def compute_stop_buffer(
     return buffer
 
 
-def should_reject_wide_stop(stop_distance: float, atr: float) -> bool:
+def should_reject_wide_stop(
+    stop_distance: float,
+    atr: float,
+    strategy_name: str = '',
+) -> bool:
     """Returns True if the stop is too far away (bad R:R).
 
-    A trade where risk > 2 ATR almost never has good enough reward
-    to justify the position size reduction needed.
+    V10: Strategy-aware max risk. gap_and_go and trend_pullback have
+    structurally wider stops than mean_reversion. Using a flat 2.0 ATR
+    max was rejecting valid setups in trending/gapping stocks.
     """
     if atr <= 0:
         return False
-    return stop_distance > atr * _MAX_RISK_ATR
+    max_atr = _STRATEGY_MAX_RISK_ATR.get(strategy_name, _DEFAULT_MAX_RISK_ATR)
+    return stop_distance > atr * max_atr

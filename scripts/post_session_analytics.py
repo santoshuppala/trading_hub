@@ -1209,12 +1209,19 @@ def job_pnl_attribution(conn, target_date: date) -> int:
 
     def _spy_close_at(ts):
         """Find SPY close price nearest to timestamp."""
-        if not spy_times:
+        if not spy_times or ts is None:
             return None
         import bisect
-        idx = bisect.bisect_right(spy_times, ts) - 1
-        idx = max(0, min(idx, len(spy_closes) - 1))
-        return spy_closes[idx]
+        # Ensure timezone-aware comparison
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is None and spy_times and hasattr(spy_times[0], 'tzinfo') and spy_times[0].tzinfo is not None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        try:
+            idx = bisect.bisect_right(spy_times, ts) - 1
+            idx = max(0, min(idx, len(spy_closes) - 1))
+            return spy_closes[idx]
+        except TypeError:
+            # Incompatible types for comparison
+            return spy_closes[0] if spy_closes else None
 
     # Step 3: Compute per-trade attribution
     rows = []
@@ -1226,13 +1233,52 @@ def job_pnl_attribution(conn, target_date: date) -> int:
         exit_price = _safe_float(trade['exit_price'])
         pnl = _safe_float(trade['pnl']) or 0.0
         qty = int(trade['qty'] or 1)
-        entry_time = trade['entry_time']
-        exit_time = trade['exit_time']
         strategy = trade['strategy'] or 'unknown'
         trade_id = trade['trade_id'] or ''
         duration_sec = int(trade['duration_seconds'] or 0)
 
         if not entry_price or entry_price == 0:
+            continue
+
+        # Parse exit_time (always full ISO timestamp)
+        exit_time_raw = trade['exit_time'] or ''
+        exit_time = None
+        if exit_time_raw:
+            try:
+                exit_time = datetime.fromisoformat(exit_time_raw.replace('Z', '+00:00'))
+            except Exception:
+                try:
+                    from dateutil.parser import parse as _dtparse
+                    exit_time = _dtparse(exit_time_raw)
+                except Exception:
+                    pass
+
+        # Parse entry_time (may be bare "HH:MM:SS" or full ISO or empty)
+        entry_time_raw = trade['entry_time'] or ''
+        entry_time = None
+        if entry_time_raw:
+            try:
+                if len(entry_time_raw) <= 8 and ':' in entry_time_raw:
+                    # Bare time like "11:36:06" is in ET — combine with exit_time's date
+                    if exit_time:
+                        from zoneinfo import ZoneInfo as _ZI
+                        _et_tz = _ZI('America/New_York')
+                        parts = entry_time_raw.split(':')
+                        h, m = int(parts[0]), int(parts[1])
+                        s = int(parts[2]) if len(parts) > 2 else 0
+                        # Build datetime in ET, then keep timezone-aware
+                        _exit_et = exit_time.astimezone(_et_tz)
+                        entry_time = _exit_et.replace(hour=h, minute=m, second=s, microsecond=0)
+                else:
+                    entry_time = datetime.fromisoformat(entry_time_raw.replace('Z', '+00:00'))
+            except Exception:
+                pass
+
+        # Fallback: if no entry_time, estimate from duration
+        if entry_time is None and exit_time and duration_sec > 0:
+            entry_time = exit_time - timedelta(seconds=duration_sec)
+
+        if entry_time is None or exit_time is None:
             continue
 
         # Trade return
@@ -1266,10 +1312,13 @@ def job_pnl_attribution(conn, target_date: date) -> int:
         # Session phase
         session_phase = _classify_session_phase(entry_time)
 
-        # Regime context from lifecycle_data
-        regime_entry = lc.get('regime_at_entry', {})
+        # Regime context from lifecycle_data (prefer entry, fall back to close)
+        regime_entry = lc.get('regime_at_entry') or lc.get('regime_at_close') or {}
         if isinstance(regime_entry, str):
-            regime_entry = _parse_json(regime_entry) if regime_entry.startswith('{') else {}
+            try:
+                regime_entry = _parse_json(regime_entry)
+            except Exception:
+                regime_entry = {}
         regime_trend = _safe_float(regime_entry.get('trend'))
         regime_vrp = _safe_float(regime_entry.get('vrp'))
         regime_participation = _safe_float(regime_entry.get('participation'))

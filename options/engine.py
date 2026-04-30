@@ -270,8 +270,10 @@ class OptionsEngine:
 
         iv_estimate = self._estimate_iv(p.ticker, p.current_price)
 
-        # Update IV tracker with current reading
-        self._iv_tracker.update(p.ticker, iv_estimate)
+        # Update IV tracker ONLY with real IV (not the 0.25 default).
+        # Feeding 0.25 constantly → min==max → iv_rank always 50 (useless).
+        if iv_estimate != 0.25:
+            self._iv_tracker.update(p.ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(p.ticker)
 
         strategy_type = self._selector.select_from_signal(
@@ -389,9 +391,10 @@ class OptionsEngine:
         # Infer direction: bullish if positive sentiment + positive gap
         is_bullish = sentiment_delta >= 0 or gap_size >= 0
 
-        # Get IV context
+        # Get IV context — only update tracker with real IV (not 0.25 default)
         iv_estimate = self._estimate_iv(ticker, entry_price)
-        self._iv_tracker.update(ticker, iv_estimate)
+        if iv_estimate != 0.25:
+            self._iv_tracker.update(ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(ticker)
         iv_is_rich = iv_rank >= 50
 

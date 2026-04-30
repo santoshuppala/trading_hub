@@ -1207,20 +1207,25 @@ def job_pnl_attribution(conn, target_date: date) -> int:
     spy_times = [r['bar_time'] for r in spy_bars]
     spy_closes = [float(r['close']) for r in spy_bars]
 
+    if not spy_bars:
+        log.warning("  No SPY bars in market_bars for %s — attribution will use "
+                     "beta=fallback, spy_return=0. Fix: verify BarBuilder DatetimeIndex "
+                     "and _persist_market_bars on next shutdown.", target_date)
+
     def _spy_close_at(ts):
         """Find SPY close price nearest to timestamp."""
         if not spy_times or ts is None:
             return None
         import bisect
-        # Ensure timezone-aware comparison
-        if hasattr(ts, 'tzinfo') and ts.tzinfo is None and spy_times and hasattr(spy_times[0], 'tzinfo') and spy_times[0].tzinfo is not None:
-            ts = ts.replace(tzinfo=timezone.utc)
+        # market_bars.bar_time is naive (timestamp without time zone)
+        # entry_time/exit_time may be timezone-aware — strip tzinfo for comparison
         try:
+            if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
             idx = bisect.bisect_right(spy_times, ts) - 1
             idx = max(0, min(idx, len(spy_closes) - 1))
             return spy_closes[idx]
         except TypeError:
-            # Incompatible types for comparison
             return spy_closes[0] if spy_closes else None
 
     # Step 3: Compute per-trade attribution

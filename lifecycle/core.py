@@ -245,7 +245,27 @@ class EngineLifecycle:
                 log.warning("[%s] market_bars persist failed (non-fatal): %s",
                             self._name, mb_exc)
 
-        # 7. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
+        # 7. V10: Generate daily trade analysis CSV (for Streamlit dashboard)
+        if is_eod and self._name == 'core':
+            try:
+                self._generate_daily_report()
+            except Exception as rpt_exc:
+                log.warning("[%s] Daily report generation failed (non-fatal): %s",
+                            self._name, rpt_exc)
+
+        # 8. V10: DB retention — delete QuoteReceived older than 3 days.
+        # Ticks are 99% of event_store (16GB). After 3 days, ticks are useless
+        # (1-min bars in market_bars replace them for ML/backtest).
+        # Signals, fills, positions kept forever (tiny).
+        # Only runs at EOD (not on mid-session crash — don't slow restart).
+        if is_eod and self._name == 'core':
+            try:
+                self._run_db_retention()
+            except Exception as ret_exc:
+                log.warning("[%s] DB retention failed (non-fatal): %s",
+                            self._name, ret_exc)
+
+        # 9. V10: ML analytics on EVERY shutdown (crash, restart, EOD).
         # Populates ml_signal_context, ml_trade_outcomes, ml_rejection_log
         # from event_store. On crash at 2 PM → captures data up to 2 PM.
         # Next restart adds more. EOD captures the full day. No data lost.
@@ -307,6 +327,217 @@ class EngineLifecycle:
             pass
         except Exception as exc:
             log.warning("[%s] market_bars persist failed: %s", self._name, exc)
+
+    def _generate_daily_report(self) -> None:
+        """Generate daily trade analysis CSV at EOD.
+
+        Format matches reports/daily_analysis/trade_analysis_YYYYMMDD.csv
+        consumed by Streamlit dashboard (dashboards/trade_analysis_dashboard.py).
+        """
+        import csv
+        import os
+        from datetime import date
+
+        engine = getattr(self._adapter, '_engine', None)
+        trade_log = getattr(engine, 'trade_log', []) if engine else []
+
+        # Fallback: if in-memory trade_log is empty (lost on restart),
+        # read from completed_trades DB (always has the data).
+        if not trade_log:
+            try:
+                import psycopg2
+                from config import DATABASE_URL
+                conn = psycopg2.connect(DATABASE_URL)
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT ticker, qty, entry_time, entry_price, exit_price,
+                           pnl, strategy, lifecycle_data
+                    FROM completed_trades
+                    WHERE exit_time::date = CURRENT_DATE
+                    ORDER BY exit_time
+                """)
+                for r in cur.fetchall():
+                    import json as _j
+                    _lc = {}
+                    if r[7]:
+                        try:
+                            _lc = _j.loads(r[7]) if isinstance(r[7], str) else r[7]
+                        except Exception:
+                            pass
+                    trade_log.append({
+                        'ticker': r[0], 'qty': r[1], 'entry_time': str(r[2] or ''),
+                        'entry_price': float(r[3] or 0), 'exit_price': float(r[4] or 0),
+                        'pnl': float(r[5] or 0), 'strategy': r[6] or '',
+                        'reason': _lc.get('exit_reason', ''),
+                        'lifecycle': _lc,
+                    })
+                conn.close()
+                log.info("[%s] Loaded %d trades from DB for daily report",
+                         self._name, len(trade_log))
+            except Exception as db_exc:
+                log.warning("[%s] DB trade fetch failed: %s", self._name, db_exc)
+
+        if not trade_log:
+            log.info("[%s] No trades today — skipping daily report", self._name)
+            return
+
+        today_str = date.today().strftime('%Y%m%d')
+        report_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'reports', 'daily_analysis')
+        os.makedirs(report_dir, exist_ok=True)
+        path = os.path.join(report_dir, f'trade_analysis_{today_str}.csv')
+
+        # CSV columns matching existing format
+        headers = [
+            'date', 'ticker', 'qty', 'entry_time', 'entry_price', 'exit_price',
+            'pnl', 'entry_reason', 'strategy', 'exit_reason', 'exit_category',
+            'exit_phase', 'exit_phase_label', 'max_phase_reached', 'phase0_passed',
+            'partial_done', 'r_multiple_at_exit', 'trail_stop', 'bars_held',
+            'is_win', 'is_loss', 'is_breakeven',
+        ]
+
+        phase_labels = {0: 'P0 Validation', 1: 'P1 Protection', 2: 'P2 Breakeven',
+                        3: 'P3 Harvest', 4: 'P4 Runner', -1: 'No Lifecycle'}
+
+        # Categorize exit reasons
+        def _exit_category(reason):
+            r = str(reason or '').upper()
+            if 'TARGET' in r or 'PARTIAL' in r:
+                return 'Target Hit'
+            elif 'STOP' in r:
+                return 'Stop Loss'
+            elif 'VWAP' in r:
+                return 'VWAP Exit'
+            elif 'RSI' in r:
+                return 'RSI Exit'
+            elif 'PHASE0' in r:
+                return 'Phase 0 Fail'
+            elif 'EOD' in r or 'FORCE' in r:
+                return 'EOD Close'
+            elif 'PHANTOM' in r or 'RECONCIL' in r:
+                return 'Phantom/Reconcile'
+            else:
+                return 'Other'
+
+        today_date = date.today().strftime('%Y-%m-%d')
+        rows = []
+        for t in trade_log:
+            pnl = float(t.get('pnl', 0) or 0)
+            lc = t.get('lifecycle', {})
+            reason = t.get('reason', '')
+
+            phase = lc.get('final_phase', -1) if lc else -1
+            max_phase = lc.get('max_phase', phase) if lc else phase
+            bars = lc.get('bars_held', 0) if lc else 0
+            trail = lc.get('trail_stop', 0) if lc else 0
+            partial = lc.get('partial_done', False) if lc else False
+            p0_passed = (max_phase >= 1) if max_phase >= 0 else False
+
+            # R-multiple at exit
+            entry = float(t.get('entry_price', 0) or 0)
+            exit_p = float(t.get('exit_price', 0) or 0)
+            r_val = lc.get('R', 0) if lc else 0
+            r_mult = round(pnl / r_val, 2) if r_val and r_val > 0 else 0
+
+            rows.append({
+                'date': today_date,
+                'ticker': t.get('ticker', ''),
+                'qty': t.get('qty', 0),
+                'entry_time': t.get('entry_time', ''),
+                'entry_price': entry,
+                'exit_price': exit_p,
+                'pnl': round(pnl, 2),
+                'entry_reason': t.get('strategy', ''),
+                'strategy': t.get('strategy', ''),
+                'exit_reason': reason,
+                'exit_category': _exit_category(reason),
+                'exit_phase': phase,
+                'exit_phase_label': phase_labels.get(phase, 'Unknown'),
+                'max_phase_reached': max_phase,
+                'phase0_passed': p0_passed,
+                'partial_done': partial,
+                'r_multiple_at_exit': r_mult,
+                'trail_stop': round(trail, 4) if trail else 0,
+                'bars_held': bars,
+                'is_win': pnl > 0,
+                'is_loss': pnl < 0,
+                'is_breakeven': pnl == 0,
+            })
+
+        with open(path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        log.info("[%s] Daily report: %d trades → %s", self._name, len(rows), path)
+
+    def _run_db_retention(self) -> None:
+        """Delete QuoteReceived events older than 3 days.
+
+        QuoteReceived = 2.7M rows/day = ~2-3 GB/day = 99% of event_store.
+        After 3 days, raw ticks are useless (market_bars has 1-min OHLCV).
+        Signals, fills, positions, risk blocks kept forever (tiny).
+
+        Also cleans old log files (> 7 days).
+        """
+        try:
+            import psycopg2
+            from config import DATABASE_URL
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+
+            # Delete QuoteReceived older than 3 days
+            cur.execute(
+                "DELETE FROM event_store "
+                "WHERE event_type = 'QuoteReceived' "
+                "AND event_time < CURRENT_DATE - INTERVAL '3 days'"
+            )
+            deleted_quotes = cur.rowcount
+
+            # Also clean BarReceived older than 7 days (market_bars replaces these)
+            cur.execute(
+                "DELETE FROM event_store "
+                "WHERE event_type = 'BarReceived' "
+                "AND event_time < CURRENT_DATE - INTERVAL '7 days'"
+            )
+            deleted_bars = cur.rowcount
+
+            # Also clean HeartbeatEmitted older than 3 days
+            cur.execute(
+                "DELETE FROM event_store "
+                "WHERE event_type = 'HeartbeatEmitted' "
+                "AND event_time < CURRENT_DATE - INTERVAL '3 days'"
+            )
+            deleted_hb = cur.rowcount
+
+            conn.commit()
+            conn.close()
+
+            log.info("[%s] DB retention: deleted %d QuoteReceived, %d BarReceived, "
+                     "%d HeartbeatEmitted (older than 3/7/3 days)",
+                     self._name, deleted_quotes, deleted_bars, deleted_hb)
+        except ImportError:
+            pass
+        except Exception as exc:
+            log.warning("[%s] DB retention failed: %s", self._name, exc)
+
+        # Clean old log files (> 7 days)
+        try:
+            import shutil
+            from datetime import date, timedelta
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+            cutoff = (date.today() - timedelta(days=7)).strftime('%Y%m%d')
+            for d in os.listdir(log_dir):
+                if d.isdigit() and len(d) == 8 and d < cutoff:
+                    path = os.path.join(log_dir, d)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                        log.info("[%s] Cleaned old log dir: %s", self._name, d)
+        except Exception as exc:
+            log.warning("[%s] Log cleanup failed: %s", self._name, exc)
 
     def _run_ml_analytics(self) -> None:
         """Populate ML tables from today's event_store data.

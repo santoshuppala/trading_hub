@@ -367,6 +367,11 @@ class RealTimeMonitor:
             self._tradier_stream.set_tick_detector(tick_detector)
         log.info("[Monitor] TickDetector attached — sub-second entries enabled")
 
+    def set_regime_filter(self, regime_filter) -> None:
+        """V10: Attach RegimeFilter for strategy-level regime gating."""
+        self._regime_filter = regime_filter
+        log.info("[Monitor] RegimeFilter attached")
+
     # ── V9 (R3): Stale order cleanup ────────────────────────────────────────
 
     def _cleanup_stale_open_orders(self) -> None:
@@ -1649,6 +1654,14 @@ class RealTimeMonitor:
         # Tick heartbeat
         self._heartbeat.tick()
 
+        # V10: Update regime filter (every ~60s)
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf:
+            try:
+                _rf.update()
+            except Exception:
+                pass  # regime failure must never block trading
+
         # V8: Pop periodic scans + ticker conviction ranking + live reconciliation
         if not hasattr(self, '_last_pop_scan'):
             self._last_pop_scan = 0.0
@@ -1811,7 +1824,11 @@ class RealTimeMonitor:
             return  # nothing changed
 
         # 1. Update WebSocket subscription (includes new + existing)
-        if _sc and _sc.is_connected:
+        # Call update_tickers even when not connected — it sets _tickers
+        # so the stream thread picks them up on its next loop iteration.
+        # Fixes chicken-and-egg: 0 positions at start → 0 HOT tickers →
+        # stream never connects → tickers never added → stream stays dead.
+        if _sc:
             try:
                 _sc.update_tickers(all_tickers)
             except Exception as exc:
@@ -1960,6 +1977,13 @@ class RealTimeMonitor:
         self.running = False
         if self.thread:
             self.thread.join(timeout=10)
+        # V10: Save regime filter state (crash recovery for next startup)
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf:
+            try:
+                _rf._save_state()
+            except Exception:
+                pass
         # V8: Actually email the EOD summary (was hardcoded to None → log only)
         EODSummary.send(self.trade_log, alert_email=self._alert_email)
         self._durable_log.close()   # flush remaining Redpanda messages

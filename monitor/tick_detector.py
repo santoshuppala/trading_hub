@@ -287,6 +287,14 @@ class TickSignalDetector:
                          "%d signals were held during freeze",
                          _ready_count, self._signals_frozen)
 
+        # ── Expire pending setups (every call — cheap dict scan) ─────
+        if self._pending_setups:
+            _expired = [k for k, v in self._pending_setups.items() if v.expires_at < now]
+            for k in _expired:
+                del self._pending_setups[k]
+                self._setups_expired += 1
+                log.debug("[TickDetector] Setup expired: %s (180s, no tick confirmation)", k)
+
         # ── Periodic memory cleanup (every 100 update_levels calls) ───
         _total_calls = sum(self._live_bar_count.values())
         if _total_calls > 0 and _total_calls % 100 == 0:
@@ -297,11 +305,6 @@ class TickSignalDetector:
             self._level_cooldown = {
                 k: v for k, v in self._level_cooldown.items() if v > _cutoff
             }
-            # Prune expired pending setups
-            _expired = [k for k, v in self._pending_setups.items() if v.expires_at < now]
-            for k in _expired:
-                del self._pending_setups[k]
-                self._setups_expired += 1
 
         # ── Store today's close for tomorrow's gap detection ─────────
         close = levels.get('close', levels.get('session_close', 0))
@@ -813,6 +816,11 @@ class TickSignalDetector:
           - EMA9 reclaim OR EMA20 bounce with momentum
           - Volume confirmation from recent ticks (live, not stale RVOL)
         """
+        # Regime check: skip if strategy not allowed in current market
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf and not _rf.is_strategy_allowed(setup.strategy):
+            return None
+
         # Expiry check
         if now > setup.expires_at:
             del self._pending_setups[ticker]
@@ -829,18 +837,30 @@ class TickSignalDetector:
         if price > setup.ema9 + setup.atr * 0.5:
             return None  # too extended above EMA9, missed the entry
 
-        # ── Trigger condition 1: EMA9 reclaim ────────────────────────
-        # Price crosses above EMA9 from below
+        # ── Trigger conditions ────────────────────────────────────────
+        # The bar-level detection already confirmed: bullish bar near EMA9/EMA20.
+        # By the time the setup registers, price is typically ALREADY above EMA9.
+        # So the tick trigger confirms the bounce is CONTINUING, not re-detects it.
+        #
+        # Trigger 1: EMA9 reclaim (price crosses above from below)
+        #   Works when price dipped below EMA9 after setup registration
         _ema9_reclaim = (prev_price < setup.ema9 <= price)
 
-        # ── Trigger condition 2: EMA20 bounce with momentum ──────────
-        # Previous tick was near EMA20, this tick shows upward move
+        # Trigger 2: Already above EMA9 + upward momentum
+        #   Works for the common case: price is already above EMA9 at registration.
+        #   Confirms the bounce is real by requiring upward tick movement.
+        _above_ema9 = (price > setup.ema9 and prev_price > setup.ema9)
+        _tick_momentum = (price - prev_price) > setup.atr * 0.005  # meaningful up-tick
+        _already_above_with_momentum = _above_ema9 and _tick_momentum
+
+        # Trigger 3: EMA20 bounce with momentum
+        #   Price was near EMA20 and is now moving up
         _near_ema20 = (abs(prev_price - setup.ema20) / setup.ema20 < 0.002
                        if setup.ema20 > 0 else False)
-        _momentum = (price - prev_price) > setup.atr * 0.01
-        _ema20_bounce = _near_ema20 and _momentum
+        _ema20_momentum = (price - prev_price) > setup.atr * 0.01
+        _ema20_bounce = _near_ema20 and _ema20_momentum
 
-        if not (_ema9_reclaim or _ema20_bounce):
+        if not (_ema9_reclaim or _already_above_with_momentum or _ema20_bounce):
             return None  # no trigger this tick
 
         # ── Volume confirmation (live tick data) ─────────────────────
@@ -876,7 +896,9 @@ class TickSignalDetector:
         del self._pending_setups[ticker]
         self._setups_triggered += 1
 
-        trigger_type = 'ema9_reclaim' if _ema9_reclaim else 'ema20_bounce'
+        trigger_type = ('ema9_reclaim' if _ema9_reclaim
+                        else 'above_ema9_momentum' if _already_above_with_momentum
+                        else 'ema20_bounce')
         log.info("[TickDetector] SETUP TRIGGERED: %s %s | trigger=%s "
                  "tick=$%.2f ema9=$%.2f ema20=$%.2f vol=%d/%d",
                  ticker, setup.strategy, trigger_type,
@@ -908,12 +930,22 @@ class TickSignalDetector:
 
             _tier = 2 if sig.strategy in ('orb', 'gap_and_go') else (
                 1 if sig.strategy in ('sr_flip', 'trend_pullback') else 3)
-            # For stop-limit orders, include activation_price in detector_signals JSON
-            _det_json = '{"source": "tick_detector"}'
+            # Build detector_signals JSON with regime scores + order type
+            import json as _json
+            _det_dict = {"source": "tick_detector"}
             if sig.activation_price > 0:
-                _det_json = (f'{{"source": "tick_detector", '
-                             f'"order_type": "stop_limit", '
-                             f'"activation_price": {sig.activation_price}}}')
+                _det_dict["order_type"] = "stop_limit"
+                _det_dict["activation_price"] = sig.activation_price
+            # Inject regime scores for DB persistence
+            _rf = getattr(self, '_regime_filter', None)
+            if _rf:
+                _det_dict['regime_trend'] = round(_rf.trend_score, 3)
+                _det_dict['regime_vrp'] = round(_rf.vrp_score, 3)
+                _det_dict['regime_participation'] = round(_rf.participation_score, 3)
+                _det_dict['regime_uncertainty'] = round(_rf.uncertainty, 3)
+                _det_dict['regime_strategy_score'] = round(
+                    _rf.get_strategy_score(sig.strategy), 3)
+            _det_json = _json.dumps(_det_dict)
             payload = ProStrategySignalPayload(
                 ticker=sig.ticker,
                 strategy_name=sig.strategy,

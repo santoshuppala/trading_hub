@@ -594,6 +594,35 @@ def main():
     except Exception as exc:
         log.warning("Tradier streaming init failed (non-fatal): %s", exc)
 
+    # ── V10: RegimeFilter — strategy-level regime gating ─────────────────
+    try:
+        from monitor.regime_filter import RegimeFilter
+        # VIX data function
+        _vix_fn = None
+        try:
+            from data_sources.alt_data_reader import alt_data
+            _vix_fn = alt_data.vix
+        except Exception:
+            pass
+
+        regime_filter = RegimeFilter(
+            bars_cache_ref=getattr(monitor, '_bars_cache', {}),
+            alt_data_fn=_vix_fn,
+        )
+        monitor.set_regime_filter(regime_filter)
+        # Wire to RiskAdapter (Pro signals)
+        if pro_engine:
+            pro_engine._risk_adapter._regime_filter = regime_filter
+        # Wire to RiskEngine (VWAP signals)
+        if hasattr(monitor, '_risk') and monitor._risk:
+            monitor._risk._regime_filter = regime_filter
+        # Wire to TickDetector (tick signals)
+        if 'tick_detector' in dir():
+            tick_detector._regime_filter = regime_filter
+        log.info("RegimeFilter active — 3-dimension scoring (trend/vrp/participation)")
+    except Exception as exc:
+        log.warning("RegimeFilter init failed (non-fatal): %s", exc)
+
     # ── Start monitor ─────────────────────────────────────────────────────
     monitor.start()
 

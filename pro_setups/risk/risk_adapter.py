@@ -136,7 +136,17 @@ class RiskAdapter:
             log.info("%s FROZEN: startup trade freeze active (waiting for data readiness)", tag)
             return
 
-        # ── Check 0a: Stopped-today blacklist ─────────────────────────────────
+        # ── Check 0a: Regime filter — block strategies in hostile conditions ────
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf and not _rf.is_strategy_allowed(strategy_name):
+            _score = _rf.get_strategy_score(strategy_name)
+            log.info("%s BLOCKED: regime_score=%.2f < threshold (trend=%.2f vrp=%.2f "
+                     "breadth=%.2f uncertainty=%.2f)",
+                     tag, _score, _rf.trend_score, _rf.vrp_score,
+                     _rf.participation_score, _rf.uncertainty)
+            return
+
+        # ── Check 0b: Stopped-today blacklist ─────────────────────────────────
         # If this ticker was stopped out today, don't re-enter. Period.
         # Prevents churn on losers (17 entries on same losing ticker).
         if ticker in self._stopped_today:
@@ -294,6 +304,12 @@ class RiskAdapter:
                     qty = max(1, int(qty * mult))
             except Exception as exc:
                 log.warning("%s market regime import failed: %s", tag, exc)
+
+            # V10: Regime-based size adjustment
+            if _rf:
+                _regime_mult = _rf.get_size_multiplier(strategy_name)
+                if _regime_mult < 1.0:
+                    qty = max(1, int(qty * _regime_mult))
 
             if qty <= 0:
                 log.warning("%s BLOCKED: qty=0 (budget=%.0f entry=%.4f)", tag, self._trade_budget, entry_price)

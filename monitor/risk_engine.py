@@ -166,7 +166,16 @@ class RiskEngine:
         # 0a. V10: WAL dedup — checked later via atomic check_and_intent
         # (moved from here to just before ORDER_REQ emit for TOCTOU safety)
 
-        # 0b. Cross-layer dedup (READ-ONLY pre-flight)
+        # 0b. V10: Regime filter — block VWAP entries in hostile markets
+        _rf = getattr(self, '_regime_filter', None)
+        if _rf and not _rf.is_strategy_allowed('vwap_reclaim'):
+            self._block(ticker, p.action,
+                        f"regime_score={_rf.get_strategy_score('vwap_reclaim'):.2f} "
+                        f"(trend={_rf.trend_score:.2f} vrp={_rf.vrp_score:.2f} "
+                        f"breadth={_rf.participation_score:.2f})", event)
+            return
+
+        # 0c. Cross-layer dedup (READ-ONLY pre-flight)
         # V7: Core's RegistryGate handles the actual acquire when ORDER_REQ
         # reaches the bus. This is a fast pre-flight to avoid unnecessary work.
         from .position_registry import registry
@@ -291,6 +300,17 @@ class RiskEngine:
             if not beta_ok:
                 self._block(ticker, p.action, beta_reason, event)
                 return
+
+            # ── Smart stop validation — reject if stop too wide ────────────
+            _atr = getattr(p, 'atr_value', 0) or 0
+            _stop = getattr(p, 'stop_price', 0) or 0
+            if _atr > 0 and _stop > 0 and ask_price > 0:
+                _stop_dist = ask_price - _stop
+                if _stop_dist > _atr * 3.0:
+                    self._block(ticker, p.action,
+                                f"stop too wide ({_stop_dist/_atr:.1f} ATR, max 3.0) "
+                                f"entry=${ask_price:.2f} stop=${_stop:.2f}", event)
+                    return
 
             # ── All checks passed — size and submit ──────────────────────────
             effective_entry = ask_price * (1 + SLIPPAGE_PCT)

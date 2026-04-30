@@ -1282,6 +1282,12 @@ class SessionWatchdog:
         now = datetime.now(ET)
         hour = now.hour
 
+        # Reset _updates_sent at start of new day (outer watchdog runs continuously)
+        _today = now.date()
+        if not hasattr(self, '_updates_date') or self._updates_date != _today:
+            self._updates_sent = set()
+            self._updates_date = _today
+
         if hour not in self._UPDATE_HOURS or hour in self._updates_sent:
             return
 

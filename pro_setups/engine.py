@@ -414,6 +414,18 @@ class ProSetupEngine:
         _time_bucket = compute_time_bucket()
         _confluence  = compute_confluence_score(det_json)
 
+        # V10: Inject regime scores into detector_signals JSON for DB persistence
+        _td = getattr(self, '_tick_detector', None)
+        _rf = getattr(_td, '_regime_filter', None) if _td else None
+        if _rf:
+            _det_dict = json.loads(det_json) if det_json else {}
+            _det_dict['regime_trend'] = round(_rf.trend_score, 3)
+            _det_dict['regime_vrp'] = round(_rf.vrp_score, 3)
+            _det_dict['regime_participation'] = round(_rf.participation_score, 3)
+            _det_dict['regime_uncertainty'] = round(_rf.uncertainty, 3)
+            _det_dict['regime_strategy_score'] = round(_rf.get_strategy_score(strategy_name), 3)
+            det_json = json.dumps(_det_dict)
+
         # Strategies whose primary detector uses 5-min bars
         _5MIN_STRATEGIES = {
             'sr_flip', 'inside_bar', 'flag_pennant', 'fib_confluence',

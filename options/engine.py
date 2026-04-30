@@ -94,6 +94,8 @@ class OptionsPosition:
     portfolio_theta:  float = 0.0      # net theta (daily decay)
     portfolio_vega:   float = 0.0      # net vega (IV sensitivity)
     greeks_updated_at: float = 0.0    # V10: monotonic timestamp of last Greeks refresh
+    # V10: Regime at entry (for ML — persists to lifecycle_data on close)
+    regime_at_entry:  dict = None      # {trend, vrp, participation, uncertainty, iv_rank}
 
     @property
     def is_credit(self) -> bool:
@@ -268,8 +270,10 @@ class OptionsEngine:
 
         iv_estimate = self._estimate_iv(p.ticker, p.current_price)
 
-        # Update IV tracker with current reading
-        self._iv_tracker.update(p.ticker, iv_estimate)
+        # Update IV tracker ONLY with real IV (not the 0.25 default).
+        # Feeding 0.25 constantly → min==max → iv_rank always 50 (useless).
+        if iv_estimate != 0.25:
+            self._iv_tracker.update(p.ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(p.ticker)
 
         strategy_type = self._selector.select_from_signal(
@@ -286,19 +290,48 @@ class OptionsEngine:
         if strategy_type is None:
             return
 
-        # Earnings safety check: block credit strategies near earnings
+        # ── Hard gates (block even in paper trading) ─────────────────
+        # These are mathematical certainties, not regime opinions.
+
+        # Gate 1: No selling premium within 5 days of earnings
         if strategy_type in _CREDIT_STRATEGIES:
-            if not self._earnings.is_earnings_safe(p.ticker, min_days=7):
+            if not self._earnings.is_earnings_safe(p.ticker, min_days=5):
                 dte = self._earnings.days_to_earnings(p.ticker)
                 log.info(
-                    "[OptionsEngine] EARNINGS BLOCK %s %s | earnings in %s days",
+                    "[OptionsEngine] HARD GATE: EARNINGS BLOCK %s %s | earnings in %s days "
+                    "(IV crush will destroy credit position)",
                     p.ticker, strategy_type, dte,
                 )
                 return
 
+        # Gate 2: No buying premium at IV rank > 90th percentile
+        if strategy_type in _DEBIT_STRATEGIES and iv_rank > 90:
+            log.info(
+                "[OptionsEngine] HARD GATE: IV RANK TOO HIGH %s %s | iv_rank=%.0f "
+                "(overpaying for options)",
+                p.ticker, strategy_type, iv_rank,
+            )
+            return
+
+        # Gate 3: No selling premium at IV rank < 20th percentile
+        if strategy_type in _CREDIT_STRATEGIES and iv_rank < 20:
+            log.info(
+                "[OptionsEngine] HARD GATE: IV RANK TOO LOW %s %s | iv_rank=%.0f "
+                "(not enough premium to justify risk)",
+                p.ticker, strategy_type, iv_rank,
+            )
+            return
+
+        # ── Regime score tagging (for post-analysis, no blocking) ────
+        _regime_scores = self._load_regime_scores()
+
         log.info(
-            "[OptionsEngine] SIGNAL → %s %s | rvol=%.2f iv=%.2f iv_rank=%.0f",
+            "[OptionsEngine] SIGNAL → %s %s | rvol=%.2f iv=%.2f iv_rank=%.0f "
+            "| regime: trend=%.2f vrp=%.2f breadth=%.2f",
             p.ticker, strategy_type, p.rvol, iv_estimate, iv_rank,
+            _regime_scores.get('trend', 0.5),
+            _regime_scores.get('vrp', 0.5),
+            _regime_scores.get('participation', 0.5),
         )
 
         self._execute_entry(
@@ -358,9 +391,10 @@ class OptionsEngine:
         # Infer direction: bullish if positive sentiment + positive gap
         is_bullish = sentiment_delta >= 0 or gap_size >= 0
 
-        # Get IV context
+        # Get IV context — only update tracker with real IV (not 0.25 default)
         iv_estimate = self._estimate_iv(ticker, entry_price)
-        self._iv_tracker.update(ticker, iv_estimate)
+        if iv_estimate != 0.25:
+            self._iv_tracker.update(ticker, iv_estimate)
         iv_rank = self._iv_tracker.iv_rank(ticker)
         iv_is_rich = iv_rank >= 50
 
@@ -1104,6 +1138,9 @@ class OptionsEngine:
             'exit_vega': round(pos.portfolio_vega, 4),
             # ── Full lifecycle journey ────────────────────────────
             'lifecycle': lc_data,
+            # ── V10: Regime at entry (for ML calibration) ─────────
+            'regime_at_entry': pos.regime_at_entry or {},
+            'lifecycle_events': lc_data.get('events', []),
         }
 
         try:
@@ -1253,6 +1290,10 @@ class OptionsEngine:
             last_check_time=time.monotonic(),
         )
 
+        # V10: Capture regime at entry for ML persistence
+        pos.regime_at_entry = self._load_regime_scores()
+        pos.regime_at_entry['iv_rank'] = self._iv_tracker.iv_rank(ticker)
+
         try:
             lifecycle = OptionsPositionLifecycle(
                 ticker=ticker,
@@ -1400,6 +1441,26 @@ class OptionsEngine:
             "[OptionsEngine] emitted OPTIONS_SIGNAL | %s %s | $%.2f debit | max_risk $%.2f",
             ticker, strategy_type, trade_spec.net_debit, trade_spec.max_risk,
         )
+
+    def _load_regime_scores(self) -> dict:
+        """Load regime scores from Core's regime_state.json (shared file)."""
+        try:
+            import json
+            _path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'data', 'regime_state.json')
+            if not os.path.exists(_path):
+                return {}
+            with open(_path) as f:
+                state = json.load(f)
+            return {
+                'trend': state.get('trend_score', 0.5),
+                'vrp': state.get('vrp_score', 0.5),
+                'participation': state.get('participation_score', 0.5),
+                'uncertainty': state.get('uncertainty', 0.0),
+            }
+        except Exception:
+            return {}
 
     def _estimate_iv(self, ticker: str, spot_price: float) -> float:
         """Estimate IV from cached chain data only — never make a live API call.

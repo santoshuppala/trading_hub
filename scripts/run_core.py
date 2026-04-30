@@ -628,6 +628,78 @@ def main():
     except Exception as exc:
         log.warning("RegimeFilter init failed (non-fatal): %s", exc)
 
+    # ── V10: Pre-market gap scanner ─────────────────────────────────────
+    # Scan all tickers for 5%+ gaps before market open using Tradier batch
+    # quotes. Adds gappers to universe + persists to discovery DB.
+    # Runs once per startup, only pre-market (before 9:35 ET).
+    try:
+        _scan_time = datetime.now(ET)
+        if _scan_time.hour < 10 or (_scan_time.hour == 9 and _scan_time.minute < 35):
+            _data = monitor._data
+            # Use underlying Tradier client for get_quotes (FailoverClient wraps it)
+            _client = getattr(_data, '_primary', _data) if hasattr(_data, '_primary') else _data
+            if hasattr(_client, 'get_quotes'):
+                log.info("[GapScan] Pre-market gap scan starting (%d tickers)...",
+                         len(monitor.tickers))
+                _quotes = _client.get_quotes(monitor.tickers)
+                _gap_tickers = []
+                _gap_meta = []
+                for sym, q in _quotes.items():
+                    try:
+                        _last = float(q.get('last', 0) or 0)
+                        _prev = float(q.get('prevclose', q.get('close', 0)) or 0)
+                        if _prev > 0 and _last > 0:
+                            _gap_pct = ((_last - _prev) / _prev) * 100
+                            if abs(_gap_pct) >= 5.0:
+                                _gap_tickers.append(sym)
+                                _gap_meta.append({
+                                    'ticker': sym,
+                                    'source': 'premarket_gap_scan',
+                                    'metadata': {
+                                        'reason': 'premarket_gap',
+                                        'gap_pct': round(_gap_pct, 2),
+                                        'prev_close': _prev,
+                                        'premarket_price': _last,
+                                        'premarket_volume': int(q.get('volume', 0) or 0),
+                                    },
+                                })
+                    except (ValueError, TypeError):
+                        continue
+
+                if _gap_tickers:
+                    # Add to scan universe
+                    _added_gaps = []
+                    for t in _gap_tickers:
+                        if t not in _ticker_set:
+                            monitor.tickers.append(t)
+                            _ticker_set.add(t)
+                            _added_gaps.append(t)
+                    log.info("[GapScan] Found %d gappers (5%%+): %s | %d new to universe",
+                             len(_gap_tickers),
+                             ', '.join(f'{m["ticker"]}({m["metadata"]["gap_pct"]:+.1f}%%)'
+                                       for m in _gap_meta[:10]),
+                             len(_added_gaps))
+
+                    # Persist to discovery DB
+                    _db_loop = getattr(db_cleanup, 'loop', None) if db_cleanup else None
+                    if _db_loop and _gap_meta:
+                        try:
+                            import asyncio as _aio
+                            from db.discovery import record_discoveries_batch
+                            _aio.run_coroutine_threadsafe(
+                                record_discoveries_batch(_gap_meta), _db_loop,
+                            ).result(timeout=10)
+                        except Exception as _exc:
+                            log.debug("[GapScan] DB persist failed: %s", _exc)
+                else:
+                    log.info("[GapScan] No 5%%+ gaps found pre-market")
+            else:
+                log.debug("[GapScan] Data client has no get_quotes — skipping")
+        else:
+            log.debug("[GapScan] Past 9:35 — skipping pre-market scan")
+    except Exception as exc:
+        log.warning("[GapScan] Pre-market gap scan failed (non-fatal): %s", exc)
+
     # ── Start monitor ─────────────────────────────────────────────────────
     monitor.start()
 

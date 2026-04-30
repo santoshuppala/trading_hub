@@ -11,6 +11,7 @@ TICKERS = [
     'AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','AVGO','ASML','ORCL',
     # Semiconductors
     'AMD','MU','QCOM','AMAT','LRCX','TXN','ADI','MRVL','KLAC','NXPI','ON','SWKS',
+    'INTC','STM','MCHP','GFS',
     # Software / cloud
     'ADBE','CRM','INTU','SNPS','CDNS','NOW','WDAY','DDOG','SNOW','NET','ZS','OKTA',
     'TEAM','MDB','GTLB','PATH','HUBS','ZM','DOCU',
@@ -39,7 +40,7 @@ TICKERS = [
     # Consumer staples
     'WMT','COST','PG','KO','PEP','MDLZ','CL',
     # Industrials
-    'CAT','DE','HON','GE','RTX','LMT','NOC','BA','UPS','FDX',
+    'CAT','DE','HON','GE','RTX','LMT','NOC','BA','UPS','FDX','GD','MMM',
     # ETFs (market + sector)
     'SPY','QQQ','IWM','DIA',
     'XLK','XLF','XLE','XLV','XLY','XLI','XLC','XLRE','XLB','XLU',

@@ -1559,6 +1559,74 @@ class SessionWatchdog:
             body += "\n\n"
 
 
+        # V10: Alpha/Beta Attribution
+        _attr_summary = ''
+        try:
+            import psycopg2
+            import psycopg2.extras
+            from config import DATABASE_URL
+            _ac = psycopg2.connect(DATABASE_URL,
+                                   cursor_factory=psycopg2.extras.RealDictCursor)
+            _acur = _ac.cursor()
+
+            # Totals
+            _acur.execute("""
+                SELECT COALESCE(SUM(alpha_pnl), 0) as total_alpha,
+                       COALESCE(SUM(beta_pnl), 0) as total_beta,
+                       COALESCE(SUM(slippage_cost), 0) as total_slippage,
+                       COUNT(*) as n_trades
+                FROM trading.ml_pnl_attribution
+                WHERE session_date = CURRENT_DATE
+            """)
+            _at = _acur.fetchone()
+            if _at and _at['n_trades'] > 0:
+                _ta = float(_at['total_alpha'])
+                _tb = float(_at['total_beta'])
+                _ts = float(_at['total_slippage'])
+                _tp = _ta + _tb
+                _alpha_pct = (_ta / _tp * 100) if _tp != 0 else 0
+
+                _attr_summary = (
+                    f"ALPHA / BETA ATTRIBUTION\n"
+                    f"  Alpha P&L:     ${_ta:+,.2f}  ({_alpha_pct:.0f}% — strategy edge)\n"
+                    f"  Beta P&L:      ${_tb:+,.2f}  ({100-_alpha_pct:.0f}% — market)\n"
+                    f"  Slippage:      ${-abs(_ts):,.2f}\n"
+                )
+
+                # Per-strategy breakdown
+                _acur.execute("""
+                    SELECT strategy,
+                           SUM(alpha_pnl) as alpha, SUM(beta_pnl) as beta,
+                           SUM(slippage_cost) as slippage, COUNT(*) as n,
+                           MIN(alpha_t_stat) as t_stat, MIN(alpha_p_value) as p_val
+                    FROM trading.ml_pnl_attribution
+                    WHERE session_date = CURRENT_DATE
+                    GROUP BY strategy ORDER BY SUM(alpha_pnl) DESC
+                """)
+                _strats = _acur.fetchall()
+                if _strats:
+                    _attr_summary += "\n  By Strategy:\n"
+                    for s in _strats:
+                        _sn = s['strategy'] or 'unknown'
+                        _sa = float(s['alpha'] or 0)
+                        _sb = float(s['beta'] or 0)
+                        _ss = float(s['slippage'] or 0)
+                        _sn_trades = int(s['n'] or 0)
+                        if s['p_val'] is not None:
+                            _sig = f"YES (p={float(s['p_val']):.2f})" if float(s['p_val']) < 0.05 else f"NO (p={float(s['p_val']):.2f})"
+                        else:
+                            _sig = f"ACCUMULATING ({_sn_trades}/20)"
+                        _attr_summary += (
+                            f"    {_sn:20s} ({_sn_trades:>2} trades): "
+                            f"alpha=${_sa:+,.0f}  beta=${_sb:+,.0f}  "
+                            f"slip=${-abs(_ss):,.0f}  {_sig}\n"
+                        )
+
+                _attr_summary += "\n"
+            _ac.close()
+        except Exception:
+            pass
+
         # WAL stats
         _wal_summary = ''
         try:
@@ -1579,6 +1647,9 @@ class SessionWatchdog:
             f"  Hotfixes:  {len(self.heals_applied)} applied\n"
             f"  Crashes:   {sum(self._prev_crash_count.values())}\n\n"
         )
+
+        if _attr_summary:
+            body += _attr_summary
 
         if _wal_summary:
             body += _wal_summary
@@ -1885,6 +1956,88 @@ class SessionWatchdog:
             report_lines.append("  ORDER WAL")
             report_lines.append(f"    Orders today:   {ws.get('total_orders', 0)}")
             report_lines.append(f"    Incomplete:     {ws.get('incomplete', 0)}")
+        except Exception:
+            pass
+
+        # 6. V10: Alpha/Beta Attribution
+        try:
+            import psycopg2
+            import psycopg2.extras
+            from config import DATABASE_URL
+            _rc = psycopg2.connect(DATABASE_URL,
+                                   cursor_factory=psycopg2.extras.RealDictCursor)
+            _rcur = _rc.cursor()
+
+            _rcur.execute("""
+                SELECT COALESCE(SUM(alpha_pnl), 0) as alpha,
+                       COALESCE(SUM(beta_pnl), 0) as beta,
+                       COALESCE(SUM(slippage_cost), 0) as slippage,
+                       COALESCE(SUM(gross_alpha_pnl), 0) as gross_alpha,
+                       COUNT(*) as n
+                FROM trading.ml_pnl_attribution
+                WHERE session_date = CURRENT_DATE
+            """)
+            _ra = _rcur.fetchone()
+            if _ra and _ra['n'] > 0:
+                _a = float(_ra['alpha'])
+                _b = float(_ra['beta'])
+                _s = float(_ra['slippage'])
+                _ga = float(_ra['gross_alpha'])
+                _t = _a + _b
+                _apct = (_a / _t * 100) if _t != 0 else 0
+
+                report_lines.append("")
+                report_lines.append("  ALPHA / BETA DECOMPOSITION")
+                report_lines.append(f"    Total P&L:         ${_t:>+10,.2f}")
+                report_lines.append(f"    Beta P&L:          ${_b:>+10,.2f}  ({100-_apct:.0f}% — market)")
+                report_lines.append(f"    Gross Alpha P&L:   ${_ga:>+10,.2f}  (before costs)")
+                report_lines.append(f"    Slippage Cost:     ${-abs(_s):>10,.2f}")
+                report_lines.append(f"    Net Alpha P&L:     ${_a:>+10,.2f}  ({_apct:.0f}% — skill)")
+
+                # Per-strategy
+                _rcur.execute("""
+                    SELECT strategy, SUM(alpha_pnl) as alpha, SUM(beta_pnl) as beta,
+                           SUM(slippage_cost) as slippage, COUNT(*) as n,
+                           MIN(alpha_p_value) as p_val
+                    FROM trading.ml_pnl_attribution
+                    WHERE session_date = CURRENT_DATE
+                    GROUP BY strategy ORDER BY SUM(alpha_pnl) DESC
+                """)
+                _rs = _rcur.fetchall()
+                if _rs:
+                    report_lines.append("")
+                    report_lines.append("    By Strategy:")
+                    for _r in _rs:
+                        _sn = _r['strategy'] or 'unknown'
+                        _n = int(_r['n'] or 0)
+                        _sa = float(_r['alpha'] or 0)
+                        _sb = float(_r['beta'] or 0)
+                        if _r['p_val'] is not None:
+                            _sig = "YES" if float(_r['p_val']) < 0.05 else "NO"
+                            _sig += f" (p={float(_r['p_val']):.2f})"
+                        else:
+                            _sig = f"ACCUMULATING ({_n}/20)"
+                        report_lines.append(
+                            f"      {_sn:20s} ({_n:>2}): alpha=${_sa:>+8,.0f}  "
+                            f"beta=${_sb:>+8,.0f}  {_sig}")
+
+                # Per session phase
+                _rcur.execute("""
+                    SELECT session_phase, SUM(alpha_pnl) as alpha, COUNT(*) as n
+                    FROM trading.ml_pnl_attribution
+                    WHERE session_date = CURRENT_DATE AND session_phase IS NOT NULL
+                    GROUP BY session_phase ORDER BY session_phase
+                """)
+                _rp = _rcur.fetchall()
+                if _rp:
+                    report_lines.append("")
+                    report_lines.append("    By Session Phase:")
+                    for _r in _rp:
+                        report_lines.append(
+                            f"      {_r['session_phase']:12s}  alpha=${float(_r['alpha'] or 0):>+8,.0f}  "
+                            f"({int(_r['n'])} trades)")
+
+            _rc.close()
         except Exception:
             pass
 

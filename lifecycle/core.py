@@ -388,13 +388,16 @@ class EngineLifecycle:
         os.makedirs(report_dir, exist_ok=True)
         path = os.path.join(report_dir, f'trade_analysis_{today_str}.csv')
 
-        # CSV columns matching existing format
+        # CSV columns matching existing format + V10 attribution
         headers = [
             'date', 'ticker', 'qty', 'entry_time', 'entry_price', 'exit_price',
             'pnl', 'entry_reason', 'strategy', 'exit_reason', 'exit_category',
             'exit_phase', 'exit_phase_label', 'max_phase_reached', 'phase0_passed',
             'partial_done', 'r_multiple_at_exit', 'trail_stop', 'bars_held',
             'is_win', 'is_loss', 'is_breakeven',
+            # V10: Alpha/Beta attribution
+            'spy_return', 'intraday_beta', 'beta_pnl', 'alpha_pnl',
+            'net_alpha_pnl', 'slippage_cost', 'session_phase', 'regime_trend',
         ]
 
         phase_labels = {0: 'P0 Validation', 1: 'P1 Protection', 2: 'P2 Breakeven',
@@ -465,8 +468,54 @@ class EngineLifecycle:
                 'is_breakeven': pnl == 0,
             })
 
+        # V10: Merge attribution data from ml_pnl_attribution (if available)
+        try:
+            import psycopg2
+            import psycopg2.extras
+            from config import DATABASE_URL
+            _aconn = psycopg2.connect(DATABASE_URL,
+                                      cursor_factory=psycopg2.extras.RealDictCursor)
+            _acur = _aconn.cursor()
+            _acur.execute("""
+                SELECT trade_id, spy_return, intraday_beta, beta_pnl, alpha_pnl,
+                       net_alpha_pnl, slippage_cost, session_phase, regime_trend
+                FROM trading.ml_pnl_attribution
+                WHERE session_date = CURRENT_DATE
+            """)
+            _attr_map = {r['trade_id']: r for r in _acur.fetchall()}
+            _aconn.close()
+
+            for row in rows:
+                # Match by ticker+entry_time (trade_id may not be in trade_log)
+                attr = _attr_map.get(row.get('_trade_id'))
+                if not attr:
+                    # Try matching by ticker
+                    for a in _attr_map.values():
+                        if a.get('ticker') == row.get('ticker'):
+                            attr = a
+                            break
+                if attr:
+                    row['spy_return'] = round(float(attr['spy_return'] or 0), 6)
+                    row['intraday_beta'] = round(float(attr['intraday_beta'] or 0), 4)
+                    row['beta_pnl'] = round(float(attr['beta_pnl'] or 0), 2)
+                    row['alpha_pnl'] = round(float(attr['alpha_pnl'] or 0), 2)
+                    row['net_alpha_pnl'] = round(float(attr['net_alpha_pnl'] or 0), 2)
+                    row['slippage_cost'] = round(float(attr['slippage_cost'] or 0), 2)
+                    row['session_phase'] = attr['session_phase'] or ''
+                    row['regime_trend'] = round(float(attr['regime_trend'] or 0), 4)
+                else:
+                    for h in ['spy_return', 'intraday_beta', 'beta_pnl', 'alpha_pnl',
+                              'net_alpha_pnl', 'slippage_cost', 'session_phase', 'regime_trend']:
+                        row.setdefault(h, '')
+        except Exception as attr_exc:
+            log.debug("[%s] Attribution merge skipped: %s", self._name, attr_exc)
+            for row in rows:
+                for h in ['spy_return', 'intraday_beta', 'beta_pnl', 'alpha_pnl',
+                          'net_alpha_pnl', 'slippage_cost', 'session_phase', 'regime_trend']:
+                    row.setdefault(h, '')
+
         with open(path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
+            writer = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(rows)
 
@@ -550,20 +599,25 @@ class EngineLifecycle:
             from datetime import date
             from scripts.post_session_analytics import (
                 job_signal_context, job_trade_outcomes, job_rejection_log,
+                job_pnl_attribution,
             )
             import psycopg2
+            import psycopg2.extras
             from config import DATABASE_URL
 
-            conn = psycopg2.connect(DATABASE_URL)
+            conn = psycopg2.connect(DATABASE_URL,
+                                    cursor_factory=psycopg2.extras.RealDictCursor)
             today = date.today()
 
             sc = job_signal_context(conn, today)
             to = job_trade_outcomes(conn, today)
             rl = job_rejection_log(conn, today)
+            pa = job_pnl_attribution(conn, today)
 
             conn.close()
             log.info("[%s] ML analytics: signal_context=%d trade_outcomes=%d "
-                     "rejection_log=%d", self._name, sc, to, rl)
+                     "rejection_log=%d pnl_attribution=%d",
+                     self._name, sc, to, rl, pa)
         except ImportError:
             log.debug("[%s] ML analytics skipped (post_session_analytics not available)",
                       self._name)

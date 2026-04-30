@@ -468,16 +468,18 @@ class AlpacaOptionChainClient:
         if not contracts:
             return None
 
+        # Use abs(delta) for matching — put deltas are negative from Alpaca
+        # but target_delta is always positive (e.g., 0.175 for a 17.5-delta put).
         candidates = [
             c for c in contracts
             if c.option_type == option_type
-            and abs(c.delta - target_delta) <= tolerance
+            and abs(abs(c.delta) - target_delta) <= tolerance
         ]
         if not candidates:
             return None
 
         # Return closest match
-        return min(candidates, key=lambda c: abs(c.delta - target_delta))
+        return min(candidates, key=lambda c: abs(abs(c.delta) - target_delta))
 
     def find_atm(
         self,

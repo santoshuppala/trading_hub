@@ -2037,6 +2037,46 @@ class SessionWatchdog:
                             f"      {_r['session_phase']:12s}  alpha=${float(_r['alpha'] or 0):>+8,.0f}  "
                             f"({int(_r['n'])} trades)")
 
+                # By Regime (trend score buckets)
+                _rcur.execute("""
+                    SELECT CASE
+                        WHEN regime_trend > 0.6 THEN 'High trend (>0.6)'
+                        WHEN regime_trend < 0.4 THEN 'Low trend (<0.4)'
+                        ELSE 'Mid trend (0.4-0.6)'
+                    END as regime_bucket,
+                    SUM(alpha_pnl) as alpha, COUNT(*) as n
+                    FROM trading.ml_pnl_attribution
+                    WHERE session_date = CURRENT_DATE AND regime_trend IS NOT NULL
+                    GROUP BY regime_bucket ORDER BY regime_bucket
+                """)
+                _rr = _rcur.fetchall()
+                if _rr:
+                    report_lines.append("")
+                    report_lines.append("    By Regime:")
+                    for _r in _rr:
+                        report_lines.append(
+                            f"      {_r['regime_bucket']:20s}  alpha=${float(_r['alpha'] or 0):>+8,.0f}  "
+                            f"({int(_r['n'])} trades)")
+
+                # Cumulative rolling alpha (last 20 days)
+                _rcur.execute("""
+                    SELECT strategy, SUM(alpha_pnl) as rolling_alpha,
+                           SUM(beta_pnl) as rolling_beta, COUNT(*) as n
+                    FROM trading.ml_pnl_attribution
+                    WHERE session_date >= CURRENT_DATE - INTERVAL '20 days'
+                    GROUP BY strategy ORDER BY SUM(alpha_pnl) DESC
+                """)
+                _rc_roll = _rcur.fetchall()
+                if _rc_roll and len(_rc_roll) > 0:
+                    report_lines.append("")
+                    report_lines.append("    Cumulative (last 20 days):")
+                    for _r in _rc_roll:
+                        _ra = float(_r['rolling_alpha'] or 0)
+                        _label = "persistent" if _ra > 0 else "decaying"
+                        report_lines.append(
+                            f"      {_r['strategy'] or 'unknown':20s}  "
+                            f"rolling alpha=${_ra:>+8,.0f}  ({_label})")
+
             _rc.close()
         except Exception:
             pass

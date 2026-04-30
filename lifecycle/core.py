@@ -398,6 +398,7 @@ class EngineLifecycle:
             # V10: Alpha/Beta attribution
             'spy_return', 'intraday_beta', 'beta_pnl', 'alpha_pnl',
             'net_alpha_pnl', 'slippage_cost', 'session_phase', 'regime_trend',
+            'alpha_significant',
         ]
 
         phase_labels = {0: 'P0 Validation', 1: 'P1 Protection', 2: 'P2 Breakeven',
@@ -477,8 +478,9 @@ class EngineLifecycle:
                                       cursor_factory=psycopg2.extras.RealDictCursor)
             _acur = _aconn.cursor()
             _acur.execute("""
-                SELECT trade_id, spy_return, intraday_beta, beta_pnl, alpha_pnl,
-                       net_alpha_pnl, slippage_cost, session_phase, regime_trend
+                SELECT trade_id, ticker, spy_return, intraday_beta, beta_pnl, alpha_pnl,
+                       net_alpha_pnl, slippage_cost, session_phase, regime_trend,
+                       alpha_p_value
                 FROM trading.ml_pnl_attribution
                 WHERE session_date = CURRENT_DATE
             """)
@@ -503,15 +505,22 @@ class EngineLifecycle:
                     row['slippage_cost'] = round(float(attr['slippage_cost'] or 0), 2)
                     row['session_phase'] = attr['session_phase'] or ''
                     row['regime_trend'] = round(float(attr['regime_trend'] or 0), 4)
+                    p = attr.get('alpha_p_value')
+                    if p is not None:
+                        row['alpha_significant'] = 'YES' if float(p) < 0.05 else 'NO'
+                    else:
+                        row['alpha_significant'] = 'ACCUMULATING'
                 else:
                     for h in ['spy_return', 'intraday_beta', 'beta_pnl', 'alpha_pnl',
-                              'net_alpha_pnl', 'slippage_cost', 'session_phase', 'regime_trend']:
+                              'net_alpha_pnl', 'slippage_cost', 'session_phase',
+                              'regime_trend', 'alpha_significant']:
                         row.setdefault(h, '')
         except Exception as attr_exc:
             log.debug("[%s] Attribution merge skipped: %s", self._name, attr_exc)
             for row in rows:
                 for h in ['spy_return', 'intraday_beta', 'beta_pnl', 'alpha_pnl',
-                          'net_alpha_pnl', 'slippage_cost', 'session_phase', 'regime_trend']:
+                          'net_alpha_pnl', 'slippage_cost', 'session_phase',
+                          'regime_trend', 'alpha_significant']:
                     row.setdefault(h, '')
 
         with open(path, 'w', newline='') as f:

@@ -122,7 +122,7 @@ EXIT_PROFILES: Dict[str, ExitProfile] = {
         dead_trade_bars=30,
         rsi_phase2_trail_r=0.5, rsi_phase3_trail_r=0.3, rsi_phase4_trail_r=0.2,
         vwap_phase2_action='tighten', vwap_tighten_r=0.2,
-        partial_at_r=1.0, partial_pct=0.50,
+        partial_at_r=1.5, partial_pct=0.33,       # V10.2: was 1.0R/50% — let winners run
         trail_type='higher_lows', trail_r_width=0.5,
         rsi_tighten=False,
         vwap_exit='2bar',

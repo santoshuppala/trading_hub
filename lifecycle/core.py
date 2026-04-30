@@ -339,10 +339,44 @@ class EngineLifecycle:
         from datetime import date
 
         engine = getattr(self._adapter, '_engine', None)
-        if not engine:
-            return
+        trade_log = getattr(engine, 'trade_log', []) if engine else []
 
-        trade_log = getattr(engine, 'trade_log', [])
+        # Fallback: if in-memory trade_log is empty (lost on restart),
+        # read from completed_trades DB (always has the data).
+        if not trade_log:
+            try:
+                import psycopg2
+                from config import DATABASE_URL
+                conn = psycopg2.connect(DATABASE_URL)
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT ticker, qty, entry_time, entry_price, exit_price,
+                           pnl, strategy, lifecycle_data
+                    FROM completed_trades
+                    WHERE exit_time::date = CURRENT_DATE
+                    ORDER BY exit_time
+                """)
+                for r in cur.fetchall():
+                    import json as _j
+                    _lc = {}
+                    if r[7]:
+                        try:
+                            _lc = _j.loads(r[7]) if isinstance(r[7], str) else r[7]
+                        except Exception:
+                            pass
+                    trade_log.append({
+                        'ticker': r[0], 'qty': r[1], 'entry_time': str(r[2] or ''),
+                        'entry_price': float(r[3] or 0), 'exit_price': float(r[4] or 0),
+                        'pnl': float(r[5] or 0), 'strategy': r[6] or '',
+                        'reason': _lc.get('exit_reason', ''),
+                        'lifecycle': _lc,
+                    })
+                conn.close()
+                log.info("[%s] Loaded %d trades from DB for daily report",
+                         self._name, len(trade_log))
+            except Exception as db_exc:
+                log.warning("[%s] DB trade fetch failed: %s", self._name, db_exc)
+
         if not trade_log:
             log.info("[%s] No trades today — skipping daily report", self._name)
             return

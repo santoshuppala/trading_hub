@@ -101,14 +101,37 @@ class TrendPullback(BaseProStrategy):
         df:          pd.DataFrame,
         outputs:     dict = None,
     ) -> float:
-        # V10.2: Structural stop below pullback swing low (proven method).
-        # Research: stop below the pullback low, not an arbitrary ATR distance.
-        # The swing low IS the thesis — if price breaks below it, trend is broken.
-        # ATR stop is the minimum floor (0.5 ATR gives room for EMA retest).
-        atr_stop   = entry_price - self.SL_ATR * atr
-        swing_stop = float(df['low'].tail(5).min()) - 0.01
-        # Use the WIDER stop (lower value = more room for thesis to play out)
-        stop = min(atr_stop, swing_stop)
+        # V10.2: Thesis-based stop — below the EMA that was tested.
+        # Research: "stop just below EMA9 or pullback candle low"
+        # If price bounced off EMA9, stop below EMA9 (thesis = EMA9 is support)
+        # If price bounced off EMA20, stop below EMA20 (thesis = EMA20 is support)
+        # Buffer: 0.2 ATR below the EMA (room for wick noise)
+        # Floor: never tighter than 0.3 ATR from entry
+        trend_meta = {}
+        if outputs and 'trend' in outputs:
+            trend_meta = outputs['trend'].metadata or {}
+
+        ema9  = trend_meta.get('ema9', 0)
+        ema20 = trend_meta.get('ema20', 0)
+        near_ema9  = trend_meta.get('near_ema9', False)
+        near_ema20 = trend_meta.get('near_ema20', False)
+
+        buffer = atr * 0.2  # room below EMA for wick noise
+
+        if near_ema9 and ema9 > 0:
+            # Thesis: EMA9 is support → stop just below EMA9
+            thesis_stop = ema9 - buffer
+        elif near_ema20 and ema20 > 0:
+            # Thesis: EMA20 is support → stop just below EMA20
+            thesis_stop = ema20 - buffer
+        else:
+            # Fallback: swing low of last 5 bars
+            thesis_stop = float(df['low'].tail(5).min()) - 0.01
+
+        # Floor: never tighter than 0.3 ATR from entry
+        min_stop = entry_price - atr * 0.3
+        stop = min(thesis_stop, min_stop)
+
         # Safety: ensure stop is below entry
         stop = min(stop, entry_price - 0.01)
         return round(stop, 4)

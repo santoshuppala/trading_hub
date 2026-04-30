@@ -42,16 +42,10 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ET = ZoneInfo('America/New_York')
-log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       'logs', datetime.now().strftime('%Y%m%d'))
-os.makedirs(log_dir, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [data_collector] %(message)s',
-    handlers=[logging.FileHandler(os.path.join(log_dir, 'data_collector.log'))],
-)
-log = logging.getLogger(__name__)
+# V10: ET timestamps (was system timezone — caused drift vs core.log)
+from scripts._log_setup import setup_logging
+log = setup_logging('data_collector')
 
 # Graceful shutdown
 signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))

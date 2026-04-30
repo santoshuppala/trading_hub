@@ -79,21 +79,9 @@ from config import (DATA_DIR, BOT_STATE_PATH, FILL_LEDGER_PATH,
                     LIVE_CACHE_PATH)
 _BOT_STATE_FILE = BOT_STATE_PATH
 
-# Logging
-log_dir = os.path.join(PROJECT_ROOT, 'logs', datetime.now().strftime('%Y%m%d'))
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, 'watchdog.log')
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [watchdog] %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        # StreamHandler removed: supervisor already redirects stdout to watchdog.log,
-        # so StreamHandler caused every line to appear twice in the log file.
-    ],
-)
-log = logging.getLogger(__name__)
+# Logging — V10: ET timestamps (was system timezone — caused drift vs core.log)
+from scripts._log_setup import setup_logging
+log = setup_logging('watchdog', log_filename='watchdog.log')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -161,7 +149,7 @@ class SessionWatchdog:
         log.info("=" * 60)
         log.info("SESSION WATCHDOG STARTED")
         log.info("  Check interval: %ds", self.check_interval)
-        log.info("  Log file: %s", log_file)
+        log.info("  Log file: watchdog.log")
         log.info("=" * 60)
 
         if dry_run:

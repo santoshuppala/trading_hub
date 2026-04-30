@@ -41,30 +41,9 @@ from config import (
     PRO_MAX_POSITIONS, PRO_TRADE_BUDGET, PRO_ORDER_COOLDOWN,
 )
 
-# Logging
-log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
-os.makedirs(log_dir, exist_ok=True)
-date_dir = os.path.join(log_dir, datetime.now().strftime('%Y%m%d'))
-os.makedirs(date_dir, exist_ok=True)
-log_file = os.path.join(date_dir, 'core.log')
-
-logging.root.handlers = []
-
-# Force all timestamps to ET (Eastern Time) regardless of system timezone.
-# Trading logs in ET match market hours (9:30-16:00 ET).
-class _ETFormatter(logging.Formatter):
-    _et = ZoneInfo('America/New_York')
-    def formatTime(self, record, datefmt=None):
-        from datetime import datetime as _dt
-        ct = _dt.fromtimestamp(record.created, tz=self._et)
-        if datefmt:
-            return ct.strftime(datefmt)
-        return ct.strftime('%Y-%m-%d %H:%M:%S') + f',{int(record.msecs):03d}'
-
-_handler = logging.FileHandler(log_file)
-_handler.setFormatter(_ETFormatter('%(asctime)s %(levelname)s [core] %(message)s'))
-logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
-log = logging.getLogger(__name__)
+# Logging — V10: shared ET formatter (all 6 processes use same format)
+from scripts._log_setup import setup_logging
+log = setup_logging('core')
 
 
 def main():

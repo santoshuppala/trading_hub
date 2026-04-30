@@ -59,16 +59,10 @@ except ImportError:
 ET = ZoneInfo('America/New_York')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Logging
-log_dir = os.path.join(PROJECT_ROOT, 'logs', datetime.now().strftime('%Y%m%d'))
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, 'outer_watchdog.log')
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [outer-watchdog] %(message)s',
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
-)
-log = logging.getLogger(__name__)
+# Logging — V10: ET timestamps (was system timezone — caused drift vs core.log)
+from scripts._log_setup import setup_logging
+log = setup_logging('outer-watchdog', log_filename='outer_watchdog.log',
+                     extra_handlers=[logging.StreamHandler()])
 
 # State file for tracking restart attempts
 _STATE_FILE = os.path.join(PROJECT_ROOT, 'data', 'outer_watchdog_state.json')

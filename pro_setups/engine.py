@@ -68,9 +68,13 @@ log = logging.getLogger(__name__)
 # (trend=52, volatility=45, momentum=25, orb=17, gap=5, etc.)
 # that self-gates via base.py:73. The global gate only needs enough
 # for basic precomputed indicators (ATR=14, RSI=14 → 15 bars).
-# Old value of 52 was TrendDetector's requirement applied globally,
-# which blocked ORB (designed for 9:45-10:00) until 10:22.
 _MIN_BARS: int = 15
+
+# V10: Progressive deployment — read once at import, not per-bar.
+# Set ENABLED_STRATEGIES env var to "trend_pullback,vwap_reclaim" etc.
+# Empty or unset = all strategies enabled.
+_ENABLED_RAW = os.environ.get('ENABLED_STRATEGIES', '').strip()
+_ENABLED_STRATEGIES: set = {s.strip() for s in _ENABLED_RAW.split(',') if s.strip()} if _ENABLED_RAW else set()
 
 
 class ProSetupEngine:
@@ -147,6 +151,11 @@ class ProSetupEngine:
             "cooldown=%ds  budget=$%.0f",
             len(self._detectors), max_positions, order_cooldown, trade_budget,
         )
+        if _ENABLED_STRATEGIES:
+            log.info("[ProSetupEngine] ENABLED_STRATEGIES=%s (other strategies filtered)",
+                     ','.join(sorted(_ENABLED_STRATEGIES)))
+        else:
+            log.info("[ProSetupEngine] All 11 strategies enabled (no filter)")
 
     # ── BAR handler ──────────────────────────────────────────────────────────
 
@@ -289,14 +298,11 @@ class ProSetupEngine:
         direction     = classification.direction
         confidence    = classification.confidence
 
-        # V10: Progressive deployment — only run enabled strategies.
-        # Set ENABLED_STRATEGIES env var to comma-separated list.
-        # Default: all strategies enabled (empty = all).
-        _enabled = os.environ.get('ENABLED_STRATEGIES', '')
-        if _enabled:
-            _allowed = {s.strip() for s in _enabled.split(',')}
-            if strategy_name not in _allowed:
-                return
+        # V10: Progressive deployment — skip strategies not in the enabled set.
+        if _ENABLED_STRATEGIES and strategy_name not in _ENABLED_STRATEGIES:
+            log.debug("[ProSetupEngine][%s] FILTERED: %s not in ENABLED_STRATEGIES %s",
+                      ticker, strategy_name, _ENABLED_STRATEGIES)
+            return
 
         # ── Step 3: load strategy + detect_signal ─────────────────────────
         strategy_cls = STRATEGY_REGISTRY.get(strategy_name)

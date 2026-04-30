@@ -484,18 +484,30 @@ class EngineLifecycle:
                 FROM trading.ml_pnl_attribution
                 WHERE session_date = CURRENT_DATE
             """)
-            _attr_map = {r['trade_id']: r for r in _acur.fetchall()}
+            _attr_rows = _acur.fetchall()
             _aconn.close()
 
+            # Build lookup by ticker (may have multiple trades per ticker)
+            from collections import defaultdict
+            _attr_by_ticker = defaultdict(list)
+            for r in _attr_rows:
+                _attr_by_ticker[r['ticker']].append(r)
+
             for row in rows:
-                # Match by ticker+entry_time (trade_id may not be in trade_log)
-                attr = _attr_map.get(row.get('_trade_id'))
-                if not attr:
-                    # Try matching by ticker
-                    for a in _attr_map.values():
-                        if a.get('ticker') == row.get('ticker'):
-                            attr = a
+                ticker = row.get('ticker', '')
+                candidates = _attr_by_ticker.get(ticker, [])
+                attr = None
+                if len(candidates) == 1:
+                    attr = candidates[0]
+                elif len(candidates) > 1:
+                    # Multiple trades for same ticker — match by closest entry_time
+                    row_entry = row.get('entry_time', '')
+                    for c in candidates:
+                        if c.get('entry_time') and row_entry and str(row_entry)[:8] in str(c['entry_time']):
+                            attr = c
                             break
+                    if not attr:
+                        attr = candidates[0]  # fallback to first
                 if attr:
                     row['spy_return'] = round(float(attr['spy_return'] or 0), 6)
                     row['intraday_beta'] = round(float(attr['intraday_beta'] or 0), 4)
@@ -643,11 +655,14 @@ class EngineLifecycle:
             from datetime import date, timedelta
             from scripts.post_session_analytics import (
                 job_signal_context, job_trade_outcomes, job_rejection_log,
+                job_pnl_attribution,
             )
             import psycopg2
+            import psycopg2.extras
             from config import DATABASE_URL
 
-            conn = psycopg2.connect(DATABASE_URL)
+            conn = psycopg2.connect(DATABASE_URL,
+                                    cursor_factory=psycopg2.extras.RealDictCursor)
             cur = conn.cursor()
 
             # Check last 3 days (covers weekends: Fri→Mon)
@@ -657,18 +672,18 @@ class EngineLifecycle:
 
                 # Skip if no events exist for that day (not a trading day)
                 cur.execute(
-                    "SELECT COUNT(*) FROM event_store "
+                    "SELECT COUNT(*) as cnt FROM event_store "
                     "WHERE event_time::date = %s AND event_type = 'StrategySignal'",
                     (check_date,))
-                event_count = cur.fetchone()[0]
+                event_count = cur.fetchone()['cnt']
                 if event_count == 0:
                     continue  # no signals that day — skip
 
                 # Check if ML data already exists
                 cur.execute(
-                    "SELECT COUNT(*) FROM ml_signal_context WHERE created_at::date = %s",
+                    "SELECT COUNT(*) as cnt FROM ml_signal_context WHERE created_at::date = %s",
                     (check_date,))
-                ml_count = cur.fetchone()[0]
+                ml_count = cur.fetchone()['cnt']
 
                 if ml_count < event_count * 0.5:  # less than 50% coverage → backfill
                     log.info("[%s] ML backfill: %s has %d signals but only %d in "
@@ -677,6 +692,7 @@ class EngineLifecycle:
                     job_signal_context(conn, check_date)
                     job_trade_outcomes(conn, check_date)
                     job_rejection_log(conn, check_date)
+                    job_pnl_attribution(conn, check_date)
 
             conn.close()
         except ImportError:

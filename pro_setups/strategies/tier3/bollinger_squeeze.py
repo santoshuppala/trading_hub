@@ -66,10 +66,9 @@ class BollingerSqueeze(BaseProStrategy):
     ) -> float:
         offset = self.SL_ATR * atr
         if direction == 'long':
-            # Stop below lower BB
-            vol_sig = None
-            stop    = entry_price - offset
-            stop    = min(stop, entry_price - 0.01)
+            stop = entry_price - offset
+            stop = min(stop, entry_price - 0.01)
         else:
             stop = entry_price + offset
+            stop = max(stop, entry_price + 0.01)
         return round(stop, 4)

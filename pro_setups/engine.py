@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Dict, Optional
 
@@ -287,6 +288,15 @@ class ProSetupEngine:
         tier          = classification.tier
         direction     = classification.direction
         confidence    = classification.confidence
+
+        # V10: Progressive deployment — only run enabled strategies.
+        # Set ENABLED_STRATEGIES env var to comma-separated list.
+        # Default: all strategies enabled (empty = all).
+        _enabled = os.environ.get('ENABLED_STRATEGIES', '')
+        if _enabled:
+            _allowed = {s.strip() for s in _enabled.split(',')}
+            if strategy_name not in _allowed:
+                return
 
         # ── Step 3: load strategy + detect_signal ─────────────────────────
         strategy_cls = STRATEGY_REGISTRY.get(strategy_name)

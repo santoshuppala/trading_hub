@@ -68,14 +68,20 @@ class InsideBar(BaseProStrategy):
         outputs:     dict = None,
     ) -> float:
         offset = self.SL_ATR * atr
+        # V10: Use mother bar levels from detector metadata (5-min timeframe)
+        # instead of df.iloc[-2] (1-min bar — wrong timeframe)
+        ib_meta = {}
+        if outputs and 'inside_bar' in outputs:
+            ib_meta = outputs['inside_bar'].metadata or {}
+
         if direction == 'long':
-            # Structure stop: below mother bar low
-            mother_low = float(df['low'].iloc[-2])
+            mother_low = float(ib_meta.get('mother_low', df['low'].iloc[-2]))
             struct_stop = mother_low - 0.01
             stop = max(entry_price - offset, struct_stop)
             stop = min(stop, entry_price - 0.01)
         else:
-            mother_high = float(df['high'].iloc[-2])
+            mother_high = float(ib_meta.get('mother_high', df['high'].iloc[-2]))
             struct_stop = mother_high + 0.01
             stop = min(entry_price + offset, struct_stop)
+            stop = max(stop, entry_price + 0.01)
         return round(stop, 4)

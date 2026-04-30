@@ -37,7 +37,21 @@ class ORB(BaseProStrategy):
             return None
         if not orb.metadata.get('vol_confirm', False):
             return None
-        return orb.direction
+
+        direction = orb.direction
+
+        # V10: VWAP alignment filter (proven ORB parameter).
+        # Long breakout above VWAP = institutional buying. Long below VWAP = trap.
+        # Short breakout below VWAP = institutional selling. Short above VWAP = trap.
+        vwap_sig = detector_outputs.get('vwap')
+        if vwap_sig and vwap_sig.fired:
+            above_vwap = vwap_sig.metadata.get('above_vwap', False)
+            if direction == 'long' and not above_vwap:
+                return None
+            if direction == 'short' and above_vwap:
+                return None
+
+        return direction
 
     def generate_entry(
         self,

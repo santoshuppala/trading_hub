@@ -62,8 +62,14 @@ from .detectors._compute import compute_atr, compute_vwap, compute_rsi, compute_
 
 log = logging.getLogger(__name__)
 
-# Minimum bars required before running any detector
-_MIN_BARS: int = 52
+# Minimum bars before ProSetupEngine runs ANY detector.
+# V10: Lowered from 52 to 15. Each detector has its own MIN_BARS
+# (trend=52, volatility=45, momentum=25, orb=17, gap=5, etc.)
+# that self-gates via base.py:73. The global gate only needs enough
+# for basic precomputed indicators (ATR=14, RSI=14 → 15 bars).
+# Old value of 52 was TrendDetector's requirement applied globally,
+# which blocked ORB (designed for 9:45-10:00) until 10:22.
+_MIN_BARS: int = 15
 
 
 class ProSetupEngine:
